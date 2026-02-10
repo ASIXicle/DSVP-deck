@@ -1,8 +1,13 @@
 distrobox create --name dev --image archlinux
+
 distrobox enter dev
+
 sudo pacman -S gcc make ffmpeg sdl2 sdl2_ttf pkgconf
+
 git clone git@github.com:ASIXicle/DSVP.git
+
 cd DSVP
+
 make
 ./build/dsvp
 
@@ -17,3 +22,4 @@ git clone git@github.com:ASIXicle/DSVP.git
 cd DSVP
 make
 ./build/dsvp
+
