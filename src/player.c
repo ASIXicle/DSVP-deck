@@ -11,7 +11,7 @@
  *   Audio is the master clock. Video frame display timing is adjusted
  *   to match the audio clock. This is the standard approach (same as
  *   ffplay) because audio glitches are far more perceptible than
- *   dropped/delayed video frames. Words so I can test git misbehaving...
+ *   dropped/delayed video frames. Words so I can remove embarassing commit spelling error
  */
 
 #include "dsvp.h"
