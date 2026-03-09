@@ -727,8 +727,11 @@ int main(int argc, char *argv[]) {
                             delay = 0.0;
                         }
 
-                        /* Track worst drift (absolute value) */
-                        if (fabs(av_diff) > fabs(ps.diag_max_av_drift))
+                        /* Track worst drift — only during steady-state
+                         * playback. Seek recovery drift is transient
+                         * and would pollute the peak measurement. */
+                        if (!ps.seek_recovering &&
+                                fabs(av_diff) > fabs(ps.diag_max_av_drift))
                             ps.diag_max_av_drift = av_diff;
                     }
 
@@ -765,11 +768,14 @@ int main(int argc, char *argv[]) {
                     new_frame = 1;
 
                     /* If video is >50ms behind audio, decode but don't
-                     * display — let video catch up. Suppressed during
-                     * the grace period after seeks and playback start,
-                     * when transient drift is expected and harmless. */
+                     * display — let video catch up. Suppressed while
+                     * seek_recovering is set (waiting for the first
+                     * displayed frame post-seek). This adapts to any
+                     * codec: H.264 recovers in ~100ms, HEVC with long
+                     * GOPs may take 5–10 seconds of decode before the
+                     * first displayable frame arrives. */
                     if (ps.audio_stream_idx >= 0 && av_diff < -0.05
-                            && now >= ps.seek_grace_until) {
+                            && !ps.seek_recovering) {
                         new_frame = 0;
                         ps.diag_frames_dropped++;
                         log_msg("DIAG: frame dropped at %.3fs "
@@ -810,6 +816,17 @@ int main(int argc, char *argv[]) {
             if (new_frame) {
                 video_display(&ps);
                 ps.diag_frames_displayed++;
+
+                /* First frame after a seek — recovery complete.
+                 * Reset frame_timer so pacing starts fresh from
+                 * this moment rather than trying to catch up from
+                 * the stale pre-seek timer value. */
+                if (ps.seek_recovering) {
+                    ps.seek_recovering = 0;
+                    ps.frame_timer = get_time_sec();
+                    log_msg("DIAG: seek recovery complete at %.3fs",
+                            ps.video_clock);
+                }
             }
 
             /* ── Periodic diagnostics (every 10 seconds) ── */
