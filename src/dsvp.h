@@ -129,7 +129,7 @@ typedef struct PlayerState {
     int64_t             seek_target;      /* seek target in AV_TIME_BASE*/
     int                 seek_request;     /* 1 = seek pending           */
     int                 seek_flags;
-    double              seek_grace_until; /* suppress frame drops until */
+    int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;

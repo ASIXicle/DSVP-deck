@@ -221,26 +221,47 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->rgb_frame   = av_frame_alloc();
     ps->audio_frame = av_frame_alloc();
 
-    /* ── Set up swscale (Lanczos + error-diffusion dithering) ── */
+    /* ── Set up swscale ── */
     /*
-     * SWS_LANCZOS is FFmpeg's high-quality scaling filter.
-     * We convert whatever the decoder outputs into a format SDL can display.
-     * SDL textures use SDL_PIXELFORMAT_IYUV (YUV420P) natively, which avoids
-     * an extra colorspace conversion if the source is already YUV420P.
+     * Two modes based on whether the source needs spatial scaling:
      *
-     * Error-diffusion dithering (SWS_DITHER_ED) distributes quantization
-     * error to neighboring pixels. This dramatically reduces banding when
-     * converting from 10-bit (or higher) sources to 8-bit output.
+     * 1. RESIZE (src size ≠ dst size): Full Lanczos pipeline with
+     *    SWS_FULL_CHR_H_INT for maximum spatial quality.
+     *
+     * 2. FORMAT ONLY (src size == dst size, e.g. 10-bit → 8-bit):
+     *    SWS_POINT (nearest neighbor) for the spatial component,
+     *    which is a no-op identity at 1:1 resolution. The quality-
+     *    relevant work is error-diffusion dithering (set below),
+     *    which is independent of the scaling filter.
+     *
+     *    Lanczos at 1:1 computes an expensive multi-tap convolution
+     *    that produces identical output to SWS_POINT. For 2960×2160
+     *    10-bit HEVC, this wastes ~70% of the sws_scale CPU time.
      */
     {
         enum AVPixelFormat dst_fmt = AV_PIX_FMT_YUV420P;
         int dst_w = ps->vid_w;
         int dst_h = ps->vid_h;
 
+        /* Detect whether we need spatial scaling or just format conversion */
+        int same_size = (ps->vid_w == dst_w && ps->vid_h == dst_h);
+        int sws_flags;
+        const char *sws_mode;
+
+        if (same_size) {
+            /* Format conversion only — spatial filter is identity */
+            sws_flags = SWS_POINT | SWS_ACCURATE_RND;
+            sws_mode = "format-only (SWS_POINT + error-diffusion)";
+        } else {
+            /* Spatial resize — full quality pipeline */
+            sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
+            sws_mode = "resize (SWS_LANCZOS + error-diffusion)";
+        }
+
         ps->sws_ctx = sws_getContext(
             ps->vid_w, ps->vid_h, ps->video_codec_ctx->pix_fmt,
             dst_w, dst_h, dst_fmt,
-            SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,
+            sws_flags,
             NULL, NULL, NULL
         );
 
@@ -335,6 +356,8 @@ int player_open(PlayerState *ps, const char *filename) {
 
             log_msg("swscale: chroma siting=%s", chroma_desc);
         }
+
+        log_msg("swscale: mode=%s", sws_mode);
 
         /* Allocate buffer for the converted frame */
         int buf_size = av_image_get_buffer_size(dst_fmt, dst_w, dst_h, 32);
@@ -431,10 +454,9 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->audio_clock      = 0.0;
     ps->video_clock      = 0.0;
 
-    /* Grace period: suppress frame drops while the decode pipeline
-     * fills. Same logic as post-seek — the first few frames need
-     * to decode from the nearest keyframe before A/V sync is valid. */
-    ps->seek_grace_until = get_time_sec() + 0.25;
+    /* Suppress frame drops until the first frame is displayed.
+     * Adapts automatically to any codec's keyframe recovery time. */
+    ps->seek_recovering = 1;
 
     /* ── Reset diagnostics ── */
     ps->diag_frames_displayed = 0;
@@ -546,7 +568,7 @@ void player_close(PlayerState *ps) {
     ps->audio_buf_index    = 0;
     ps->seek_request       = 0;
     ps->seeking            = 0;
-    ps->seek_grace_until   = 0.0;
+    ps->seek_recovering    = 0;
     ps->show_debug         = 0;
     ps->show_info          = 0;
     ps->aud_count          = 0;
@@ -626,14 +648,24 @@ int demux_thread_func(void *arg) {
             ps->audio_buf_size  = 0;
             ps->audio_buf_index = 0;
 
+            /* Reset both clocks to the seek target. Without this,
+             * video_clock retains the old position until the first
+             * frame is decoded, causing a phantom drift spike equal
+             * to the entire seek distance (e.g. 895 seconds). */
+            {
+                double seek_pos = (double)target / AV_TIME_BASE;
+                ps->audio_clock = seek_pos;
+                ps->video_clock = seek_pos;
+            }
+
             ps->seeking = 0;
             SDL_UnlockMutex(ps->seek_mutex);
 
-            /* Grace period: suppress frame drops for 150ms after seek.
-             * The video decoder needs 2–3 frames to catch up from the
-             * nearest keyframe, and A/V drift during this window is
-             * expected and harmless. */
-            ps->seek_grace_until = get_time_sec() + 0.15;
+            /* Suppress frame drops until the first frame is displayed
+             * post-seek. Adapts to any codec — H.264 recovers in
+             * ~100ms, HEVC with long GOPs may take 5–10 seconds.
+             * Cleared in main.c when a frame is actually shown. */
+            ps->seek_recovering = 1;
 
             /* Resume audio playback */
             if (ps->audio_dev && !ps->paused)
@@ -966,7 +998,14 @@ void player_build_debug_info(PlayerState *ps) {
         off += snprintf(buf + off, sz - off, "Decoder Threads: %d\n",
             ps->video_codec_ctx->thread_count);
     }
-    off += snprintf(buf + off, sz - off, "SWS Dithering: error-diffusion\n");
+    if (ps->video_codec_ctx) {
+        if (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+            off += snprintf(buf + off, sz - off, "SWS: passthrough (no conversion)\n");
+        } else {
+            off += snprintf(buf + off, sz - off,
+                "SWS: format-only (point + ED dither)\n");
+        }
+    }
 
     /* Audio track info */
     if (ps->aud_count > 1) {
