@@ -255,6 +255,87 @@ int player_open(PlayerState *ps, const char *filename) {
          * integer directly for compatibility across FFmpeg versions. */
         av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
 
+        /* ── Colorspace and range ──
+         *
+         * Tell swscale the correct source colorspace (BT.601 vs BT.709)
+         * and range (limited/TV vs full/PC). Without this, swscale guesses
+         * based on resolution heuristics, which can produce crushed blacks
+         * (limited treated as full) or washed-out grays (full treated as
+         * limited). We read the actual values from the stream metadata. */
+        {
+            AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+
+            /* Determine source colorspace matrix */
+            int src_cs;
+            if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
+                /* Use what the container/codec reports */
+                src_cs = (par->color_space == AVCOL_SPC_BT709)
+                    ? SWS_CS_ITU709 : SWS_CS_ITU601;
+            } else {
+                /* Fallback: HD (≥720p) → BT.709, SD → BT.601 */
+                src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709 : SWS_CS_ITU601;
+            }
+
+            /* Output uses the same matrix (no gamut conversion needed
+             * since we're just converting bit depth, not colorspace) */
+            int dst_cs = src_cs;
+
+            /* Determine source range: 0 = limited/TV, 1 = full/PC */
+            int src_range;
+            if (par->color_range == AVCOL_RANGE_JPEG) {
+                src_range = 1; /* full range */
+            } else if (par->color_range == AVCOL_RANGE_MPEG) {
+                src_range = 0; /* limited range */
+            } else {
+                src_range = 0; /* assume limited (vast majority of video) */
+            }
+            int dst_range = src_range;
+
+            /* Retrieve defaults, then override with correct values */
+            int *inv_table, *table;
+            int cur_src_range, cur_dst_range, brightness, contrast, saturation;
+            sws_getColorspaceDetails(ps->sws_ctx,
+                &inv_table, &cur_src_range, &table, &cur_dst_range,
+                &brightness, &contrast, &saturation);
+
+            sws_setColorspaceDetails(ps->sws_ctx,
+                sws_getCoefficients(src_cs), src_range,
+                sws_getCoefficients(dst_cs), dst_range,
+                brightness, contrast, saturation);
+
+            log_msg("swscale: colorspace=%s range=%s",
+                (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
+                src_range ? "full" : "limited");
+        }
+
+        /* ── Chroma siting ──
+         *
+         * For 4:2:0 subsampled video, the exact position of chroma samples
+         * affects interpolation quality. MPEG-style (chroma between luma
+         * rows) and JPEG-style (chroma co-sited with top-left luma) produce
+         * different results. We read chroma_location from the stream and
+         * pass it to swscale. This is "free" correctness. */
+        {
+            AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+            const char *chroma_desc = "default";
+
+            if (par->chroma_location == AVCHROMA_LOC_LEFT) {
+                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
+                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
+                chroma_desc = "left (MPEG-2)";
+            } else if (par->chroma_location == AVCHROMA_LOC_CENTER) {
+                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 128, 0);
+                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
+                chroma_desc = "center (MPEG-1/JPEG)";
+            } else if (par->chroma_location == AVCHROMA_LOC_TOPLEFT) {
+                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
+                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 0, 0);
+                chroma_desc = "top-left";
+            }
+
+            log_msg("swscale: chroma siting=%s", chroma_desc);
+        }
+
         /* Allocate buffer for the converted frame */
         int buf_size = av_image_get_buffer_size(dst_fmt, dst_w, dst_h, 32);
         ps->rgb_buffer = av_malloc(buf_size);
@@ -296,6 +377,30 @@ int player_open(PlayerState *ps, const char *filename) {
     }
 
     /* ── Create SDL texture for video ── */
+
+    /* Set texture scaling quality — applies to the NEXT texture created.
+     * "2" = anisotropic (best), "1" = bilinear (good fallback).
+     * This controls how SDL scales the texture when the display rect
+     * differs from the native video resolution (window resize, fullscreen).
+     * Without this, SDL defaults to nearest-neighbor (blocky). */
+    if (!SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "2")) {
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+        log_msg("SDL: using bilinear texture scaling (anisotropic unavailable)");
+    } else {
+        log_msg("SDL: using anisotropic texture scaling");
+    }
+
+    /* Set YUV→RGB conversion matrix based on resolution.
+     * BT.601 is the SD standard (< 720p), BT.709 is HD (≥ 720p).
+     * SDL defaults to BT.601, which produces subtly wrong colors on HD. */
+    if (ps->vid_h >= 720) {
+        SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
+        log_msg("SDL: YUV conversion set to BT.709 (HD)");
+    } else {
+        SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT601);
+        log_msg("SDL: YUV conversion set to BT.601 (SD)");
+    }
+
     if (ps->texture) SDL_DestroyTexture(ps->texture);
     ps->texture = SDL_CreateTexture(
         ps->renderer,
