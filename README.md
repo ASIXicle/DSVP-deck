@@ -4,11 +4,9 @@
 <img width="1069" height="695" alt="DSVPmenu" src="https://github.com/user-attachments/assets/e831c7b9-53ca-436a-83ed-7109307e4329" />
 
 
-WIP, this 1.2
-
 WHY? Because I can. And education. And I want to offer a mpv-style player without configs or intimidation-factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Perhaps not as much so as VLC but should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There is a portable Windows build you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/tag/v1.2-beta)
+There is a portable Windows build you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/)
 
 REQUIRES Visual C++ Redistributable runtime (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170

@@ -27,26 +27,29 @@
 /* Returns 1 if a file was selected (path written to `out`), 0 if cancelled. */
 static int open_file_dialog(char *out, int out_size) {
 #ifdef _WIN32
-    /* Native Win32 file dialog */
-    OPENFILENAMEA ofn;
-    char file[1024] = {0};
+    /* Native Win32 file dialog — use Wide (Unicode) APIs so filenames
+     * with non-ASCII characters (accented, CJK, fullwidth, etc.) work.
+     * The result is converted to UTF-8 which FFmpeg expects. */
+    OPENFILENAMEW ofn;
+    wchar_t file[1024] = {0};
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize  = sizeof(ofn);
     ofn.hwndOwner    = NULL;
     ofn.lpstrFile    = file;
-    ofn.nMaxFile     = sizeof(file);
-    ofn.lpstrFilter  = "Video Files\0"
-                       "*.mkv;*.mp4;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.mpg;*.mpeg\0"
-                       "Audio Files\0"
-                       "*.mp3;*.flac;*.wav;*.aac;*.ogg;*.opus;*.m4a;*.wma\0"
-                       "All Files\0*.*\0";
+    ofn.nMaxFile     = sizeof(file) / sizeof(file[0]);
+    ofn.lpstrFilter  = L"Video Files\0"
+                       L"*.mkv;*.mp4;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.mpg;*.mpeg\0"
+                       L"Audio Files\0"
+                       L"*.mp3;*.flac;*.wav;*.aac;*.ogg;*.opus;*.m4a;*.wma\0"
+                       L"All Files\0*.*\0";
     ofn.nFilterIndex = 1;
     ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
 
-    if (GetOpenFileNameA(&ofn)) {
-        snprintf(out, out_size, "%s", file);
-        return 1;
+    if (GetOpenFileNameW(&ofn)) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, file, -1, out, out_size, NULL, NULL);
+        if (len > 0) return 1;
+        log_msg("ERROR: UTF-8 conversion failed");
     }
     return 0;
 
