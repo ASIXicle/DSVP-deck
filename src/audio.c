@@ -83,10 +83,14 @@ int audio_decode_frame(PlayerState *ps) {
 
             data_size = converted * 2 * 2; /* stereo * 16-bit */
 
-            /* Update audio clock from frame PTS */
-            if (ps->audio_frame->pts != AV_NOPTS_VALUE) {
+            /* Update audio clock from frame PTS.
+             * Prefer best_effort_timestamp for same reasons as video. */
+            int64_t frame_pts = ps->audio_frame->best_effort_timestamp;
+            if (frame_pts == AV_NOPTS_VALUE)
+                frame_pts = ps->audio_frame->pts;
+            if (frame_pts != AV_NOPTS_VALUE) {
                 AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
-                ps->audio_clock = (double)ps->audio_frame->pts * av_q2d(as->time_base);
+                ps->audio_clock = (double)frame_pts * av_q2d(as->time_base);
             }
             /* Advance clock by the duration of the samples we just decoded */
             ps->audio_clock += (double)converted / ps->audio_spec.freq;
