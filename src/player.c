@@ -223,45 +223,51 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->rgb_frame   = av_frame_alloc();
     ps->audio_frame = av_frame_alloc();
 
-    /* ── Set up swscale ── */
-    /*
-     * Two modes based on whether the source needs spatial scaling:
+    /* ── Set up swscale ──
      *
-     * 1. RESIZE (src size ≠ dst size): Full Lanczos pipeline with
+     * Three modes based on source format and whether spatial scaling is needed:
+     *
+     * 1. RESIZE (src size != dst size): Full Lanczos pipeline with
      *    SWS_FULL_CHR_H_INT for maximum spatial quality.
      *
-     * 2. FORMAT ONLY (src size == dst size, e.g. 10-bit → 8-bit):
-     *    SWS_POINT (nearest neighbor) for the spatial component,
-     *    which is a no-op identity at 1:1 resolution. The quality-
-     *    relevant work is error-diffusion dithering (set below),
-     *    which is independent of the scaling filter.
+     * 2. FORMAT ONLY, 8-bit (e.g. limited→full range expansion):
+     *    SWS_POINT + error-diffusion dithering.
      *
-     *    Lanczos at 1:1 computes an expensive multi-tap convolution
-     *    that produces identical output to SWS_POINT. For 2960×2160
-     *    10-bit HEVC, this wastes ~70% of the sws_scale CPU time.
+     * 3. FORMAT ONLY, 10-bit → 8-bit: SWS_POINT with NO error-diffusion.
+     *    ED dithering is a serial per-pixel operation that bottlenecks
+     *    4K 10-bit content (causes FLAC+HEVC frame drops). Simple
+     *    truncation (10→8 bit) is visually negligible on real video —
+     *    you're discarding 2 bits of 10. The real quality win was the
+     *    P010 path (10-bit display), but SDL3's D3D11 renderer has a
+     *    broken P010 shader (UV plane uses R8G8 instead of R16G16).
+     *    When SDL3 fixes P010, we can re-enable the passthrough path.
      */
     {
+        enum AVPixelFormat src_fmt = ps->video_codec_ctx->pix_fmt;
         enum AVPixelFormat dst_fmt = AV_PIX_FMT_YUV420P;
         int dst_w = ps->vid_w;
         int dst_h = ps->vid_h;
 
         /* Detect whether we need spatial scaling or just format conversion */
         int same_size = (ps->vid_w == dst_w && ps->vid_h == dst_h);
+        int is_10bit = (src_fmt == AV_PIX_FMT_YUV420P10LE);
         int sws_flags;
         const char *sws_mode;
 
-        if (same_size) {
-            /* Format conversion only — spatial filter is identity */
-            sws_flags = SWS_POINT | SWS_ACCURATE_RND;
-            sws_mode = "format-only (SWS_POINT + error-diffusion)";
-        } else {
+        if (!same_size) {
             /* Spatial resize — full quality pipeline */
             sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
-            sws_mode = "resize (SWS_LANCZOS + error-diffusion)";
+            sws_mode = "resize (SWS_LANCZOS)";
+        } else {
+            /* Format conversion only — spatial filter is identity */
+            sws_flags = SWS_POINT | SWS_ACCURATE_RND;
+            sws_mode = is_10bit
+                ? "10-bit fast (SWS_POINT, no dither)"
+                : "format-only (SWS_POINT + error-diffusion)";
         }
 
         ps->sws_ctx = sws_getContext(
-            ps->vid_w, ps->vid_h, ps->video_codec_ctx->pix_fmt,
+            ps->vid_w, ps->vid_h, src_fmt,
             dst_w, dst_h, dst_fmt,
             sws_flags,
             NULL, NULL, NULL
@@ -273,51 +279,37 @@ int player_open(PlayerState *ps, const char *filename) {
             return -1;
         }
 
-        /* Enable error-diffusion dithering for bit-depth conversion.
-         * Value 1 = SWS_DITHER_ED in FFmpeg's internal enum. Using the
-         * integer directly for compatibility across FFmpeg versions. */
-        av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
+        /* Enable error-diffusion dithering ONLY for 8-bit sources.
+         * For 10-bit, skip ED — it's the serial bottleneck that causes
+         * FLAC+4K drops. Truncation from 10→8 bit is visually negligible. */
+        if (!is_10bit) {
+            av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
+        }
 
-        /* ── Colorspace and range ──
-         *
-         * Tell swscale the correct source colorspace (BT.601 vs BT.709)
-         * and range (limited/TV vs full/PC). Without this, swscale guesses
-         * based on resolution heuristics, which can produce crushed blacks
-         * (limited treated as full) or washed-out grays (full treated as
-         * limited). We read the actual values from the stream metadata. */
+        /* ── Colorspace and range ── */
         {
             AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
 
-            /* Determine source colorspace matrix */
             int src_cs;
             if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
-                /* Use what the container/codec reports */
                 src_cs = (par->color_space == AVCOL_SPC_BT709)
                     ? SWS_CS_ITU709 : SWS_CS_ITU601;
             } else {
-                /* Fallback: HD (≥720p) → BT.709, SD → BT.601 */
                 src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709 : SWS_CS_ITU601;
             }
 
-            /* Output uses the same matrix (no gamut conversion needed
-             * since we're just converting bit depth, not colorspace) */
             int dst_cs = src_cs;
 
-            /* Determine source range: 0 = limited/TV, 1 = full/PC */
             int src_range;
             if (par->color_range == AVCOL_RANGE_JPEG) {
-                src_range = 1; /* full range */
+                src_range = 1;
             } else if (par->color_range == AVCOL_RANGE_MPEG) {
-                src_range = 0; /* limited range */
+                src_range = 0;
             } else {
-                src_range = 0; /* assume limited (vast majority of video) */
+                src_range = 0;
             }
-            /* Always output full range — SDL3's limited-range YUV→RGB
-             * shader is broken (crushed blacks). Let FFmpeg expand
-             * limited [16-235] → full [0-255] via swscale instead. */
             int dst_range = 1;
 
-            /* Retrieve defaults, then override with correct values */
             int *inv_table, *table;
             int cur_src_range, cur_dst_range, brightness, contrast, saturation;
             sws_getColorspaceDetails(ps->sws_ctx,
@@ -334,13 +326,7 @@ int player_open(PlayerState *ps, const char *filename) {
                 src_range ? "full" : "limited");
         }
 
-        /* ── Chroma siting ──
-         *
-         * For 4:2:0 subsampled video, the exact position of chroma samples
-         * affects interpolation quality. MPEG-style (chroma between luma
-         * rows) and JPEG-style (chroma co-sited with top-left luma) produce
-         * different results. We read chroma_location from the stream and
-         * pass it to swscale. This is "free" correctness. */
+        /* ── Chroma siting ── */
         {
             AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
             const char *chroma_desc = "default";
@@ -428,7 +414,6 @@ int player_open(PlayerState *ps, const char *filename) {
         return -1;
     }
 
-    /* SDL3: set texture scale mode (replaces SDL_HINT_RENDER_SCALE_QUALITY) */
     SDL_SetTextureScaleMode(ps->texture, SDL_SCALEMODE_LINEAR);
     log_msg("SDL: using linear texture scaling");
     log_msg("SDL: YUV colorspace set to %s (full range)",
@@ -537,8 +522,8 @@ void player_close(PlayerState *ps) {
     if (ps->audio_frame)  av_frame_free(&ps->audio_frame);
 
     /* Free buffers */
-    if (ps->rgb_buffer)   { av_free(ps->rgb_buffer); ps->rgb_buffer = NULL; }
-    if (ps->audio_buf)    { av_free(ps->audio_buf);  ps->audio_buf  = NULL; }
+    if (ps->rgb_buffer)    { av_free(ps->rgb_buffer);    ps->rgb_buffer    = NULL; }
+    if (ps->audio_buf)     { av_free(ps->audio_buf);     ps->audio_buf     = NULL; }
 
     /* Free scale/resample contexts */
     if (ps->sws_ctx)      { sws_freeContext(ps->sws_ctx); ps->sws_ctx = NULL; }
@@ -804,7 +789,7 @@ void player_update_display_rect(PlayerState *ps) {
     ps->display_rect.h = disp_h;
 }
 
-/* Display the current video frame: scale → upload to texture → render.
+/* Display the current video frame: convert → upload to texture → render.
  *
  * A/V sync logic:
  *   We compare the video frame's PTS to the audio clock.
@@ -817,16 +802,9 @@ void video_display(PlayerState *ps) {
 
     /* ── YUV420P passthrough optimization ──
      *
-     * When the source is already YUV420P AND full-range (JPEG/PC levels),
-     * skip sws_scale entirely and upload the decoded frame directly.
-     *
-     * Limited-range YUV420P MUST go through sws_scale for range expansion
-     * (limited [16-235] → full [0-255]) because SDL3's GPU-side
-     * limited-range shader produces crushed blacks.
-     *
-     * For any other pixel format (10-bit, 4:2:2, RGB, etc.), we run
-     * the full sws_scale pipeline with error-diffusion dithering for
-     * reference-quality conversion. */
+     * When the source is already YUV420P AND full-range, skip sws_scale
+     * entirely. For everything else (limited-range, 10-bit, other formats),
+     * run through sws_scale. */
     {
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
         int is_full_range = (ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
@@ -838,8 +816,8 @@ void video_display(PlayerState *ps) {
                 ps->video_frame->data[1], ps->video_frame->linesize[1],
                 ps->video_frame->data[2], ps->video_frame->linesize[2]);
         } else {
-            /* Limited-range or non-YUV420P — sws_scale handles
-             * range expansion and/or format conversion */
+            /* All other formats — sws_scale handles range expansion,
+             * bit-depth conversion, and/or format conversion */
             sws_scale(ps->sws_ctx,
                 (const uint8_t *const *)ps->video_frame->data,
                 ps->video_frame->linesize,
@@ -1037,11 +1015,14 @@ void player_build_debug_info(PlayerState *ps) {
     }
     if (ps->video_codec_ctx) {
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
+        int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE);
         int is_full_range = (ps->fmt_ctx &&
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
 
         if (is_yuv420p && is_full_range) {
             off += snprintf(buf + off, sz - off, "SWS: passthrough (full-range YUV420P)\n");
+        } else if (is_10bit) {
+            off += snprintf(buf + off, sz - off, "SWS: 10-bit fast (SWS_POINT, no dither)\n");
         } else if (is_yuv420p) {
             off += snprintf(buf + off, sz - off, "SWS: limited->full expand (SWS_POINT)\n");
         } else {
