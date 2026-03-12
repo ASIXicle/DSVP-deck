@@ -32,9 +32,12 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3_ttf/SDL_ttf.h>
 
+/* SDL3 shadercross — runtime HLSL→SPIRV→native compilation */
+#include <SDL3_shadercross/SDL_shadercross.h>
+
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.1.3-beta"
+#define DSVP_VERSION        "0.1.4-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -72,6 +75,18 @@ typedef struct PacketQueue {
     SDL_Condition *cond;
     int          abort_request; /* signal threads to stop blocking      */
 } PacketQueue;
+
+/* ── GPU Uniform Data ──────────────────────────────────────────────
+ *
+ * Pushed to the fragment shader each frame via SDL_PushGPUFragmentUniformData.
+ * Layout must match the HLSL cbuffer exactly (std140-ish packing).
+ */
+
+typedef struct GPUUniforms {
+    float colorMatrix[16];  /* 4×4 YUV→RGB matrix (row-major)   64 bytes */
+    float rangeY[2];        /* { offset, scale } for Y plane      8 bytes */
+    float rangeUV[2];       /* { offset, scale } for UV planes    8 bytes */
+} GPUUniforms;              /*                                   80 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -116,10 +131,24 @@ typedef struct PlayerState {
 
     /* ── SDL handles ── */
     SDL_Window         *window;
-    SDL_Renderer       *renderer;
-    SDL_Texture        *texture;
-    SDL_AudioStream    *audio_stream;    /* SDL3: owns the device   */
-    SDL_AudioSpec       audio_spec;       /* actual device spec         */
+    SDL_AudioStream    *audio_stream;    /* SDL3: owns the device        */
+    SDL_AudioSpec       audio_spec;       /* actual device spec           */
+
+    /* ── SDL_GPU handles (lifetime: application) ── */
+    SDL_GPUDevice              *gpu_device;
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv;   /* planar YUV420P   */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_nv12;  /* NV12 / P010      */
+    SDL_GPUSampler             *gpu_sampler;         /* linear filtering */
+
+    /* ── SDL_GPU handles (lifetime: per-file, created/destroyed in player_open/close) ── */
+    SDL_GPUTexture             *gpu_tex_y;           /* Y plane          */
+    SDL_GPUTexture             *gpu_tex_u;           /* U (planar) or UV (NV12) */
+    SDL_GPUTexture             *gpu_tex_v;           /* V (planar), NULL for NV12 */
+    SDL_GPUTransferBuffer      *gpu_xfer_y;          /* CPU→GPU staging  */
+    SDL_GPUTransferBuffer      *gpu_xfer_u;
+    SDL_GPUTransferBuffer      *gpu_xfer_v;
+    int                         gpu_is_nv12;         /* 1 = NV12/P010 path */
+    GPUUniforms                 gpu_uniforms;         /* current color params */
 
     /* ── Timing / A/V sync ── */
     double              audio_clock;      /* current audio PTS in secs  */
@@ -150,7 +179,7 @@ typedef struct PlayerState {
     int                 vid_w, vid_h;     /* video native resolution    */
     SDL_Rect            display_rect;     /* letterboxed video area     */
 
-    /* ── Overlays ── */
+    /* ── Overlays (Phase 2 — disabled during Phase 1 GPU migration) ── */
     int                 show_debug;
     int                 show_info;
 
@@ -170,7 +199,7 @@ typedef struct PlayerState {
     int                 sub_valid;          /* 1 = sub_text should display  */
     int                 sub_is_bitmap;      /* 1 = bitmap sub, 0 = text     */
 
-    /* Bitmap subtitle textures (PGS, VobSub, DVB) */
+    /* Bitmap subtitle textures — Phase 2: convert to GPU textures */
     SDL_Texture        *sub_bitmaps[MAX_SUB_BITMAPS];
     SDL_Rect            sub_bitmap_rects[MAX_SUB_BITMAPS];
     int                 sub_bitmap_count;
@@ -210,10 +239,16 @@ void  player_close(PlayerState *ps);
 int   demux_thread_func(void *arg);
 int   video_decode_frame(PlayerState *ps);
 void  video_display(PlayerState *ps);
+void  video_reblit(PlayerState *ps);
 void  player_seek(PlayerState *ps, double incr);
 void  player_build_media_info(PlayerState *ps);
 void  player_build_debug_info(PlayerState *ps);
 void  player_update_display_rect(PlayerState *ps);
+
+/* ── GPU Init (player.c) ──────────────────────────────────────────── */
+
+int   gpu_create_pipelines(PlayerState *ps);
+void  gpu_destroy_pipelines(PlayerState *ps);
 
 /* ── Audio API (audio.c) ──────────────────────────────────────────── */
 
@@ -234,6 +269,7 @@ void  sub_cycle(PlayerState *ps);
 void  sub_decode_pending(PlayerState *ps);
 int   sub_init_font(void);
 void  sub_close_font(void);
+/* Phase 2: sub_render will be reworked for GPU compositing */
 void  sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h);
 
 /* ── Logging API (log.c) ───────────────────────────────────────────── */
@@ -248,7 +284,8 @@ static inline double get_time_sec(void) {
     return (double)av_gettime_relative() / 1000000.0;
 }
 
-/* SDL3 render functions use SDL_FRect. Convert from our int rects. */
+/* SDL3 render functions use SDL_FRect. Convert from our int rects.
+ * Retained for Phase 2 overlay compositing. */
 static inline SDL_FRect rect_to_frect(const SDL_Rect *r) {
     return (SDL_FRect){ (float)r->x, (float)r->y, (float)r->w, (float)r->h };
 }

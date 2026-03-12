@@ -1,14 +1,17 @@
 /*
  * DSVP — Dead Simple Video Player
- * main.c — Entry point, SDL initialization, event loop, overlays
+ * main.c — Entry point, SDL initialization, event loop
  *
  * This is the application's main loop. It:
  *   1. Initializes SDL (video, audio, events)
- *   2. Creates the window and renderer
- *   3. Processes keyboard/mouse events
- *   4. Drives video decode and rendering
- *   5. Draws overlay text (debug, media info)
- *   6. Handles the native file-open dialog
+ *   2. Creates the window and GPU device (SDL_GPU)
+ *   3. Compiles HLSL shaders via shadercross
+ *   4. Processes keyboard/mouse events
+ *   5. Drives video decode and rendering via GPU
+ *
+ * Phase 1 (v0.1.4-beta): Video-only GPU rendering. Overlays (debug,
+ * info, seek bar, subtitles) are disabled — log output provides all
+ * diagnostic data. Phase 2 will composite overlays as GPU textures.
  */
 
 #include "dsvp.h"
@@ -105,302 +108,42 @@ static int open_file_dialog(char *out, int out_size) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * Simple Text Overlay
+ * GPU Idle Screen (no media loaded)
  * ═══════════════════════════════════════════════════════════════════
  *
- * Phase 1 uses basic SDL rectangle-based text rendering.
- * Each character is drawn as a small filled rect (bitmap font style).
- * This is intentionally crude — Phase 2 will add proper GUI via Nuklear.
- *
- * For now we use a simple approach: render a semi-transparent background
- * box and draw monospace text character by character using a minimal
- * built-in bitmap font.
+ * Phase 1: simple dark background clear via GPU. No text rendering.
+ * Phase 2 will composite text overlays as GPU textures.
  */
 
-/* Minimal 5x7 bitmap font - covers ASCII 32-126.
- * Each character is 5 columns × 7 rows, stored as 7 bytes (1 bit per pixel column).
- * This avoids any dependency on font files or SDL_ttf. */
+static void gpu_draw_idle(PlayerState *ps) {
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
+    if (!cmd) return;
 
-static const uint8_t font_5x7[][7] = {
-    /* ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* '!' */ {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
-    /* '"' */ {0x0A,0x0A,0x00,0x00,0x00,0x00,0x00},
-    /* '#' */ {0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A},
-    /* '$' */ {0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04},
-    /* '%' */ {0x18,0x19,0x02,0x04,0x08,0x13,0x03},
-    /* '&' */ {0x08,0x14,0x14,0x08,0x15,0x12,0x0D},
-    /* ''' */ {0x04,0x04,0x00,0x00,0x00,0x00,0x00},
-    /* '(' */ {0x02,0x04,0x08,0x08,0x08,0x04,0x02},
-    /* ')' */ {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
-    /* '*' */ {0x04,0x15,0x0E,0x1F,0x0E,0x15,0x04},
-    /* '+' */ {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
-    /* ',' */ {0x00,0x00,0x00,0x00,0x00,0x04,0x08},
-    /* '-' */ {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
-    /* '.' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x04},
-    /* '/' */ {0x01,0x01,0x02,0x04,0x08,0x10,0x10},
-    /* '0' */ {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
-    /* '1' */ {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-    /* '2' */ {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
-    /* '3' */ {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E},
-    /* '4' */ {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
-    /* '5' */ {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
-    /* '6' */ {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},
-    /* '7' */ {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
-    /* '8' */ {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
-    /* '9' */ {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
-    /* ':' */ {0x00,0x00,0x04,0x00,0x00,0x04,0x00},
-    /* ';' */ {0x00,0x00,0x04,0x00,0x00,0x04,0x08},
-    /* '<' */ {0x02,0x04,0x08,0x10,0x08,0x04,0x02},
-    /* '=' */ {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00},
-    /* '>' */ {0x08,0x04,0x02,0x01,0x02,0x04,0x08},
-    /* '?' */ {0x0E,0x11,0x01,0x02,0x04,0x00,0x04},
-    /* '@' */ {0x0E,0x11,0x17,0x15,0x17,0x10,0x0E},
-    /* 'A' */ {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
-    /* 'B' */ {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
-    /* 'C' */ {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
-    /* 'D' */ {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},
-    /* 'E' */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
-    /* 'F' */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
-    /* 'G' */ {0x0E,0x11,0x10,0x17,0x11,0x11,0x0E},
-    /* 'H' */ {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
-    /* 'I' */ {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},
-    /* 'J' */ {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},
-    /* 'K' */ {0x11,0x12,0x14,0x18,0x14,0x12,0x11},
-    /* 'L' */ {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-    /* 'M' */ {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},
-    /* 'N' */ {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
-    /* 'O' */ {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
-    /* 'P' */ {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-    /* 'Q' */ {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
-    /* 'R' */ {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
-    /* 'S' */ {0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E},
-    /* 'T' */ {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
-    /* 'U' */ {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
-    /* 'V' */ {0x11,0x11,0x11,0x11,0x0A,0x0A,0x04},
-    /* 'W' */ {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},
-    /* 'X' */ {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
-    /* 'Y' */ {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
-    /* 'Z' */ {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
-    /* '[' */ {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
-    /* '\' */ {0x10,0x10,0x08,0x04,0x02,0x01,0x01},
-    /* ']' */ {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
-    /* '^' */ {0x04,0x0A,0x11,0x00,0x00,0x00,0x00},
-    /* '_' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x1F},
-    /* '`' */ {0x08,0x04,0x00,0x00,0x00,0x00,0x00},
-    /* 'a' */ {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F},
-    /* 'b' */ {0x10,0x10,0x1E,0x11,0x11,0x11,0x1E},
-    /* 'c' */ {0x00,0x00,0x0E,0x11,0x10,0x11,0x0E},
-    /* 'd' */ {0x01,0x01,0x0F,0x11,0x11,0x11,0x0F},
-    /* 'e' */ {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E},
-    /* 'f' */ {0x06,0x08,0x1E,0x08,0x08,0x08,0x08},
-    /* 'g' */ {0x00,0x00,0x0F,0x11,0x0F,0x01,0x0E},
-    /* 'h' */ {0x10,0x10,0x1E,0x11,0x11,0x11,0x11},
-    /* 'i' */ {0x04,0x00,0x0C,0x04,0x04,0x04,0x0E},
-    /* 'j' */ {0x02,0x00,0x06,0x02,0x02,0x12,0x0C},
-    /* 'k' */ {0x10,0x10,0x12,0x14,0x18,0x14,0x12},
-    /* 'l' */ {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E},
-    /* 'm' */ {0x00,0x00,0x1A,0x15,0x15,0x15,0x15},
-    /* 'n' */ {0x00,0x00,0x1E,0x11,0x11,0x11,0x11},
-    /* 'o' */ {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E},
-    /* 'p' */ {0x00,0x00,0x1E,0x11,0x1E,0x10,0x10},
-    /* 'q' */ {0x00,0x00,0x0F,0x11,0x0F,0x01,0x01},
-    /* 'r' */ {0x00,0x00,0x16,0x19,0x10,0x10,0x10},
-    /* 's' */ {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E},
-    /* 't' */ {0x08,0x08,0x1E,0x08,0x08,0x09,0x06},
-    /* 'u' */ {0x00,0x00,0x11,0x11,0x11,0x11,0x0F},
-    /* 'v' */ {0x00,0x00,0x11,0x11,0x0A,0x0A,0x04},
-    /* 'w' */ {0x00,0x00,0x11,0x11,0x15,0x15,0x0A},
-    /* 'x' */ {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11},
-    /* 'y' */ {0x00,0x00,0x11,0x11,0x0F,0x01,0x0E},
-    /* 'z' */ {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F},
-    /* '{' */ {0x02,0x04,0x04,0x08,0x04,0x04,0x02},
-    /* '|' */ {0x04,0x04,0x04,0x04,0x04,0x04,0x04},
-    /* '}' */ {0x08,0x04,0x04,0x02,0x04,0x04,0x08},
-    /* '~' */ {0x00,0x00,0x08,0x15,0x02,0x00,0x00},
-};
-
-/* Draw a single character at (x,y) using the bitmap font. Scale=pixel size. */
-static void draw_char(SDL_Renderer *r, int x, int y, char ch, int scale) {
-    if (ch < 32 || ch > 126) ch = '?';
-    int idx = ch - 32;
-
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = font_5x7[idx][row];
-        for (int col = 0; col < 5; col++) {
-            if (bits & (1 << (4 - col))) {
-                SDL_FRect px = { (float)(x + col * scale), (float)(y + row * scale), (float)scale, (float)scale };
-                SDL_RenderFillRect(r, &px);
-            }
-        }
+    SDL_GPUTexture *swapchain_tex = NULL;
+    Uint32 sc_w, sc_h;
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, ps->window,
+            &swapchain_tex, &sc_w, &sc_h)) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
     }
-}
-
-/* Draw a string. Returns the Y position after the last line. */
-static int draw_text(SDL_Renderer *r, int x, int y, const char *text,
-                     int scale, SDL_Color fg) {
-    SDL_SetRenderDrawColor(r, fg.r, fg.g, fg.b, fg.a);
-
-    int cx = x, cy = y;
-    int char_w = 6 * scale;  /* 5px + 1px gap */
-    int char_h = 8 * scale;  /* 7px + 1px gap */
-
-    for (const char *p = text; *p; p++) {
-        if (*p == '\n') {
-            cx = x;
-            cy += char_h;
-            continue;
-        }
-        draw_char(r, cx, cy, *p, scale);
-        cx += char_w;
+    if (!swapchain_tex) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
     }
-    return cy + char_h;
-}
 
-/* Draw a semi-transparent overlay background, then text on top. */
-static void draw_overlay(SDL_Renderer *renderer, const char *text,
-                         int x, int y, int scale) {
-    /* Estimate text bounds */
-    int max_w = 0, cur_w = 0, lines = 1;
-    for (const char *p = text; *p; p++) {
-        if (*p == '\n') { lines++; cur_w = 0; }
-        else { cur_w++; if (cur_w > max_w) max_w = cur_w; }
-    }
-    int pad = 8;
-    int box_w = max_w * 6 * scale + pad * 2;
-    int box_h = lines * 8 * scale + pad * 2;
+    /* Dark background — same color as old idle screen (24, 24, 28) */
+    SDL_GPUColorTargetInfo color_target;
+    SDL_zero(color_target);
+    color_target.texture    = swapchain_tex;
+    color_target.clear_color = (SDL_FColor){ 0.094f, 0.094f, 0.110f, 1.0f };
+    color_target.load_op    = SDL_GPU_LOADOP_CLEAR;
+    color_target.store_op   = SDL_GPU_STOREOP_STORE;
 
-    /* Background */
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 180);
-    SDL_FRect bg = { (float)(x - pad), (float)(y - pad), (float)box_w, (float)box_h };
-    SDL_RenderFillRect(renderer, &bg);
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    /* Empty pass — just the clear */
+    SDL_EndGPURenderPass(pass);
 
-    /* Text */
-    SDL_Color white = {220, 220, 220, 255};
-    draw_text(renderer, x, y, text, scale, white);
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * Seek Bar & Volume Overlay
- * ═══════════════════════════════════════════════════════════════════ */
-
-static void draw_seek_bar(PlayerState *ps) {
-    if (!ps->playing || !ps->fmt_ctx) return;
-
-    double duration = (ps->fmt_ctx->duration != AV_NOPTS_VALUE)
-        ? (double)ps->fmt_ctx->duration / AV_TIME_BASE : 0.0;
-    if (duration <= 0.0) return;
-
-    double pos = ps->video_clock;
-    double frac = pos / duration;
-    if (frac < 0.0) frac = 0.0;
-    if (frac > 1.0) frac = 1.0;
-
-    int w, h;
-    SDL_GetWindowSize(ps->window, &w, &h);
-
-    int bar_h   = 4;
-    int bar_y   = h - 30;
-    int bar_x   = 20;
-    int bar_w   = w - 40;
-
-    SDL_SetRenderDrawBlendMode(ps->renderer, SDL_BLENDMODE_BLEND);
-
-    /* Track background */
-    SDL_SetRenderDrawColor(ps->renderer, 100, 100, 100, 150);
-    SDL_FRect track = { (float)bar_x, (float)bar_y, (float)bar_w, (float)bar_h };
-    SDL_RenderFillRect(ps->renderer, &track);
-
-    /* Filled portion */
-    SDL_SetRenderDrawColor(ps->renderer, 200, 200, 200, 220);
-    SDL_FRect filled = { (float)bar_x, (float)bar_y, (float)(bar_w * frac), (float)bar_h };
-    SDL_RenderFillRect(ps->renderer, &filled);
-
-    /* Time text */
-    int pos_m = (int)pos / 60, pos_s = (int)pos % 60;
-    int dur_m = (int)duration / 60, dur_s = (int)duration % 60;
-    char time_str[64];
-    snprintf(time_str, sizeof(time_str), "%d:%02d / %d:%02d", pos_m, pos_s, dur_m, dur_s);
-    SDL_Color dim = {180, 180, 180, 200};
-    draw_text(ps->renderer, bar_x, bar_y + 8, time_str, 1, dim);
-
-    /* Volume indicator */
-    char vol_str[32];
-    snprintf(vol_str, sizeof(vol_str), "Vol: %.0f%%", ps->volume * 100.0);
-    draw_text(ps->renderer, bar_x + bar_w - 60, bar_y + 8, vol_str, 1, dim);
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * Idle Screen (no media loaded)
- * ═══════════════════════════════════════════════════════════════════ */
-
-static void draw_idle_screen(PlayerState *ps) {
-    SDL_SetRenderDrawColor(ps->renderer, 24, 24, 28, 255);
-    SDL_RenderClear(ps->renderer);
-
-    int w, h;
-    SDL_GetWindowSize(ps->window, &w, &h);
-
-    const char *title = "DSVP";
-    const char *ver   = "Dead Simple Video Player v" DSVP_VERSION;
-    const char *help  =
-        "[O] Open file\n"
-        "[Q] Quit\n"
-        "[F] Fullscreen\n"
-        "[A] Cycle audio tracks\n"
-        "[S] Cycle subtitles\n"
-        "[D] Debug overlay\n"
-        "[I] Media info\n"
-        "\n"
-        "Arrow keys: seek / volume\n"
-        "Space: pause/resume\n"
-        "Double-click: fullscreen";
-
-    /* Title */
-    int scale = 3;
-    int tx = (w - 4 * 6 * scale) / 2;
-    SDL_Color bright = {200, 200, 210, 255};
-    draw_text(ps->renderer, tx, h / 4, title, scale, bright);
-
-    /* Subtitle */
-    scale = 1;
-    int sx = (w - (int)strlen(ver) * 6 * scale) / 2;
-    SDL_Color dim = {120, 120, 130, 255};
-    draw_text(ps->renderer, sx, h / 4 + 30, ver, scale, dim);
-
-    /* Help */
-    SDL_Color help_col = {160, 160, 170, 255};
-    draw_text(ps->renderer, 30, h / 2, help, 2, help_col);
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * Hover Menu
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Track mouse hover state for the top menu bar */
-typedef struct {
-    int visible;
-} MenuState;
-
-static void draw_menu(PlayerState *ps, MenuState *menu) {
-    if (!menu->visible) return;
-
-    int w, h;
-    SDL_GetWindowSize(ps->window, &w, &h);
-
-    /* Menu bar background */
-    SDL_SetRenderDrawBlendMode(ps->renderer, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(ps->renderer, 30, 30, 34, 220);
-    SDL_FRect bar = { 0.0f, 0.0f, (float)w, 32.0f };
-    SDL_RenderFillRect(ps->renderer, &bar);
-
-    /* Menu items */
-    SDL_Color menu_col = {180, 180, 190, 255};
-    const char *items = "[O]Open  [A]Audio  [S]Subs  [F]Fullscreen  [D]Debug  [I]Info  [Q]Quit";
-    draw_text(ps->renderer, 10, 10, items, 1, menu_col);
+    SDL_SubmitGPUCommandBuffer(cmd);
 }
 
 
@@ -411,13 +154,21 @@ static void draw_menu(PlayerState *ps, MenuState *menu) {
 int main(int argc, char *argv[]) {
     /* ── Initialize logging (before anything else) ── */
     log_init();
-    log_msg("Starting DSVP (argc=%d)", argc);
+    log_msg("Starting DSVP v" DSVP_VERSION " (argc=%d)", argc);
 
     /* ── Initialize SDL ── */
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         fprintf(stderr, "[DSVP] SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+
+    /* ── Initialize shadercross (must be before GPU device creation) ── */
+    if (!SDL_ShaderCross_Init()) {
+        fprintf(stderr, "[DSVP] SDL_ShaderCross_Init failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+    log_msg("SDL_ShaderCross initialized");
 
     /* Suppress FFmpeg's internal warnings (container quirks, timestamp
      * heuristics, etc.). In debug builds, keep them visible. */
@@ -435,27 +186,47 @@ int main(int argc, char *argv[]) {
     );
     if (!window) {
         fprintf(stderr, "[DSVP] Cannot create window: %s\n", SDL_GetError());
+        SDL_ShaderCross_Quit();
         SDL_Quit();
         return 1;
     }
 
-    /* ── Create renderer ──
-     * SDL3: no flags parameter. GPU acceleration is the default.
-     * VSync is set separately via SDL_SetRenderVSync(). */
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, NULL);
-    if (!renderer) {
-        fprintf(stderr, "[DSVP] Cannot create renderer: %s\n", SDL_GetError());
+    /* ── Create GPU device ──
+     * SDL_GPU replaces SDL_Renderer. Uses shadercross to query which
+     * shader formats the platform supports (DXIL on Windows D3D12,
+     * SPIRV on Vulkan, MSL on Metal). Debug mode enables GPU validation. */
+    SDL_GPUDevice *gpu_device = SDL_CreateGPUDevice(
+        SDL_ShaderCross_GetSPIRVShaderFormats(),
+        true,   /* debug_mode — GPU validation layers */
+        NULL    /* preferred driver — auto-select */
+    );
+    if (!gpu_device) {
+        fprintf(stderr, "[DSVP] Cannot create GPU device: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
+        SDL_ShaderCross_Quit();
+        SDL_Quit();
+        return 1;
+    }
+    log_msg("GPU device created (driver: %s)",
+            SDL_GetGPUDeviceDriver(gpu_device));
+
+    /* ── Claim window for GPU rendering ── */
+    if (!SDL_ClaimWindowForGPUDevice(gpu_device, window)) {
+        fprintf(stderr, "[DSVP] Cannot claim window for GPU: %s\n", SDL_GetError());
+        SDL_DestroyGPUDevice(gpu_device);
+        SDL_DestroyWindow(window);
+        SDL_ShaderCross_Quit();
         SDL_Quit();
         return 1;
     }
 
-    /* Enable VSync — SDL3 manages the fallback chain internally */
-    SDL_SetRenderVSync(renderer, 1);
+    /* ── Set VSync via swapchain parameters ── */
+    SDL_SetGPUSwapchainParameters(gpu_device, window,
+        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+        SDL_GPU_PRESENTMODE_VSYNC);
+    log_msg("GPU: swapchain set to SDR + VSync");
 
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-
-    /* ── Initialize subtitle font ── */
+    /* ── Initialize subtitle font (Phase 2 will use for GPU overlay) ── */
     if (sub_init_font() < 0) {
         log_msg("WARNING: Subtitle rendering disabled (no font)");
     }
@@ -463,28 +234,29 @@ int main(int argc, char *argv[]) {
     /* ── Initialize player state ── */
     PlayerState ps;
     memset(&ps, 0, sizeof(ps));
-    ps.window   = window;
-    ps.renderer = renderer;
-    ps.volume   = 0.75;
+    ps.window     = window;
+    ps.gpu_device = gpu_device;
+    ps.volume     = 0.75;
     ps.video_stream_idx = -1;
     ps.audio_stream_idx = -1;
     ps.sub_active_idx   = -1;
     ps.win_w = DEFAULT_WIN_W;
     ps.win_h = DEFAULT_WIN_H;
 
-    /* ── Overlay visibility state ── */
-    MenuState menu = {0};
-    int show_overlays = 1;          /* controls both seek bar and menu */
-    double overlay_hide_time = 0.0; /* hide after this timestamp       */
-    double overlay_timeout = 3.0;   /* seconds of inactivity to hide   */
+    /* ── Compile shaders and create GPU pipelines ── */
+    if (gpu_create_pipelines(&ps) < 0) {
+        fprintf(stderr, "[DSVP] GPU pipeline creation failed\n");
+        SDL_DestroyGPUDevice(gpu_device);
+        SDL_DestroyWindow(window);
+        SDL_ShaderCross_Quit();
+        SDL_Quit();
+        return 1;
+    }
 
     /* ── Open file from command line if provided ── */
     if (argc > 1) {
         if (player_open(&ps, argv[1]) != 0) {
             log_msg("ERROR: Failed to open: %s", argv[1]);
-        } else {
-            show_overlays = 1;
-            overlay_hide_time = get_time_sec() + overlay_timeout;
         }
     }
 
@@ -524,9 +296,6 @@ int main(int argc, char *argv[]) {
                         ps.quit = 0;
                         if (player_open(&ps, path) != 0) {
                             log_msg("ERROR: Failed to open: %s", path);
-                        } else {
-                            show_overlays = 1;
-                            overlay_hide_time = get_time_sec() + overlay_timeout;
                         }
                     } else {
                         log_msg("File dialog cancelled");
@@ -551,8 +320,6 @@ int main(int argc, char *argv[]) {
                         if (!ps.paused) {
                             ps.frame_timer = get_time_sec();
                         }
-                        show_overlays = 1;
-                        overlay_hide_time = get_time_sec() + overlay_timeout;
                     }
                     break;
 
@@ -571,35 +338,38 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_D:
+                    /* Debug overlay disabled in Phase 1 — data goes to log */
                     ps.show_debug = !ps.show_debug;
+                    if (ps.show_debug) {
+                        log_msg("Debug overlay requested (Phase 1: log only)");
+                        player_build_debug_info(&ps);
+                        log_msg("%s", ps.debug_info);
+                    }
                     break;
 
                 case SDLK_I:
+                    /* Info overlay disabled in Phase 1 — data goes to log */
                     ps.show_info = !ps.show_info;
+                    if (ps.show_info) {
+                        log_msg("Media info requested (Phase 1: log only)");
+                        log_msg("%s", ps.media_info);
+                    }
                     break;
 
                 case SDLK_S:
                     sub_cycle(&ps);
-                    show_overlays = 1;
-                    overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
                 case SDLK_A:
                     audio_cycle(&ps);
-                    show_overlays = 1;
-                    overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
                 case SDLK_LEFT:
                     player_seek(&ps, -SEEK_STEP_SEC);
-                    show_overlays = 1;
-                    overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
                 case SDLK_RIGHT:
                     player_seek(&ps, SEEK_STEP_SEC);
-                    show_overlays = 1;
-                    overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
                 case SDLK_UP:
@@ -607,8 +377,6 @@ int main(int argc, char *argv[]) {
                     if (ps.volume > 1.0) ps.volume = 1.0;
                     if (ps.audio_stream)
                         SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
-                    show_overlays = 1;
-                    overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
                 case SDLK_DOWN:
@@ -616,8 +384,6 @@ int main(int argc, char *argv[]) {
                     if (ps.volume < 0.0) ps.volume = 0.0;
                     if (ps.audio_stream)
                         SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
-                    show_overlays = 1;
-                    overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
                 default:
@@ -640,7 +406,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                /* Click on seek bar to seek */
+                /* Click on seek bar to seek (Phase 2: re-enable with overlays) */
                 if (ev.button.button == SDL_BUTTON_LEFT && ps.playing) {
                     int w_now, h_now;
                     SDL_GetWindowSize(window, &w_now, &h_now);
@@ -658,9 +424,7 @@ int main(int argc, char *argv[]) {
                 break;
 
             case SDL_EVENT_MOUSE_MOTION:
-                /* Show overlays on any mouse movement */
-                show_overlays = 1;
-                overlay_hide_time = get_time_sec() + overlay_timeout;
+                /* Phase 2: show/hide overlays on mouse movement */
                 SDL_ShowCursor();
                 break;
 
@@ -673,46 +437,24 @@ int main(int argc, char *argv[]) {
 
         /* ── Render ── */
         if (ps.playing && !ps.paused) {
-            /* Decode pending subtitles */
+            /* Decode pending subtitles (still queued for Phase 2) */
             sub_decode_pending(&ps);
 
             /* ── Video decode and A/V sync ──
              *
-             * Two-tier pacing:
+             * Two-tier pacing (unchanged from SDL_Renderer version):
              *   1. frame_timer governs WHEN to show a new frame based
-             *      on content frame rate (e.g. every ~41.7ms for 24fps).
-             *   2. VSync (when available) governs the render loop rate.
-             *      On ticks where no new frame is due, we re-blit the
-             *      current texture (required by GPU double-buffering).
+             *      on content frame rate.
+             *   2. VSync (via GPU swapchain) governs render loop rate.
              *
-             * The decode loop consumes ALL frames that are due by now,
-             * keeping only the last for display. This handles every
-             * combination of content FPS and display refresh rate:
-             *
-             *   24fps on  60Hz → ~1 decode every 2-3 VSync ticks
-             *   59fps on 122Hz → ~1 decode every 2 VSync ticks
-             *   60fps on  60Hz → ~1 decode per tick (with jitter safety)
-             *  120fps on  60Hz → ~2 decodes per tick, display the latest
-             *
-             * A/V sync adjusts frame_timer forward (video ahead of
-             * audio) or collapses delay to zero (video behind audio).
-             * If video is >50ms behind, the frame is decoded but not
-             * displayed, letting video catch up without audio glitches.
-             *
-             * No explicit SDL_Delay in the active-playback path —
-             * VSync in SDL_RenderPresent provides the heartbeat. If
-             * VSync is unavailable, a 1ms yield prevents CPU spin. */
+             * video_display() handles the full GPU submission:
+             *   copy pass (upload planes) → render pass (shader draw) → submit.
+             * video_reblit() re-draws the last frame without uploading. */
             double now = get_time_sec();
             int new_frame = 0;
             int decoded_any = 0;
             int decoded_this_tick = 0;
 
-            /* Decode all frames that are due by now. When content FPS
-             * exceeds display refresh (e.g. 120fps on 60Hz), multiple
-             * frames may be due per tick — we decode them all but only
-             * display the last one, which is what the viewer sees.
-             * Cap at 4 iterations to prevent runaway loops on extreme
-             * clock jumps (e.g. system suspend/resume). */
             int max_catchup = 4;
             while (now >= ps.frame_timer && max_catchup-- > 0) {
                 int vret = video_decode_frame(&ps);
@@ -736,60 +478,25 @@ int main(int argc, char *argv[]) {
                         double threshold = fmax(pts_delay, 0.01);
 
                         if (av_diff > threshold) {
-                            /* Video is ahead — stretch the delay */
                             delay = pts_delay + av_diff;
                         } else if (av_diff < -threshold) {
-                            /* Video is behind — catch up gradually */
                             delay = 0.0;
                         }
 
-                        /* Track worst drift — only during steady-state
-                         * playback. Seek recovery drift is transient
-                         * and would pollute the peak measurement. */
                         if (!ps.seek_recovering &&
                                 fabs(av_diff) > fabs(ps.diag_max_av_drift))
                             ps.diag_max_av_drift = av_diff;
                     }
 
-                    /* ── Minimum delay floor ──
-                     *
-                     * When delay = 0 (video behind audio), frame_timer
-                     * doesn't advance, so the while loop immediately
-                     * decodes ANOTHER frame on the same tick — creating
-                     * a micro-stutter (one frame held too long, the
-                     * next silently skipped).
-                     *
-                     * Fix: always advance frame_timer by at least half
-                     * the nominal frame duration. This limits catch-up
-                     * to ~2x real-time: one extra frame per normal
-                     * interval, spread across successive VSync ticks
-                     * instead of bursting on one.
-                     *
-                     * For 24fps on 60Hz: min_delay = ~20.8ms, VSync =
-                     * 16.7ms → at most 1 decode per tick, catch-up at
-                     * ~48fps until sync is restored.
-                     *
-                     * For 120fps on 60Hz: min_delay = ~4.2ms, VSync =
-                     * 16.7ms → up to 4 decodes per tick, which matches
-                     * the genuine 2:1 frame ratio. */
+                    /* Minimum delay floor */
                     double min_delay = ps.frame_last_delay * 0.5;
                     if (delay < min_delay)
                         delay = min_delay;
 
-                    /* Schedule next frame */
                     ps.frame_timer += delay;
-
-                    /* Mark for display (overwritten each iteration —
-                     * only the last decoded frame gets displayed) */
                     new_frame = 1;
 
-                    /* If video is >50ms behind audio, decode but don't
-                     * display — let video catch up. Suppressed while
-                     * seek_recovering is set (waiting for the first
-                     * displayed frame post-seek). This adapts to any
-                     * codec: H.264 recovers in ~100ms, HEVC with long
-                     * GOPs may take 5–10 seconds of decode before the
-                     * first displayable frame arrives. */
+                    /* Drop frame if video is >50ms behind audio */
                     if (ps.audio_stream_idx >= 0 && av_diff < -0.05
                             && !ps.seek_recovering) {
                         new_frame = 0;
@@ -799,7 +506,6 @@ int main(int argc, char *argv[]) {
                                 ps.video_clock, av_diff * 1000.0);
                     }
                 } else {
-                    /* No packet available or decode error — stop loop */
                     if (vret < 0) {
                         log_msg("Video decode error at clock=%.3f",
                                 ps.video_clock);
@@ -813,14 +519,11 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Track multi-decode ticks (content FPS > display Hz) */
             if (decoded_this_tick > 1) {
                 ps.diag_multi_decodes++;
             }
 
-            /* If frame_timer drifted too far behind (system suspend,
-             * extreme stall, etc.), snap it forward to prevent a burst
-             * of catch-up decodes on the next tick */
+            /* Snap forward on extreme stall */
             if (ps.frame_timer < now - 0.1) {
                 ps.frame_timer = now;
                 ps.diag_timer_snaps++;
@@ -828,15 +531,11 @@ int main(int argc, char *argv[]) {
                         "(stall recovery at %.3fs)", ps.video_clock);
             }
 
-            /* Display the last decoded frame */
+            /* Display the last decoded frame via GPU */
             if (new_frame) {
                 video_display(&ps);
                 ps.diag_frames_displayed++;
 
-                /* First frame after a seek — recovery complete.
-                 * Reset frame_timer so pacing starts fresh from
-                 * this moment rather than trying to catch up from
-                 * the stale pre-seek timer value. */
                 if (ps.seek_recovering) {
                     ps.seek_recovering = 0;
                     ps.frame_timer = get_time_sec();
@@ -845,7 +544,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* ── Periodic diagnostics (every 10 seconds) ── */
+            /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
                 double av_now = (ps.audio_stream_idx >= 0)
                     ? ps.video_clock - ps.audio_clock : 0.0;
@@ -863,81 +562,28 @@ int main(int argc, char *argv[]) {
                 ps.diag_last_report = now;
             }
 
-            /* Re-blit current texture on ticks with no new frame.
-             * GPU double-buffering: back buffer is undefined after
-             * swap, so we must always render explicitly. */
-            if (!new_frame && ps.playing && ps.texture) {
-                SDL_SetRenderDrawColor(ps.renderer, 0, 0, 0, 255);
-                SDL_RenderClear(ps.renderer);
-                player_update_display_rect(&ps);
-                {SDL_FRect _dr = rect_to_frect(&ps.display_rect); SDL_RenderTexture(ps.renderer, ps.texture, NULL, &_dr);}
+            /* Re-blit on ticks with no new frame (GPU double-buffering) */
+            if (!new_frame && ps.playing && ps.gpu_tex_y) {
+                video_reblit(&ps);
             }
 
-            /* If VSync is unavailable (SDL_RenderPresent returns
-             * instantly), we'd spin at 100% CPU on re-blit ticks.
-             * Yield briefly when we had nothing new to decode. */
+            /* Yield when VSync is unavailable and nothing was decoded */
             if (!decoded_any) {
                 SDL_Delay(1);
             }
         } else if (ps.playing && ps.paused) {
             /* Paused — decode pending subs, redraw current frame */
             sub_decode_pending(&ps);
-            if (ps.texture) {
-                SDL_SetRenderDrawColor(ps.renderer, 0, 0, 0, 255);
-                SDL_RenderClear(ps.renderer);
-                player_update_display_rect(&ps);
-                {SDL_FRect _dr = rect_to_frect(&ps.display_rect); SDL_RenderTexture(ps.renderer, ps.texture, NULL, &_dr);}
+            if (ps.gpu_tex_y) {
+                video_reblit(&ps);
             }
         } else {
             /* No media loaded — draw idle screen */
-            draw_idle_screen(&ps);
+            gpu_draw_idle(&ps);
             SDL_ShowCursor();
         }
 
-        /* ── Draw overlays ── */
-        if (ps.playing) {
-            /* Subtitles — always visible when active (independent of overlay timer) */
-            sub_render(&ps, ps.renderer, ps.win_w, ps.win_h);
-            /* Auto-hide timer check */
-            if (show_overlays && get_time_sec() > overlay_hide_time) {
-                show_overlays = 0;
-                SDL_HideCursor();
-            }
-
-            /* Seek bar + menu bar (unified visibility) */
-            if (show_overlays) {
-                draw_seek_bar(&ps);
-                menu.visible = 1;
-                draw_menu(&ps, &menu);
-            } else {
-                menu.visible = 0;
-            }
-
-            /* Debug overlay */
-            if (ps.show_debug) {
-                player_build_debug_info(&ps);
-                draw_overlay(ps.renderer, ps.debug_info, 10, 40, 2);
-            }
-
-            /* Media info overlay */
-            if (ps.show_info) {
-                draw_overlay(ps.renderer, ps.media_info, 10, 40, 2);
-            }
-
-            /* Pause indicator */
-            if (ps.paused) {
-                int w, h;
-                SDL_GetWindowSize(window, &w, &h);
-                SDL_Color pause_col = {200, 200, 200, 180};
-                draw_text(ps.renderer, w / 2 - 30, h / 2 - 10,
-                          "PAUSED", 2, pause_col);
-            }
-        }
-
-        /* Present everything */
-        SDL_RenderPresent(ps.renderer);
-
-        /* Don't burn CPU when idle */
+        /* Don't burn CPU when idle or paused */
         if (!ps.playing || ps.paused) {
             SDL_Delay(16); /* ~60fps idle */
         }
@@ -947,8 +593,11 @@ int main(int argc, char *argv[]) {
     log_msg("Shutting down");
     if (ps.playing) player_close(&ps);
     sub_close_font();
-    SDL_DestroyRenderer(renderer);
+    gpu_destroy_pipelines(&ps);
+    SDL_ReleaseWindowFromGPUDevice(gpu_device, window);
+    SDL_DestroyGPUDevice(gpu_device);
     SDL_DestroyWindow(window);
+    SDL_ShaderCross_Quit();
     SDL_Quit();
     log_close();
 

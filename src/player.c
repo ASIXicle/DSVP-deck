@@ -11,12 +11,444 @@
  *   Audio is the master clock. Video frame display timing is adjusted
  *   to match the audio clock. This is the standard approach (same as
  *   ffplay) because audio glitches are far more perceptible than
- *   dropped/delayed video frames. Words so I can remove embarassing commit spelling error
- *   ok git, explain this: git commit -m "optimization: adaptive seek recovery, SWS_POINT for format-only conversion, min-delay floor"
+ *   dropped/delayed video frames.
  *
+ * Rendering (v0.1.4 — SDL_GPU):
+ *   Video frames are uploaded to GPU textures (R8_UNORM per plane)
+ *   and converted YUV→RGB by a custom HLSL fragment shader compiled
+ *   at runtime via SDL3_shadercross. This replaces SDL_Renderer and
+ *   unlocks future P010 10-bit passthrough, HDR10, and anisotropy.
  */
 
 #include "dsvp.h"
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * HLSL Shader Sources (compiled at runtime via shadercross)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * SDL_GPU binding convention (CRITICAL — wrong spaces = black screen):
+ *   Fragment textures/samplers: space2 (SPIR-V set 2)
+ *   Fragment uniform buffers:   space3 (SPIR-V set 3)
+ *   Vertex textures/samplers:   space0 (SPIR-V set 0)
+ *   Vertex uniform buffers:     space1 (SPIR-V set 1)
+ *
+ * CRITICAL: One SamplerState per Texture2D, always. SDL_GPU / SPIRV-Cross
+ * counts "samplers" as texture+sampler pairs. Sharing one SamplerState
+ * across multiple textures causes unpaired textures to be misclassified
+ * as storage textures and bound to wrong slots.
+ */
+
+/* Fullscreen quad — generates 4 vertices from SV_VertexID, no vertex buffer.
+ * Draw with SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0) as triangle-strip. */
+static const char hlsl_fullscreen_vert[] =
+    "struct VSOutput {\n"
+    "    float4 pos : SV_Position;\n"
+    "    float2 uv  : TEXCOORD0;\n"
+    "};\n"
+    "\n"
+    "VSOutput main(uint id : SV_VertexID) {\n"
+    "    VSOutput o;\n"
+    "    o.uv  = float2((id & 1), (id >> 1));\n"
+    "    o.pos = float4(o.uv * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    o.uv.y = 1.0 - o.uv.y;\n"  /* flip Y: video is top-left origin */
+    "    return o;\n"
+    "}\n";
+
+/* Planar YUV420P fragment shader — 3 separate R8 planes (Y, U, V).
+ * Used for all 8-bit content after swscale conversion. */
+static const char hlsl_yuv_planar_frag[] =
+    "Texture2D<float> texY : register(t0, space2);\n"
+    "Texture2D<float> texU : register(t1, space2);\n"
+    "Texture2D<float> texV : register(t2, space2);\n"
+    "SamplerState sampY : register(s0, space2);\n"
+    "SamplerState sampU : register(s1, space2);\n"
+    "SamplerState sampV : register(s2, space2);\n"
+    "\n"
+    "cbuffer Params : register(b0, space3) {\n"
+    "    row_major float4x4 colorMatrix;\n"
+    "    float2 rangeY;\n"
+    "    float2 rangeUV;\n"
+    "};\n"
+    "\n"
+    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    float y  = texY.Sample(sampY, uv).r;\n"
+    "    float cb = texU.Sample(sampU, uv).r;\n"
+    "    float cr = texV.Sample(sampV, uv).r;\n"
+    "\n"
+    "    y  = (y  - rangeY.x)  * rangeY.y;\n"
+    "    cb = (cb - rangeUV.x) * rangeUV.y;\n"
+    "    cr = (cr - rangeUV.x) * rangeUV.y;\n"
+    "\n"
+    "    float4 yuv = float4(y, cb - 0.5, cr - 0.5, 1.0);\n"
+    "    return float4(mul(colorMatrix, yuv).rgb, 1.0);\n"
+    "}\n";
+
+/* NV12/P010 fragment shader — 2 planes (Y + interleaved UV).
+ * Prepared for Phase 1.5 (10-bit passthrough). Not used yet. */
+static const char hlsl_nv12_frag[] =
+    "Texture2D<float>  texY  : register(t0, space2);\n"
+    "Texture2D<float2> texUV : register(t1, space2);\n"
+    "SamplerState sampY  : register(s0, space2);\n"
+    "SamplerState sampUV : register(s1, space2);\n"
+    "\n"
+    "cbuffer Params : register(b0, space3) {\n"
+    "    row_major float4x4 colorMatrix;\n"
+    "    float2 rangeY;\n"
+    "    float2 rangeUV;\n"
+    "};\n"
+    "\n"
+    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    float  y     = texY.Sample(sampY, uv).r;\n"
+    "    float2 cb_cr = texUV.Sample(sampUV, uv).rg;\n"
+    "\n"
+    "    y     = (y     - rangeY.x)  * rangeY.y;\n"
+    "    cb_cr = (cb_cr - rangeUV.x) * rangeUV.y;\n"
+    "\n"
+    "    float4 yuv = float4(y, cb_cr.x - 0.5, cb_cr.y - 0.5, 1.0);\n"
+    "    return float4(mul(colorMatrix, yuv).rgb, 1.0);\n"
+    "}\n";
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Shader Compilation Helper
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Three-step pipeline for shadercross 3.0.0:
+ *   1. HLSL → SPIRV  (CompileSPIRVFromHLSL)
+ *   2. SPIRV → metadata (ReflectGraphicsSPIRV) — resource counts
+ *   3. SPIRV → native  (CompileGraphicsShaderFromSPIRV) — D3D12/Vulkan/Metal
+ *
+ * Note: CompileGraphicsShaderFromHLSL does NOT exist in 3.0.0.
+ */
+
+static SDL_GPUShader *compile_shader(
+    SDL_GPUDevice *device,
+    const char *source,
+    const char *entrypoint,
+    SDL_ShaderCross_ShaderStage stage)
+{
+    const char *stage_name =
+        (stage == SDL_SHADERCROSS_SHADERSTAGE_VERTEX) ? "vert" : "frag";
+
+    /* Step 1: HLSL → SPIRV */
+    SDL_ShaderCross_HLSL_Info hlsl_info;
+    SDL_zero(hlsl_info);
+    hlsl_info.source       = source;
+    hlsl_info.entrypoint   = entrypoint;
+    hlsl_info.include_dir  = NULL;
+    hlsl_info.defines      = NULL;
+    hlsl_info.shader_stage = stage;
+    hlsl_info.props        = 0;
+
+    size_t spirv_size = 0;
+    void *spirv = SDL_ShaderCross_CompileSPIRVFromHLSL(&hlsl_info, &spirv_size);
+    if (!spirv) {
+        log_msg("ERROR: HLSL->SPIRV failed (%s): %s", stage_name, SDL_GetError());
+        return NULL;
+    }
+    log_msg("Shader: HLSL->SPIRV OK (%s, %zu bytes)", stage_name, spirv_size);
+
+    /* Step 2: Reflect SPIRV for resource counts.
+     * Returns a malloc'd struct — must SDL_free when done. */
+    SDL_ShaderCross_GraphicsShaderMetadata *metadata =
+        SDL_ShaderCross_ReflectGraphicsSPIRV(spirv, spirv_size, 0);
+    if (!metadata) {
+        log_msg("ERROR: SPIRV reflection failed: %s", SDL_GetError());
+        SDL_free(spirv);
+        return NULL;
+    }
+    log_msg("Shader: reflect OK (samplers=%u storage_tex=%u uniforms=%u)",
+            metadata->resource_info.num_samplers,
+            metadata->resource_info.num_storage_textures,
+            metadata->resource_info.num_uniform_buffers);
+
+    /* Step 3: SPIRV → native GPU shader.
+     * CompileGraphicsShaderFromSPIRV takes:
+     *   (device, SPIRV_Info*, GraphicsShaderResourceInfo*, props) */
+    SDL_ShaderCross_SPIRV_Info spirv_info;
+    SDL_zero(spirv_info);
+    spirv_info.bytecode     = spirv;
+    spirv_info.bytecode_size = spirv_size;
+    spirv_info.entrypoint   = entrypoint;
+    spirv_info.shader_stage = stage;
+    spirv_info.props        = 0;
+
+    SDL_GPUShader *shader = SDL_ShaderCross_CompileGraphicsShaderFromSPIRV(
+        device, &spirv_info, &metadata->resource_info, 0);
+
+    SDL_free(metadata);
+    SDL_free(spirv);
+
+    if (!shader) {
+        log_msg("ERROR: SPIRV->native failed: %s", SDL_GetError());
+        return NULL;
+    }
+    log_msg("Shader: native compile OK (%s)", stage_name);
+    return shader;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * GPU Pipeline Setup / Teardown
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Called once at startup (from main.c after creating the GPU device
+ * and claiming the window). Compiles shaders and creates the
+ * graphics pipelines and sampler.
+ *
+ * Two pipelines:
+ *   - gpu_pipeline_yuv:  planar YUV420P (3 textures, 3 samplers)
+ *   - gpu_pipeline_nv12: NV12/P010 (2 textures, 2 samplers) [Phase 1.5]
+ */
+
+int gpu_create_pipelines(PlayerState *ps) {
+    if (!ps->gpu_device || !ps->window) return -1;
+
+    log_msg("GPU: compiling shaders...");
+
+    /* ── Compile vertex shader (shared by both pipelines) ── */
+    SDL_GPUShader *vert = compile_shader(
+        ps->gpu_device, hlsl_fullscreen_vert, "main",
+        SDL_SHADERCROSS_SHADERSTAGE_VERTEX);
+    if (!vert) return -1;
+
+    /* ── Compile planar YUV fragment shader ── */
+    SDL_GPUShader *frag_yuv = compile_shader(
+        ps->gpu_device, hlsl_yuv_planar_frag, "main",
+        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
+    if (!frag_yuv) {
+        SDL_ReleaseGPUShader(ps->gpu_device, vert);
+        return -1;
+    }
+
+    /* ── Create YUV planar pipeline ── */
+    SDL_GPUColorTargetDescription color_desc;
+    SDL_zero(color_desc);
+    color_desc.format = SDL_GetGPUSwapchainTextureFormat(
+        ps->gpu_device, ps->window);
+
+    SDL_GPUGraphicsPipelineCreateInfo pipe_info;
+    SDL_zero(pipe_info);
+    pipe_info.vertex_shader   = vert;
+    pipe_info.fragment_shader = frag_yuv;
+    pipe_info.primitive_type  = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+    pipe_info.target_info.num_color_targets        = 1;
+    pipe_info.target_info.color_target_descriptions = &color_desc;
+
+    ps->gpu_pipeline_yuv = SDL_CreateGPUGraphicsPipeline(
+        ps->gpu_device, &pipe_info);
+
+    /* Shaders are baked into the pipeline — release the objects */
+    SDL_ReleaseGPUShader(ps->gpu_device, frag_yuv);
+
+    if (!ps->gpu_pipeline_yuv) {
+        log_msg("ERROR: Failed to create YUV pipeline: %s", SDL_GetError());
+        SDL_ReleaseGPUShader(ps->gpu_device, vert);
+        return -1;
+    }
+    log_msg("GPU: YUV planar pipeline created");
+
+    /* ── Compile NV12 fragment shader (Phase 1.5 — P010 10-bit) ── */
+    SDL_GPUShader *frag_nv12 = compile_shader(
+        ps->gpu_device, hlsl_nv12_frag, "main",
+        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
+    if (frag_nv12) {
+        pipe_info.fragment_shader = frag_nv12;
+        ps->gpu_pipeline_nv12 = SDL_CreateGPUGraphicsPipeline(
+            ps->gpu_device, &pipe_info);
+        SDL_ReleaseGPUShader(ps->gpu_device, frag_nv12);
+        if (ps->gpu_pipeline_nv12) {
+            log_msg("GPU: NV12/P010 pipeline created");
+        } else {
+            log_msg("WARNING: NV12 pipeline failed (P010 path unavailable): %s",
+                    SDL_GetError());
+        }
+    } else {
+        log_msg("WARNING: NV12 shader compile failed (P010 path unavailable)");
+    }
+
+    /* Vertex shader used by both pipelines — safe to release now */
+    SDL_ReleaseGPUShader(ps->gpu_device, vert);
+
+    /* ── Create sampler (linear filtering + anisotropy) ── */
+    SDL_GPUSamplerCreateInfo samp_info;
+    SDL_zero(samp_info);
+    samp_info.min_filter     = SDL_GPU_FILTER_LINEAR;
+    samp_info.mag_filter     = SDL_GPU_FILTER_LINEAR;
+    samp_info.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    samp_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    samp_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    samp_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    samp_info.enable_anisotropy = true;
+    samp_info.max_anisotropy    = 16.0f;
+
+    ps->gpu_sampler = SDL_CreateGPUSampler(ps->gpu_device, &samp_info);
+    if (!ps->gpu_sampler) {
+        log_msg("ERROR: Failed to create sampler: %s", SDL_GetError());
+        return -1;
+    }
+    log_msg("GPU: sampler created (linear + 16x anisotropy)");
+
+    return 0;
+}
+
+void gpu_destroy_pipelines(PlayerState *ps) {
+    if (!ps->gpu_device) return;
+
+    if (ps->gpu_sampler) {
+        SDL_ReleaseGPUSampler(ps->gpu_device, ps->gpu_sampler);
+        ps->gpu_sampler = NULL;
+    }
+    if (ps->gpu_pipeline_yuv) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv);
+        ps->gpu_pipeline_yuv = NULL;
+    }
+    if (ps->gpu_pipeline_nv12) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_nv12);
+        ps->gpu_pipeline_nv12 = NULL;
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * GPU Texture & Transfer Buffer Helpers (per-file lifetime)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Create GPU textures and transfer buffers for the current video. */
+static int gpu_create_video_textures(PlayerState *ps) {
+    int w = ps->vid_w;
+    int h = ps->vid_h;
+    int cw = w / 2;  /* chroma width  (4:2:0) */
+    int ch = h / 2;  /* chroma height (4:2:0) */
+
+    /* ── Y plane texture (R8_UNORM, full resolution) ── */
+    SDL_GPUTextureCreateInfo tex_info;
+    SDL_zero(tex_info);
+    tex_info.type                  = SDL_GPU_TEXTURETYPE_2D;
+    tex_info.format                = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+    tex_info.width                 = w;
+    tex_info.height                = h;
+    tex_info.layer_count_or_depth  = 1;
+    tex_info.num_levels            = 1;
+    tex_info.usage                 = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+
+    ps->gpu_tex_y = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
+    if (!ps->gpu_tex_y) {
+        log_msg("ERROR: Failed to create Y texture: %s", SDL_GetError());
+        return -1;
+    }
+
+    /* ── U plane texture (R8_UNORM, half resolution) ── */
+    tex_info.width  = cw;
+    tex_info.height = ch;
+    ps->gpu_tex_u = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
+    if (!ps->gpu_tex_u) {
+        log_msg("ERROR: Failed to create U texture: %s", SDL_GetError());
+        return -1;
+    }
+
+    /* ── V plane texture (R8_UNORM, half resolution) ── */
+    ps->gpu_tex_v = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
+    if (!ps->gpu_tex_v) {
+        log_msg("ERROR: Failed to create V texture: %s", SDL_GetError());
+        return -1;
+    }
+
+    /* ── Transfer buffers (CPU→GPU staging) ── */
+    SDL_GPUTransferBufferCreateInfo xfer_info;
+    SDL_zero(xfer_info);
+    xfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+
+    xfer_info.size = w * h;
+    ps->gpu_xfer_y = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+
+    xfer_info.size = cw * ch;
+    ps->gpu_xfer_u = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+    ps->gpu_xfer_v = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+
+    if (!ps->gpu_xfer_y || !ps->gpu_xfer_u || !ps->gpu_xfer_v) {
+        log_msg("ERROR: Failed to create transfer buffers: %s", SDL_GetError());
+        return -1;
+    }
+
+    ps->gpu_is_nv12 = 0;
+    log_msg("GPU: textures created (Y=%dx%d, UV=%dx%d, R8_UNORM planar)",
+            w, h, cw, ch);
+    return 0;
+}
+
+/* Destroy per-file GPU resources. */
+static void gpu_destroy_video_textures(PlayerState *ps) {
+    if (!ps->gpu_device) return;
+
+    if (ps->gpu_tex_y)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_y);  ps->gpu_tex_y  = NULL; }
+    if (ps->gpu_tex_u)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_u);  ps->gpu_tex_u  = NULL; }
+    if (ps->gpu_tex_v)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_v);  ps->gpu_tex_v  = NULL; }
+    if (ps->gpu_xfer_y) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_y); ps->gpu_xfer_y = NULL; }
+    if (ps->gpu_xfer_u) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_u); ps->gpu_xfer_u = NULL; }
+    if (ps->gpu_xfer_v) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_v); ps->gpu_xfer_v = NULL; }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * GPU Uniform Setup
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Sets the YUV→RGB color matrix and range parameters based on the
+ * video's colorspace metadata. Called once per file in player_open().
+ *
+ * Since swscale already converts to full-range YUV420P, the range
+ * uniforms are identity ({0,1}). The matrix handles the pure
+ * YUV→RGB color conversion.
+ */
+
+static void gpu_setup_uniforms(PlayerState *ps) {
+    /* Determine colorspace from metadata or resolution heuristic */
+    int is_bt709 = (ps->vid_h >= 720);
+    if (ps->fmt_ctx) {
+        AVCodecParameters *par =
+            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+        if (par->color_space == AVCOL_SPC_BT709)
+            is_bt709 = 1;
+        else if (par->color_space == AVCOL_SPC_BT470BG ||
+                 par->color_space == AVCOL_SPC_SMPTE170M)
+            is_bt709 = 0;
+    }
+
+    /* Range: identity — swscale outputs full-range YUV420P */
+    ps->gpu_uniforms.rangeY[0]  = 0.0f;
+    ps->gpu_uniforms.rangeY[1]  = 1.0f;
+    ps->gpu_uniforms.rangeUV[0] = 0.0f;
+    ps->gpu_uniforms.rangeUV[1] = 1.0f;
+
+    /* Color matrix: row-major (matches HLSL row_major qualifier).
+     *
+     * Standard YUV→RGB for full-range input where Cb,Cr are centered:
+     *   R = Y + 0     * (Cb-0.5) + Cr_coeff * (Cr-0.5)
+     *   G = Y + Cb_g  * (Cb-0.5) + Cr_g    * (Cr-0.5)
+     *   B = Y + Cb_b  * (Cb-0.5) + 0       * (Cr-0.5)
+     */
+    float *m = ps->gpu_uniforms.colorMatrix;
+    memset(m, 0, 16 * sizeof(float));
+
+    if (is_bt709) {
+        /* BT.709: Kr=0.2126, Kb=0.0722 */
+        m[ 0] = 1.0f;  m[ 1] =  0.0f;     m[ 2] =  1.5748f;  /* R */
+        m[ 4] = 1.0f;  m[ 5] = -0.1873f;  m[ 6] = -0.4681f;  /* G */
+        m[ 8] = 1.0f;  m[ 9] =  1.8556f;  m[10] =  0.0f;     /* B */
+    } else {
+        /* BT.601: Kr=0.299, Kb=0.114 */
+        m[ 0] = 1.0f;  m[ 1] =  0.0f;     m[ 2] =  1.402f;   /* R */
+        m[ 4] = 1.0f;  m[ 5] = -0.3441f;  m[ 6] = -0.7141f;  /* G */
+        m[ 8] = 1.0f;  m[ 9] =  1.772f;   m[10] =  0.0f;     /* B */
+    }
+    m[15] = 1.0f;  /* A passthrough */
+
+    log_msg("GPU: uniforms set (%s, full range)",
+            is_bt709 ? "BT.709" : "BT.601");
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * Packet Queue — thread-safe FIFO for AVPackets
@@ -123,7 +555,7 @@ void pq_flush(PacketQueue *q) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Open a media file: probe format, find best streams, init decoders,
- * set up scaling context, create SDL texture, start demux thread. */
+ * set up scaling context, create GPU textures, start demux thread. */
 int player_open(PlayerState *ps, const char *filename) {
     int ret;
 
@@ -236,11 +668,11 @@ int player_open(PlayerState *ps, const char *filename) {
      * 3. FORMAT ONLY, 10-bit → 8-bit: SWS_POINT with NO error-diffusion.
      *    ED dithering is a serial per-pixel operation that bottlenecks
      *    4K 10-bit content (causes FLAC+HEVC frame drops). Simple
-     *    truncation (10→8 bit) is visually negligible on real video —
-     *    you're discarding 2 bits of 10. The real quality win was the
-     *    P010 path (10-bit display), but SDL3's D3D11 renderer has a
-     *    broken P010 shader (UV plane uses R8G8 instead of R16G16).
-     *    When SDL3 fixes P010, we can re-enable the passthrough path.
+     *    truncation (10→8 bit) is visually negligible on real video.
+     *
+     * Note (v0.1.4): swscale still feeds 8-bit YUV420P to the GPU.
+     * Phase 1.5 will add a P010 passthrough path using the NV12 shader
+     * and R16_UNORM textures, bypassing swscale entirely for 10-bit.
      */
     {
         enum AVPixelFormat src_fmt = ps->video_codec_ctx->pix_fmt;
@@ -390,34 +822,15 @@ int player_open(PlayerState *ps, const char *filename) {
         SDL_SetWindowTitle(ps->window, title);
     }
 
-    /* ── Create SDL texture for video ── */
-
-    /* ── Create video texture with correct colorspace ── */
-    /* Always FULL range — swscale expands limited→full before upload */
-    if (ps->texture) SDL_DestroyTexture(ps->texture);
-    {
-        SDL_Colorspace cspace = (ps->vid_h >= 720)
-            ? SDL_COLORSPACE_BT709_FULL : SDL_COLORSPACE_BT601_FULL;
-
-        SDL_PropertiesID props = SDL_CreateProperties();
-        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, cspace);
-        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_IYUV);
-        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
-        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, ps->vid_w);
-        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, ps->vid_h);
-        ps->texture = SDL_CreateTextureWithProperties(ps->renderer, props);
-        SDL_DestroyProperties(props);
-    }
-    if (!ps->texture) {
-        fprintf(stderr, "[DSVP] Cannot create texture: %s\n", SDL_GetError());
+    /* ── Create GPU textures and transfer buffers ── */
+    if (gpu_create_video_textures(ps) < 0) {
+        log_msg("ERROR: GPU texture creation failed");
         player_close(ps);
         return -1;
     }
 
-    SDL_SetTextureScaleMode(ps->texture, SDL_SCALEMODE_LINEAR);
-    log_msg("SDL: using linear texture scaling");
-    log_msg("SDL: YUV colorspace set to %s (full range)",
-        ps->vid_h >= 720 ? "BT.709" : "BT.601");
+    /* ── Set up GPU color uniforms ── */
+    gpu_setup_uniforms(ps);
 
     /* ── Init packet queues ── */
     pq_init(&ps->video_pq);
@@ -536,8 +949,8 @@ void player_close(PlayerState *ps) {
     /* Close format */
     if (ps->fmt_ctx) avformat_close_input(&ps->fmt_ctx);
 
-    /* Destroy texture */
-    if (ps->texture) { SDL_DestroyTexture(ps->texture); ps->texture = NULL; }
+    /* ── Destroy GPU video textures and transfer buffers ── */
+    gpu_destroy_video_textures(ps);
 
     /* Reset state */
     ps->playing            = 0;
@@ -789,34 +1202,57 @@ void player_update_display_rect(PlayerState *ps) {
     ps->display_rect.h = disp_h;
 }
 
-/* Display the current video frame: convert → upload to texture → render.
+
+/* ── Upload one YUV plane from AVFrame to GPU transfer buffer ──
  *
- * A/V sync logic:
- *   We compare the video frame's PTS to the audio clock.
- *   If the video is early, we delay. If late, we skip the delay.
- *   This keeps video in sync with audio without audio glitches.
+ * Handles stride mismatch: FFmpeg's linesize may be wider than the
+ * actual pixel width (alignment padding). The transfer buffer is
+ * tightly packed at the target width. */
+static void upload_plane(
+    SDL_GPUDevice *device,
+    SDL_GPUTransferBuffer *xfer,
+    const uint8_t *src, int src_stride,
+    int width, int height)
+{
+    uint8_t *dst = SDL_MapGPUTransferBuffer(device, xfer, true);
+    if (!dst) return;
+
+    if (src_stride == width) {
+        /* Tightly packed — single memcpy */
+        memcpy(dst, src, (size_t)width * height);
+    } else {
+        /* Stride mismatch — copy row by row */
+        for (int row = 0; row < height; row++) {
+            memcpy(dst + row * width, src + row * src_stride, width);
+        }
+    }
+
+    SDL_UnmapGPUTransferBuffer(device, xfer);
+}
+
+
+/* Display the current video frame: convert → upload to GPU → shader draw.
+ *
+ * This is the hot path. Called once per new frame from main.c.
+ * Handles both the CPU-side conversion (swscale or passthrough)
+ * and the full GPU submission (copy pass + render pass).
  */
 void video_display(PlayerState *ps) {
-    if (!ps->texture || !ps->video_frame || !ps->video_frame->data[0]) return;
+    if (!ps->gpu_tex_y || !ps->video_frame || !ps->video_frame->data[0]) return;
     if (ps->seeking) return;
 
-    /* ── YUV420P passthrough optimization ──
-     *
-     * When the source is already YUV420P AND full-range, skip sws_scale
-     * entirely. For everything else (limited-range, 10-bit, other formats),
-     * run through sws_scale. */
+    /* ── Determine source frame (passthrough or swscale) ── */
+    AVFrame *src_frame;
     {
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
-        int is_full_range = (ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
+        int is_full_range = (ps->fmt_ctx->streams[ps->video_stream_idx]
+                                ->codecpar->color_range == AVCOL_RANGE_JPEG);
 
         if (is_yuv420p && is_full_range) {
-            /* Full-range YUV420P — direct upload, no conversion needed */
-            SDL_UpdateYUVTexture(ps->texture, NULL,
-                ps->video_frame->data[0], ps->video_frame->linesize[0],
-                ps->video_frame->data[1], ps->video_frame->linesize[1],
-                ps->video_frame->data[2], ps->video_frame->linesize[2]);
+            /* Full-range YUV420P — direct upload, no conversion */
+            src_frame = ps->video_frame;
         } else {
-            /* All other formats — sws_scale handles range expansion,
+            /* All other formats — swscale handles range expansion,
              * bit-depth conversion, and/or format conversion */
             sws_scale(ps->sws_ctx,
                 (const uint8_t *const *)ps->video_frame->data,
@@ -824,21 +1260,200 @@ void video_display(PlayerState *ps) {
                 0, ps->vid_h,
                 ps->rgb_frame->data,
                 ps->rgb_frame->linesize);
-
-            SDL_UpdateYUVTexture(ps->texture, NULL,
-                ps->rgb_frame->data[0], ps->rgb_frame->linesize[0],
-                ps->rgb_frame->data[1], ps->rgb_frame->linesize[1],
-                ps->rgb_frame->data[2], ps->rgb_frame->linesize[2]);
+            src_frame = ps->rgb_frame;
         }
     }
 
-    /* ── Render with correct aspect ratio ── */
-    SDL_SetRenderDrawColor(ps->renderer, 0, 0, 0, 255);
-    SDL_RenderClear(ps->renderer);
-    player_update_display_rect(ps);
-    SDL_FRect dr = rect_to_frect(&ps->display_rect);
-    SDL_RenderTexture(ps->renderer, ps->texture, NULL, &dr);
-    /* Note: overlays are drawn on top in main.c before RenderPresent */
+    /* ── Upload plane data to GPU transfer buffers ── */
+    int w  = ps->vid_w;
+    int h  = ps->vid_h;
+    int cw = w / 2;
+    int ch = h / 2;
+
+    upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+                 src_frame->data[0], src_frame->linesize[0], w, h);
+    upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+                 src_frame->data[1], src_frame->linesize[1], cw, ch);
+    upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+                 src_frame->data[2], src_frame->linesize[2], cw, ch);
+
+    /* ── GPU command buffer ── */
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
+    if (!cmd) {
+        log_msg("ERROR: SDL_AcquireGPUCommandBuffer failed: %s", SDL_GetError());
+        return;
+    }
+
+    /* ── Copy pass: transfer buffers → GPU textures ── */
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    {
+        SDL_GPUTextureTransferInfo src_info;
+        SDL_GPUTextureRegion dst_region;
+
+        /* Y plane */
+        SDL_zero(src_info);
+        SDL_zero(dst_region);
+        src_info.transfer_buffer = ps->gpu_xfer_y;
+        src_info.pixels_per_row  = w;
+        src_info.rows_per_layer  = h;
+        dst_region.texture = ps->gpu_tex_y;
+        dst_region.w = w;
+        dst_region.h = h;
+        dst_region.d = 1;
+        SDL_UploadToGPUTexture(copy, &src_info, &dst_region, true);
+
+        /* U plane */
+        SDL_zero(src_info);
+        SDL_zero(dst_region);
+        src_info.transfer_buffer = ps->gpu_xfer_u;
+        src_info.pixels_per_row  = cw;
+        src_info.rows_per_layer  = ch;
+        dst_region.texture = ps->gpu_tex_u;
+        dst_region.w = cw;
+        dst_region.h = ch;
+        dst_region.d = 1;
+        SDL_UploadToGPUTexture(copy, &src_info, &dst_region, true);
+
+        /* V plane */
+        SDL_zero(src_info);
+        SDL_zero(dst_region);
+        src_info.transfer_buffer = ps->gpu_xfer_v;
+        src_info.pixels_per_row  = cw;
+        src_info.rows_per_layer  = ch;
+        dst_region.texture = ps->gpu_tex_v;
+        dst_region.w = cw;
+        dst_region.h = ch;
+        dst_region.d = 1;
+        SDL_UploadToGPUTexture(copy, &src_info, &dst_region, true);
+    }
+    SDL_EndGPUCopyPass(copy);
+
+    /* ── Acquire swapchain texture ── */
+    SDL_GPUTexture *swapchain_tex = NULL;
+    Uint32 sc_w, sc_h;
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, ps->window,
+            &swapchain_tex, &sc_w, &sc_h)) {
+        log_msg("ERROR: Swapchain acquire failed: %s", SDL_GetError());
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
+    }
+    if (!swapchain_tex) {
+        /* Window is minimized or occluded — skip this frame */
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
+    }
+
+    /* ── Render pass: draw video quad ── */
+    SDL_GPUColorTargetInfo color_target;
+    SDL_zero(color_target);
+    color_target.texture    = swapchain_tex;
+    color_target.clear_color = (SDL_FColor){ 0.0f, 0.0f, 0.0f, 1.0f };
+    color_target.load_op    = SDL_GPU_LOADOP_CLEAR;
+    color_target.store_op   = SDL_GPU_STOREOP_STORE;
+
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    {
+        SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_yuv);
+
+        /* Viewport for letterboxing — shader fills the viewport,
+         * black bars come from the LOADOP_CLEAR outside the viewport. */
+        player_update_display_rect(ps);
+
+        /* Use swapchain dimensions for viewport (handles high-DPI) */
+        float scale_x = (sc_w > 0) ? (float)sc_w / ps->win_w : 1.0f;
+        float scale_y = (sc_h > 0) ? (float)sc_h / ps->win_h : 1.0f;
+
+        SDL_GPUViewport viewport;
+        viewport.x = ps->display_rect.x * scale_x;
+        viewport.y = ps->display_rect.y * scale_y;
+        viewport.w = ps->display_rect.w * scale_x;
+        viewport.h = ps->display_rect.h * scale_y;
+        viewport.min_depth = 0.0f;
+        viewport.max_depth = 1.0f;
+        SDL_SetGPUViewport(pass, &viewport);
+
+        /* Push color uniforms */
+        SDL_PushGPUFragmentUniformData(cmd, 0,
+            &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
+
+        /* Bind texture+sampler pairs (one sampler per texture — CRITICAL) */
+        SDL_GPUTextureSamplerBinding bindings[3] = {
+            { .texture = ps->gpu_tex_y, .sampler = ps->gpu_sampler },
+            { .texture = ps->gpu_tex_u, .sampler = ps->gpu_sampler },
+            { .texture = ps->gpu_tex_v, .sampler = ps->gpu_sampler },
+        };
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 3);
+
+        /* Draw fullscreen quad (4 vertices, triangle strip, no vertex buffer) */
+        SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+    }
+    SDL_EndGPURenderPass(pass);
+
+    /* ── Submit ── */
+    SDL_SubmitGPUCommandBuffer(cmd);
+}
+
+
+/* Re-draw the last frame without uploading new data.
+ * Called from main.c on ticks where no new frame was decoded
+ * (GPU double-buffering requires explicit re-blit each frame).
+ * Also used for paused state rendering. */
+void video_reblit(PlayerState *ps) {
+    if (!ps->gpu_tex_y) return;
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
+    if (!cmd) return;
+
+    SDL_GPUTexture *swapchain_tex = NULL;
+    Uint32 sc_w, sc_h;
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, ps->window,
+            &swapchain_tex, &sc_w, &sc_h)) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
+    }
+    if (!swapchain_tex) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
+    }
+
+    SDL_GPUColorTargetInfo color_target;
+    SDL_zero(color_target);
+    color_target.texture    = swapchain_tex;
+    color_target.clear_color = (SDL_FColor){ 0.0f, 0.0f, 0.0f, 1.0f };
+    color_target.load_op    = SDL_GPU_LOADOP_CLEAR;
+    color_target.store_op   = SDL_GPU_STOREOP_STORE;
+
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    {
+        SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_yuv);
+
+        player_update_display_rect(ps);
+        float scale_x = (sc_w > 0) ? (float)sc_w / ps->win_w : 1.0f;
+        float scale_y = (sc_h > 0) ? (float)sc_h / ps->win_h : 1.0f;
+
+        SDL_GPUViewport viewport;
+        viewport.x = ps->display_rect.x * scale_x;
+        viewport.y = ps->display_rect.y * scale_y;
+        viewport.w = ps->display_rect.w * scale_x;
+        viewport.h = ps->display_rect.h * scale_y;
+        viewport.min_depth = 0.0f;
+        viewport.max_depth = 1.0f;
+        SDL_SetGPUViewport(pass, &viewport);
+
+        SDL_PushGPUFragmentUniformData(cmd, 0,
+            &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
+
+        SDL_GPUTextureSamplerBinding bindings[3] = {
+            { .texture = ps->gpu_tex_y, .sampler = ps->gpu_sampler },
+            { .texture = ps->gpu_tex_u, .sampler = ps->gpu_sampler },
+            { .texture = ps->gpu_tex_v, .sampler = ps->gpu_sampler },
+        };
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 3);
+
+        SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+    }
+    SDL_EndGPURenderPass(pass);
+    SDL_SubmitGPUCommandBuffer(cmd);
 }
 
 
@@ -997,6 +1612,7 @@ void player_build_debug_info(PlayerState *ps) {
     int   off = 0;
 
     off += snprintf(buf + off, sz - off, "=== DEBUG ===\n");
+    off += snprintf(buf + off, sz - off, "Renderer: SDL_GPU\n");
     off += snprintf(buf + off, sz - off, "Video Clock: %.3f s\n", ps->video_clock);
     off += snprintf(buf + off, sz - off, "Audio Clock: %.3f s\n", ps->audio_clock);
     off += snprintf(buf + off, sz - off, "A/V Diff:    %.3f ms\n",

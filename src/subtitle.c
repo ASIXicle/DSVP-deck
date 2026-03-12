@@ -419,9 +419,10 @@ void sub_decode_pending(PlayerState *ps) {
                         }
                     }
 
-                    SDL_Texture *tex = SDL_CreateTexture(ps->renderer,
-                        SDL_PIXELFORMAT_RGBA32,
-                        SDL_TEXTUREACCESS_STATIC, w, h);
+                    /* Phase 1 (SDL_GPU): skip bitmap texture creation.
+                     * Bitmap sub decode still runs; rendering in Phase 2. */
+                    SDL_Texture *tex = NULL;
+                    (void)tex;
                     if (tex) {
                         SDL_UpdateTexture(tex, NULL, rgba, w * 4);
                         SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
