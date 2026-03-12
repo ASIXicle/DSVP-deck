@@ -14,10 +14,11 @@
  *   dropped/delayed video frames.
  *
  * Rendering (v0.1.4 — SDL_GPU):
- *   Video frames are uploaded to GPU textures (R8_UNORM per plane)
- *   and converted YUV→RGB by a custom HLSL fragment shader compiled
- *   at runtime via SDL3_shadercross. This replaces SDL_Renderer and
- *   unlocks future P010 10-bit passthrough, HDR10, and anisotropy.
+ *   Video frames are uploaded to GPU textures (R8_UNORM per plane for
+ *   8-bit, R16_UNORM/R16G16_UNORM for 10-bit passthrough) and converted
+ *   YUV→RGB by custom HLSL fragment shaders compiled at runtime via
+ *   SDL3_shadercross. This replaces SDL_Renderer and unlocks HDR10
+ *   and further GPU-side processing.
  */
 
 #include "dsvp.h"
@@ -85,7 +86,7 @@ static const char hlsl_yuv_planar_frag[] =
     "}\n";
 
 /* NV12/P010 fragment shader — 2 planes (Y + interleaved UV).
- * Prepared for Phase 1.5 (10-bit passthrough). Not used yet. */
+ * Used for 10-bit passthrough (R16_UNORM Y + R16G16_UNORM UV). */
 static const char hlsl_nv12_frag[] =
     "Texture2D<float>  texY  : register(t0, space2);\n"
     "Texture2D<float2> texUV : register(t1, space2);\n"
@@ -199,7 +200,7 @@ static SDL_GPUShader *compile_shader(
  *
  * Two pipelines:
  *   - gpu_pipeline_yuv:  planar YUV420P (3 textures, 3 samplers)
- *   - gpu_pipeline_nv12: NV12/P010 (2 textures, 2 samplers) [Phase 1.5]
+ *   - gpu_pipeline_nv12: NV12/P010 (2 textures, 2 samplers) [10-bit passthrough]
  */
 
 int gpu_create_pipelines(PlayerState *ps) {
@@ -249,7 +250,7 @@ int gpu_create_pipelines(PlayerState *ps) {
     }
     log_msg("GPU: YUV planar pipeline created");
 
-    /* ── Compile NV12 fragment shader (Phase 1.5 — P010 10-bit) ── */
+    /* ── Compile NV12 fragment shader (P010 10-bit passthrough) ── */
     SDL_GPUShader *frag_nv12 = compile_shader(
         ps->gpu_device, hlsl_nv12_frag, "main",
         SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
@@ -315,31 +316,46 @@ void gpu_destroy_pipelines(PlayerState *ps) {
  * GPU Texture & Transfer Buffer Helpers (per-file lifetime)
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* Create GPU textures and transfer buffers for the current video. */
+/* Create GPU textures and transfer buffers for the current video.
+ *
+ * Two paths:
+ *   8-bit (YUV420P):      3 × R8_UNORM planar textures (Y, U, V)
+ *   10-bit (YUV420P10LE): 3 × R16_UNORM planar textures (Y, U, V)
+ *
+ * Both paths use the same YUV planar shader — Texture2D<float> reads
+ * the .r channel from either format. The 10-bit path bypasses swscale
+ * entirely; raw frame data goes straight to GPU. */
 static int gpu_create_video_textures(PlayerState *ps) {
     int w = ps->vid_w;
     int h = ps->vid_h;
     int cw = w / 2;  /* chroma width  (4:2:0) */
     int ch = h / 2;  /* chroma height (4:2:0) */
 
-    /* ── Y plane texture (R8_UNORM, full resolution) ── */
+    int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE);
+
+    SDL_GPUTextureFormat fmt = is_10bit
+        ? SDL_GPU_TEXTUREFORMAT_R16_UNORM
+        : SDL_GPU_TEXTUREFORMAT_R8_UNORM;
+    int bpp = is_10bit ? 2 : 1;  /* bytes per sample */
+
     SDL_GPUTextureCreateInfo tex_info;
     SDL_zero(tex_info);
     tex_info.type                  = SDL_GPU_TEXTURETYPE_2D;
-    tex_info.format                = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
-    tex_info.width                 = w;
-    tex_info.height                = h;
+    tex_info.format                = fmt;
     tex_info.layer_count_or_depth  = 1;
     tex_info.num_levels            = 1;
     tex_info.usage                 = SDL_GPU_TEXTUREUSAGE_SAMPLER;
 
+    /* Y plane (full resolution) */
+    tex_info.width  = w;
+    tex_info.height = h;
     ps->gpu_tex_y = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
     if (!ps->gpu_tex_y) {
         log_msg("ERROR: Failed to create Y texture: %s", SDL_GetError());
         return -1;
     }
 
-    /* ── U plane texture (R8_UNORM, half resolution) ── */
+    /* U plane (half resolution) */
     tex_info.width  = cw;
     tex_info.height = ch;
     ps->gpu_tex_u = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
@@ -348,22 +364,22 @@ static int gpu_create_video_textures(PlayerState *ps) {
         return -1;
     }
 
-    /* ── V plane texture (R8_UNORM, half resolution) ── */
+    /* V plane (half resolution) */
     ps->gpu_tex_v = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
     if (!ps->gpu_tex_v) {
         log_msg("ERROR: Failed to create V texture: %s", SDL_GetError());
         return -1;
     }
 
-    /* ── Transfer buffers (CPU→GPU staging) ── */
+    /* Transfer buffers (CPU→GPU staging) */
     SDL_GPUTransferBufferCreateInfo xfer_info;
     SDL_zero(xfer_info);
     xfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
 
-    xfer_info.size = w * h;
+    xfer_info.size = (Uint32)w * h * bpp;
     ps->gpu_xfer_y = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
 
-    xfer_info.size = cw * ch;
+    xfer_info.size = (Uint32)cw * ch * bpp;
     ps->gpu_xfer_u = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
     ps->gpu_xfer_v = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
 
@@ -373,8 +389,9 @@ static int gpu_create_video_textures(PlayerState *ps) {
     }
 
     ps->gpu_is_nv12 = 0;
-    log_msg("GPU: textures created (Y=%dx%d, UV=%dx%d, R8_UNORM planar)",
-            w, h, cw, ch);
+    log_msg("GPU: textures created (Y=%dx%d, UV=%dx%d, %s planar)",
+            w, h, cw, ch,
+            is_10bit ? "R16_UNORM 10-bit" : "R8_UNORM");
     return 0;
 }
 
@@ -416,11 +433,59 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             is_bt709 = 0;
     }
 
-    /* Range: identity — swscale outputs full-range YUV420P */
-    ps->gpu_uniforms.rangeY[0]  = 0.0f;
-    ps->gpu_uniforms.rangeY[1]  = 1.0f;
-    ps->gpu_uniforms.rangeUV[0] = 0.0f;
-    ps->gpu_uniforms.rangeUV[1] = 1.0f;
+    /* ── Range parameters ──
+     *
+     * 8-bit path: swscale outputs full-range YUV420P → identity {0, 1}.
+     *
+     * 10-bit passthrough: raw yuv420p10le data uploaded directly to
+     * R16_UNORM textures. Each 10-bit value V is stored as uint16 V
+     * (range 0-1023). The GPU reads V/65535, so we need:
+     *
+     *   Limited range (most 10-bit content):
+     *     Y:  64-940  → offset = 64/65535, scale = 65535/(940-64)
+     *     UV: 64-960  → offset = 64/65535, scale = 65535/(960-64)
+     *
+     *   Full range:
+     *     Y/UV: 0-1023 → offset = 0, scale = 65535/1023
+     */
+    int is_10bit_passthrough =
+        (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
+         && !ps->sws_ctx);
+
+    if (is_10bit_passthrough) {
+        /* 10-bit passthrough — range correction in shader */
+        int is_full_range = 0;
+        if (ps->fmt_ctx) {
+            AVCodecParameters *par =
+                ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+            is_full_range = (par->color_range == AVCOL_RANGE_JPEG);
+        }
+
+        if (is_full_range) {
+            ps->gpu_uniforms.rangeY[0]  = 0.0f;
+            ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
+            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            ps->gpu_uniforms.rangeUV[1] = 65535.0f / 1023.0f;
+        } else {
+            ps->gpu_uniforms.rangeY[0]  = 64.0f / 65535.0f;
+            ps->gpu_uniforms.rangeY[1]  = 65535.0f / (940.0f - 64.0f);
+            ps->gpu_uniforms.rangeUV[0] = 64.0f / 65535.0f;
+            ps->gpu_uniforms.rangeUV[1] = 65535.0f / (960.0f - 64.0f);
+        }
+
+        log_msg("GPU: uniforms set (%s, 10-bit %s range → shader)",
+                is_bt709 ? "BT.709" : "BT.601",
+                is_full_range ? "full" : "limited");
+    } else {
+        /* 8-bit path — swscale outputs full-range, identity range */
+        ps->gpu_uniforms.rangeY[0]  = 0.0f;
+        ps->gpu_uniforms.rangeY[1]  = 1.0f;
+        ps->gpu_uniforms.rangeUV[0] = 0.0f;
+        ps->gpu_uniforms.rangeUV[1] = 1.0f;
+
+        log_msg("GPU: uniforms set (%s, full range)",
+                is_bt709 ? "BT.709" : "BT.601");
+    }
 
     /* Color matrix: row-major (matches HLSL row_major qualifier).
      *
@@ -444,9 +509,6 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         m[ 8] = 1.0f;  m[ 9] =  1.772f;   m[10] =  0.0f;     /* B */
     }
     m[15] = 1.0f;  /* A passthrough */
-
-    log_msg("GPU: uniforms set (%s, full range)",
-            is_bt709 ? "BT.709" : "BT.601");
 }
 
 
@@ -655,9 +717,13 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->rgb_frame   = av_frame_alloc();
     ps->audio_frame = av_frame_alloc();
 
-    /* ── Set up swscale ──
+    /* ── Set up swscale (or skip for 10-bit passthrough) ──
      *
-     * Three modes based on source format and whether spatial scaling is needed:
+     * For yuv420p10le: bypass swscale entirely. Raw 10-bit planes go
+     * directly to R16_UNORM / R16G16_UNORM GPU textures. The fragment
+     * shader handles range expansion and YUV→RGB conversion.
+     *
+     * For all other formats, three swscale modes:
      *
      * 1. RESIZE (src size != dst size): Full Lanczos pipeline with
      *    SWS_FULL_CHR_H_INT for maximum spatial quality.
@@ -665,128 +731,125 @@ int player_open(PlayerState *ps, const char *filename) {
      * 2. FORMAT ONLY, 8-bit (e.g. limited→full range expansion):
      *    SWS_POINT + error-diffusion dithering.
      *
-     * 3. FORMAT ONLY, 10-bit → 8-bit: SWS_POINT with NO error-diffusion.
-     *    ED dithering is a serial per-pixel operation that bottlenecks
-     *    4K 10-bit content (causes FLAC+HEVC frame drops). Simple
-     *    truncation (10→8 bit) is visually negligible on real video.
-     *
-     * Note (v0.1.4): swscale still feeds 8-bit YUV420P to the GPU.
-     * Phase 1.5 will add a P010 passthrough path using the NV12 shader
-     * and R16_UNORM textures, bypassing swscale entirely for 10-bit.
+     * 3. FORMAT ONLY, other bit depths: SWS_POINT, no ED dithering.
      */
     {
         enum AVPixelFormat src_fmt = ps->video_codec_ctx->pix_fmt;
-        enum AVPixelFormat dst_fmt = AV_PIX_FMT_YUV420P;
-        int dst_w = ps->vid_w;
-        int dst_h = ps->vid_h;
-
-        /* Detect whether we need spatial scaling or just format conversion */
-        int same_size = (ps->vid_w == dst_w && ps->vid_h == dst_h);
         int is_10bit = (src_fmt == AV_PIX_FMT_YUV420P10LE);
-        int sws_flags;
-        const char *sws_mode;
 
-        if (!same_size) {
-            /* Spatial resize — full quality pipeline */
-            sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
-            sws_mode = "resize (SWS_LANCZOS)";
+        if (is_10bit && ps->gpu_pipeline_nv12) {
+            /* ── 10-bit GPU passthrough — no swscale needed ── */
+            ps->sws_ctx    = NULL;
+            ps->rgb_buffer = NULL;
+            log_msg("swscale: bypassed (10-bit GPU passthrough)");
         } else {
-            /* Format conversion only — spatial filter is identity */
-            sws_flags = SWS_POINT | SWS_ACCURATE_RND;
-            sws_mode = is_10bit
-                ? "10-bit fast (SWS_POINT, no dither)"
-                : "format-only (SWS_POINT + error-diffusion)";
-        }
+            /* ── swscale path for 8-bit and other formats ── */
+            enum AVPixelFormat dst_fmt = AV_PIX_FMT_YUV420P;
+            int dst_w = ps->vid_w;
+            int dst_h = ps->vid_h;
 
-        ps->sws_ctx = sws_getContext(
-            ps->vid_w, ps->vid_h, src_fmt,
-            dst_w, dst_h, dst_fmt,
-            sws_flags,
-            NULL, NULL, NULL
-        );
+            int same_size = (ps->vid_w == dst_w && ps->vid_h == dst_h);
+            int sws_flags;
+            const char *sws_mode;
 
-        if (!ps->sws_ctx) {
-            log_msg("ERROR: Cannot create swscale context");
-            player_close(ps);
-            return -1;
-        }
-
-        /* Enable error-diffusion dithering ONLY for 8-bit sources.
-         * For 10-bit, skip ED — it's the serial bottleneck that causes
-         * FLAC+4K drops. Truncation from 10→8 bit is visually negligible. */
-        if (!is_10bit) {
-            av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
-        }
-
-        /* ── Colorspace and range ── */
-        {
-            AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
-
-            int src_cs;
-            if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
-                src_cs = (par->color_space == AVCOL_SPC_BT709)
-                    ? SWS_CS_ITU709 : SWS_CS_ITU601;
+            if (!same_size) {
+                sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
+                sws_mode = "resize (SWS_LANCZOS)";
             } else {
-                src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709 : SWS_CS_ITU601;
+                sws_flags = SWS_POINT | SWS_ACCURATE_RND;
+                sws_mode = is_10bit
+                    ? "10-bit fast (SWS_POINT, no dither)"
+                    : "format-only (SWS_POINT + error-diffusion)";
             }
 
-            int dst_cs = src_cs;
+            ps->sws_ctx = sws_getContext(
+                ps->vid_w, ps->vid_h, src_fmt,
+                dst_w, dst_h, dst_fmt,
+                sws_flags,
+                NULL, NULL, NULL
+            );
 
-            int src_range;
-            if (par->color_range == AVCOL_RANGE_JPEG) {
-                src_range = 1;
-            } else if (par->color_range == AVCOL_RANGE_MPEG) {
-                src_range = 0;
-            } else {
-                src_range = 0;
+            if (!ps->sws_ctx) {
+                log_msg("ERROR: Cannot create swscale context");
+                player_close(ps);
+                return -1;
             }
-            int dst_range = 1;
 
-            int *inv_table, *table;
-            int cur_src_range, cur_dst_range, brightness, contrast, saturation;
-            sws_getColorspaceDetails(ps->sws_ctx,
-                &inv_table, &cur_src_range, &table, &cur_dst_range,
-                &brightness, &contrast, &saturation);
+            /* Enable error-diffusion dithering ONLY for 8-bit sources. */
+            if (!is_10bit) {
+                av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
+            }
 
-            sws_setColorspaceDetails(ps->sws_ctx,
-                sws_getCoefficients(src_cs), src_range,
-                sws_getCoefficients(dst_cs), dst_range,
-                brightness, contrast, saturation);
+            /* ── Colorspace and range ── */
+            {
+                AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
 
-            log_msg("swscale: colorspace=%s range=%s->full",
-                (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
-                src_range ? "full" : "limited");
+                int src_cs;
+                if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
+                    src_cs = (par->color_space == AVCOL_SPC_BT709)
+                        ? SWS_CS_ITU709 : SWS_CS_ITU601;
+                } else {
+                    src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709 : SWS_CS_ITU601;
+                }
+
+                int dst_cs = src_cs;
+
+                int src_range;
+                if (par->color_range == AVCOL_RANGE_JPEG) {
+                    src_range = 1;
+                } else if (par->color_range == AVCOL_RANGE_MPEG) {
+                    src_range = 0;
+                } else {
+                    src_range = 0;
+                }
+                int dst_range = 1;
+
+                int *inv_table, *table;
+                int cur_src_range, cur_dst_range, brightness, contrast, saturation;
+                sws_getColorspaceDetails(ps->sws_ctx,
+                    &inv_table, &cur_src_range, &table, &cur_dst_range,
+                    &brightness, &contrast, &saturation);
+
+                sws_setColorspaceDetails(ps->sws_ctx,
+                    sws_getCoefficients(src_cs), src_range,
+                    sws_getCoefficients(dst_cs), dst_range,
+                    brightness, contrast, saturation);
+
+                log_msg("swscale: colorspace=%s range=%s->full",
+                    (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
+                    src_range ? "full" : "limited");
+            }
+
+            /* ── Chroma siting ── */
+            {
+                AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+                const char *chroma_desc = "default";
+
+                if (par->chroma_location == AVCHROMA_LOC_LEFT) {
+                    av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
+                    av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
+                    chroma_desc = "left (MPEG-2)";
+                } else if (par->chroma_location == AVCHROMA_LOC_CENTER) {
+                    av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 128, 0);
+                    av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
+                    chroma_desc = "center (MPEG-1/JPEG)";
+                } else if (par->chroma_location == AVCHROMA_LOC_TOPLEFT) {
+                    av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
+                    av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 0, 0);
+                    chroma_desc = "top-left";
+                }
+
+                log_msg("swscale: chroma siting=%s", chroma_desc);
+            }
+
+            log_msg("swscale: mode=%s", sws_mode);
+
+            /* Allocate buffer for the converted frame */
+            int buf_size = av_image_get_buffer_size(dst_fmt, dst_w, dst_h, 32);
+            ps->rgb_buffer = av_malloc(buf_size);
+            av_image_fill_arrays(ps->rgb_frame->data, ps->rgb_frame->linesize,
+                                 ps->rgb_buffer, dst_fmt, dst_w, dst_h, 32);
         }
-
-        /* ── Chroma siting ── */
-        {
-            AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
-            const char *chroma_desc = "default";
-
-            if (par->chroma_location == AVCHROMA_LOC_LEFT) {
-                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
-                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
-                chroma_desc = "left (MPEG-2)";
-            } else if (par->chroma_location == AVCHROMA_LOC_CENTER) {
-                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 128, 0);
-                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
-                chroma_desc = "center (MPEG-1/JPEG)";
-            } else if (par->chroma_location == AVCHROMA_LOC_TOPLEFT) {
-                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
-                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 0, 0);
-                chroma_desc = "top-left";
-            }
-
-            log_msg("swscale: chroma siting=%s", chroma_desc);
-        }
-
-        log_msg("swscale: mode=%s", sws_mode);
-
-        /* Allocate buffer for the converted frame */
-        int buf_size = av_image_get_buffer_size(dst_fmt, dst_w, dst_h, 32);
-        ps->rgb_buffer = av_malloc(buf_size);
-        av_image_fill_arrays(ps->rgb_frame->data, ps->rgb_frame->linesize,
-                             ps->rgb_buffer, dst_fmt, dst_w, dst_h, 32);
     }
 
     /* ── Resize window to video dimensions ── */
@@ -1234,16 +1297,34 @@ static void upload_plane(
 /* Display the current video frame: convert → upload to GPU → shader draw.
  *
  * This is the hot path. Called once per new frame from main.c.
- * Handles both the CPU-side conversion (swscale or passthrough)
- * and the full GPU submission (copy pass + render pass).
+ *
+ * Three source modes, all using the YUV planar pipeline (3 textures):
+ *   1. 10-bit passthrough: direct upload, 2 bytes/sample (R16_UNORM)
+ *   2. 8-bit full-range YUV420P: direct upload, 1 byte/sample (R8_UNORM)
+ *   3. All other formats: swscale → upload, 1 byte/sample (R8_UNORM)
  */
 void video_display(PlayerState *ps) {
     if (!ps->gpu_tex_y || !ps->video_frame || !ps->video_frame->data[0]) return;
     if (ps->seeking) return;
 
-    /* ── Determine source frame (passthrough or swscale) ── */
+    int w  = ps->vid_w;
+    int h  = ps->vid_h;
+    int cw = w / 2;
+    int ch = h / 2;
+
+    /* ── Determine source frame and byte width ── */
     AVFrame *src_frame;
-    {
+    int bpp;  /* bytes per sample for upload_plane */
+
+    int is_10bit_passthrough =
+        (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
+         && !ps->sws_ctx);
+
+    if (is_10bit_passthrough) {
+        /* 10-bit passthrough — raw frame directly to R16_UNORM textures */
+        src_frame = ps->video_frame;
+        bpp = 2;
+    } else {
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
         int is_full_range = (ps->fmt_ctx->streams[ps->video_stream_idx]
                                 ->codecpar->color_range == AVCOL_RANGE_JPEG);
@@ -1252,8 +1333,7 @@ void video_display(PlayerState *ps) {
             /* Full-range YUV420P — direct upload, no conversion */
             src_frame = ps->video_frame;
         } else {
-            /* All other formats — swscale handles range expansion,
-             * bit-depth conversion, and/or format conversion */
+            /* All other formats — swscale handles conversion */
             sws_scale(ps->sws_ctx,
                 (const uint8_t *const *)ps->video_frame->data,
                 ps->video_frame->linesize,
@@ -1262,20 +1342,16 @@ void video_display(PlayerState *ps) {
                 ps->rgb_frame->linesize);
             src_frame = ps->rgb_frame;
         }
+        bpp = 1;
     }
 
     /* ── Upload plane data to GPU transfer buffers ── */
-    int w  = ps->vid_w;
-    int h  = ps->vid_h;
-    int cw = w / 2;
-    int ch = h / 2;
-
     upload_plane(ps->gpu_device, ps->gpu_xfer_y,
-                 src_frame->data[0], src_frame->linesize[0], w, h);
+                 src_frame->data[0], src_frame->linesize[0], w * bpp, h);
     upload_plane(ps->gpu_device, ps->gpu_xfer_u,
-                 src_frame->data[1], src_frame->linesize[1], cw, ch);
+                 src_frame->data[1], src_frame->linesize[1], cw * bpp, ch);
     upload_plane(ps->gpu_device, ps->gpu_xfer_v,
-                 src_frame->data[2], src_frame->linesize[2], cw, ch);
+                 src_frame->data[2], src_frame->linesize[2], cw * bpp, ch);
 
     /* ── GPU command buffer ── */
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
@@ -1338,12 +1414,11 @@ void video_display(PlayerState *ps) {
         return;
     }
     if (!swapchain_tex) {
-        /* Window is minimized or occluded — skip this frame */
         SDL_CancelGPUCommandBuffer(cmd);
         return;
     }
 
-    /* ── Render pass: draw video quad ── */
+    /* ── Render pass: YUV planar shader, 3 textures ── */
     SDL_GPUColorTargetInfo color_target;
     SDL_zero(color_target);
     color_target.texture    = swapchain_tex;
@@ -1355,11 +1430,7 @@ void video_display(PlayerState *ps) {
     {
         SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_yuv);
 
-        /* Viewport for letterboxing — shader fills the viewport,
-         * black bars come from the LOADOP_CLEAR outside the viewport. */
         player_update_display_rect(ps);
-
-        /* Use swapchain dimensions for viewport (handles high-DPI) */
         float scale_x = (sc_w > 0) ? (float)sc_w / ps->win_w : 1.0f;
         float scale_y = (sc_h > 0) ? (float)sc_h / ps->win_h : 1.0f;
 
@@ -1372,11 +1443,9 @@ void video_display(PlayerState *ps) {
         viewport.max_depth = 1.0f;
         SDL_SetGPUViewport(pass, &viewport);
 
-        /* Push color uniforms */
         SDL_PushGPUFragmentUniformData(cmd, 0,
             &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
 
-        /* Bind texture+sampler pairs (one sampler per texture — CRITICAL) */
         SDL_GPUTextureSamplerBinding bindings[3] = {
             { .texture = ps->gpu_tex_y, .sampler = ps->gpu_sampler },
             { .texture = ps->gpu_tex_u, .sampler = ps->gpu_sampler },
@@ -1384,12 +1453,9 @@ void video_display(PlayerState *ps) {
         };
         SDL_BindGPUFragmentSamplers(pass, 0, bindings, 3);
 
-        /* Draw fullscreen quad (4 vertices, triangle strip, no vertex buffer) */
         SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
     }
     SDL_EndGPURenderPass(pass);
-
-    /* ── Submit ── */
     SDL_SubmitGPUCommandBuffer(cmd);
 }
 
@@ -1635,7 +1701,10 @@ void player_build_debug_info(PlayerState *ps) {
         int is_full_range = (ps->fmt_ctx &&
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
 
-        if (is_yuv420p && is_full_range) {
+        if (is_10bit && !ps->sws_ctx) {
+            off += snprintf(buf + off, sz - off,
+                "SWS: bypassed (10-bit GPU passthrough, R16_UNORM)\n");
+        } else if (is_yuv420p && is_full_range) {
             off += snprintf(buf + off, sz - off, "SWS: passthrough (full-range YUV420P)\n");
         } else if (is_10bit) {
             off += snprintf(buf + off, sz - off, "SWS: 10-bit fast (SWS_POINT, no dither)\n");
