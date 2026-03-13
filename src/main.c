@@ -111,13 +111,19 @@ static int open_file_dialog(char *out, int out_size) {
  * GPU Idle Screen (no media loaded)
  * ═══════════════════════════════════════════════════════════════════
  *
- * Phase 1: simple dark background clear via GPU. No text rendering.
- * Phase 2 will composite text overlays as GPU textures.
+ * Dark background with DSVP title, version, and hotkey reference
+ * rendered via the overlay system.
  */
 
 static void gpu_draw_idle(PlayerState *ps) {
+    /* Render idle screen text to overlay pixel buffer */
+    overlay_render_idle(ps);
+
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
     if (!cmd) return;
+
+    /* Upload overlay texture if dirty */
+    gpu_overlay_copy_cmd(cmd, ps);
 
     SDL_GPUTexture *swapchain_tex = NULL;
     Uint32 sc_w, sc_h;
@@ -140,7 +146,10 @@ static void gpu_draw_idle(PlayerState *ps) {
     color_target.store_op   = SDL_GPU_STOREOP_STORE;
 
     SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
-    /* Empty pass — just the clear */
+    {
+        /* Overlay quad with title/version/hotkeys */
+        gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
+    }
     SDL_EndGPURenderPass(pass);
 
     SDL_SubmitGPUCommandBuffer(cmd);
@@ -236,7 +245,7 @@ int main(int argc, char *argv[]) {
     memset(&ps, 0, sizeof(ps));
     ps.window     = window;
     ps.gpu_device = gpu_device;
-    ps.volume     = 0.75;
+    ps.volume     = 1.00;
     ps.video_stream_idx = -1;
     ps.audio_stream_idx = -1;
     ps.sub_active_idx   = -1;
@@ -338,21 +347,22 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_D:
-                    /* Debug overlay disabled in Phase 1 — data goes to log */
-                    ps.show_debug = !ps.show_debug;
-                    if (ps.show_debug) {
-                        log_msg("Debug overlay requested (Phase 1: log only)");
-                        player_build_debug_info(&ps);
-                        log_msg("%s", ps.debug_info);
+                    if (ps.playing) {
+                        ps.show_debug = !ps.show_debug;
+                        if (ps.show_debug) {
+                            ps.show_info = 0;  /* mutually exclusive */
+                            player_build_debug_info(&ps);
+                        }
                     }
                     break;
 
                 case SDLK_I:
-                    /* Info overlay disabled in Phase 1 — data goes to log */
-                    ps.show_info = !ps.show_info;
-                    if (ps.show_info) {
-                        log_msg("Media info requested (Phase 1: log only)");
-                        log_msg("%s", ps.media_info);
+                    if (ps.playing) {
+                        ps.show_info = !ps.show_info;
+                        if (ps.show_info) {
+                            ps.show_debug = 0;  /* mutually exclusive */
+                            player_build_media_info(&ps);
+                        }
                     }
                     break;
 
@@ -377,6 +387,8 @@ int main(int argc, char *argv[]) {
                     if (ps.volume > 1.0) ps.volume = 1.0;
                     if (ps.audio_stream)
                         SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
+                    ps.show_seekbar = 1;
+                    ps.seekbar_hide_time = get_time_sec() + 1.5;
                     break;
 
                 case SDLK_DOWN:
@@ -384,6 +396,8 @@ int main(int argc, char *argv[]) {
                     if (ps.volume < 0.0) ps.volume = 0.0;
                     if (ps.audio_stream)
                         SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
+                    ps.show_seekbar = 1;
+                    ps.seekbar_hide_time = get_time_sec() + 1.5;
                     break;
 
                 default:
@@ -424,8 +438,12 @@ int main(int argc, char *argv[]) {
                 break;
 
             case SDL_EVENT_MOUSE_MOTION:
-                /* Phase 2: show/hide overlays on mouse movement */
+                /* Show overlays on mouse movement, auto-hide after 3s */
                 SDL_ShowCursor();
+                if (ps.playing) {
+                    ps.show_seekbar = 1;
+                    ps.seekbar_hide_time = get_time_sec() + 1.5;
+                }
                 break;
 
             case SDL_EVENT_WINDOW_RESIZED:
@@ -439,6 +457,13 @@ int main(int argc, char *argv[]) {
         if (ps.playing && !ps.paused) {
             /* Decode pending subtitles (still queued for Phase 2) */
             sub_decode_pending(&ps);
+
+            /* ── Render overlays to pixel buffer (before GPU submission) ── */
+            overlay_render(&ps);
+
+            /* Hide cursor when seek bar auto-hides */
+            if (!ps.show_seekbar && !ps.show_debug && !ps.show_info)
+                SDL_HideCursor();
 
             /* ── Video decode and A/V sync ──
              *
@@ -567,8 +592,9 @@ int main(int argc, char *argv[]) {
 
 
         } else if (ps.playing && ps.paused) {
-            /* Paused — decode pending subs, redraw current frame */
+            /* Paused — decode pending subs, render overlays, redraw current frame */
             sub_decode_pending(&ps);
+            overlay_render(&ps);
             if (ps.gpu_tex_y) {
                 video_reblit(&ps);
             }

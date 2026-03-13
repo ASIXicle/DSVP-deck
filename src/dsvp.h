@@ -150,6 +150,14 @@ typedef struct PlayerState {
     int                         gpu_is_nv12;         /* 1 = NV12/P010 path */
     GPUUniforms                 gpu_uniforms;         /* current color params */
 
+    /* ── Overlay GPU handles (lifetime: application, resized as needed) ── */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_overlay; /* RGBA + alpha blend */
+    SDL_GPUTexture             *gpu_overlay_tex;      /* RGBA8888 overlay  */
+    SDL_GPUTransferBuffer      *gpu_overlay_xfer;     /* CPU→GPU staging   */
+    int                         overlay_tex_w;         /* current texture dimensions */
+    int                         overlay_tex_h;
+    int                         overlay_dirty;         /* 1 = need re-upload */
+
     /* ── Timing / A/V sync ── */
     double              audio_clock;      /* current audio PTS in secs  */
     double              video_clock;      /* current video PTS in secs  */
@@ -179,9 +187,12 @@ typedef struct PlayerState {
     int                 vid_w, vid_h;     /* video native resolution    */
     SDL_Rect            display_rect;     /* letterboxed video area     */
 
-    /* ── Overlays (Phase 2 — disabled during Phase 1 GPU migration) ── */
+    /* ── Overlay visibility state ── */
     int                 show_debug;
     int                 show_info;
+    int                 show_seekbar;         /* 1 = seek bar visible       */
+    double              seekbar_hide_time;    /* auto-hide after this time  */
+    int                 overlay_active;       /* 1 = overlay has content    */
 
     /* ── Subtitles ── */
     int                 sub_stream_indices[MAX_SUB_STREAMS];
@@ -250,6 +261,15 @@ void  player_update_display_rect(PlayerState *ps);
 int   gpu_create_pipelines(PlayerState *ps);
 void  gpu_destroy_pipelines(PlayerState *ps);
 
+/* ── Overlay GPU (player.c) ──────────────────────────────────────── */
+
+int   gpu_overlay_ensure(PlayerState *ps, int width, int height);
+void  gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba, int width, int height);
+void  gpu_overlay_copy_cmd(SDL_GPUCommandBuffer *cmd, PlayerState *ps);
+void  gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
+                        PlayerState *ps, Uint32 sc_w, Uint32 sc_h);
+void  gpu_overlay_destroy(PlayerState *ps);
+
 /* ── Audio API (audio.c) ──────────────────────────────────────────── */
 
 int   audio_open(PlayerState *ps);
@@ -269,8 +289,15 @@ void  sub_cycle(PlayerState *ps);
 void  sub_decode_pending(PlayerState *ps);
 int   sub_init_font(void);
 void  sub_close_font(void);
+TTF_Font *sub_get_font(void);
+TTF_Font *sub_get_outline_font(void);
 /* Phase 2: sub_render will be reworked for GPU compositing */
 void  sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h);
+
+/* ── Overlay API (overlay.c) ─────────────────────────────────────── */
+
+void  overlay_render(PlayerState *ps);
+void  overlay_render_idle(PlayerState *ps);
 
 /* ── Logging API (log.c) ───────────────────────────────────────────── */
 

@@ -111,6 +111,10 @@ void sub_close_font(void) {
     if (font_loaded)      { TTF_Quit(); font_loaded = 0; }
 }
 
+/* Font accessors for overlay.c (GPU-composited subtitle rendering) */
+TTF_Font *sub_get_font(void)         { return sub_font; }
+TTF_Font *sub_get_outline_font(void) { return sub_font_outline; }
+
 /* Free any active bitmap subtitle textures */
 static void sub_clear_bitmaps(PlayerState *ps) {
     for (int i = 0; i < ps->sub_bitmap_count; i++) {

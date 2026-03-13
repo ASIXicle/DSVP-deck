@@ -110,6 +110,17 @@ static const char hlsl_nv12_frag[] =
     "    return float4(mul(colorMatrix, yuv).rgb, 1.0);\n"
     "}\n";
 
+/* RGBA overlay fragment shader — simple passthrough with alpha.
+ * Used for compositing debug overlays, seek bar, subtitles, etc.
+ * over the video frame. One texture, one sampler, no uniforms. */
+static const char hlsl_overlay_frag[] =
+    "Texture2D<float4> texOverlay : register(t0, space2);\n"
+    "SamplerState sampOverlay : register(s0, space2);\n"
+    "\n"
+    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    return texOverlay.Sample(sampOverlay, uv);\n"
+    "}\n";
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * Shader Compilation Helper
@@ -272,6 +283,67 @@ int gpu_create_pipelines(PlayerState *ps) {
     /* Vertex shader used by both pipelines — safe to release now */
     SDL_ReleaseGPUShader(ps->gpu_device, vert);
 
+    /* ── Compile overlay RGBA fragment shader ── */
+    SDL_GPUShader *frag_overlay = compile_shader(
+        ps->gpu_device, hlsl_overlay_frag, "main",
+        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
+    if (!frag_overlay) {
+        log_msg("ERROR: Overlay shader compile failed");
+        return -1;
+    }
+
+    /* ── Create overlay pipeline (alpha blending enabled) ──
+     *
+     * Standard alpha compositing: src.a * src + (1-src.a) * dst.
+     * This is the "over" operator — overlay pixels with alpha < 1
+     * blend with the video underneath. */
+    {
+        /* Need a fresh vertex shader since we released vert above */
+        SDL_GPUShader *vert_overlay = compile_shader(
+            ps->gpu_device, hlsl_fullscreen_vert, "main",
+            SDL_SHADERCROSS_SHADERSTAGE_VERTEX);
+        if (!vert_overlay) {
+            SDL_ReleaseGPUShader(ps->gpu_device, frag_overlay);
+            log_msg("ERROR: Overlay vertex shader compile failed");
+            return -1;
+        }
+
+        SDL_GPUColorTargetDescription overlay_color_desc;
+        SDL_zero(overlay_color_desc);
+        overlay_color_desc.format = SDL_GetGPUSwapchainTextureFormat(
+            ps->gpu_device, ps->window);
+        overlay_color_desc.blend_state.enable_blend          = true;
+        overlay_color_desc.blend_state.src_color_blendfactor  = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+        overlay_color_desc.blend_state.dst_color_blendfactor  = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        overlay_color_desc.blend_state.color_blend_op         = SDL_GPU_BLENDOP_ADD;
+        overlay_color_desc.blend_state.src_alpha_blendfactor   = SDL_GPU_BLENDFACTOR_ONE;
+        overlay_color_desc.blend_state.dst_alpha_blendfactor   = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        overlay_color_desc.blend_state.alpha_blend_op          = SDL_GPU_BLENDOP_ADD;
+        overlay_color_desc.blend_state.color_write_mask        =
+            SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G |
+            SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+
+        SDL_GPUGraphicsPipelineCreateInfo overlay_pipe;
+        SDL_zero(overlay_pipe);
+        overlay_pipe.vertex_shader   = vert_overlay;
+        overlay_pipe.fragment_shader = frag_overlay;
+        overlay_pipe.primitive_type  = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+        overlay_pipe.target_info.num_color_targets        = 1;
+        overlay_pipe.target_info.color_target_descriptions = &overlay_color_desc;
+
+        ps->gpu_pipeline_overlay = SDL_CreateGPUGraphicsPipeline(
+            ps->gpu_device, &overlay_pipe);
+
+        SDL_ReleaseGPUShader(ps->gpu_device, vert_overlay);
+        SDL_ReleaseGPUShader(ps->gpu_device, frag_overlay);
+
+        if (!ps->gpu_pipeline_overlay) {
+            log_msg("ERROR: Failed to create overlay pipeline: %s", SDL_GetError());
+            return -1;
+        }
+        log_msg("GPU: overlay pipeline created (alpha blend)");
+    }
+
     /* ── Create sampler (linear filtering + anisotropy) ── */
     SDL_GPUSamplerCreateInfo samp_info;
     SDL_zero(samp_info);
@@ -297,6 +369,8 @@ int gpu_create_pipelines(PlayerState *ps) {
 void gpu_destroy_pipelines(PlayerState *ps) {
     if (!ps->gpu_device) return;
 
+    gpu_overlay_destroy(ps);
+
     if (ps->gpu_sampler) {
         SDL_ReleaseGPUSampler(ps->gpu_device, ps->gpu_sampler);
         ps->gpu_sampler = NULL;
@@ -308,6 +382,10 @@ void gpu_destroy_pipelines(PlayerState *ps) {
     if (ps->gpu_pipeline_nv12) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_nv12);
         ps->gpu_pipeline_nv12 = NULL;
+    }
+    if (ps->gpu_pipeline_overlay) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_overlay);
+        ps->gpu_pipeline_overlay = NULL;
     }
 }
 
@@ -509,6 +587,163 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         m[ 8] = 1.0f;  m[ 9] =  1.772f;   m[10] =  0.0f;     /* B */
     }
     m[15] = 1.0f;  /* A passthrough */
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Overlay GPU Resources
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * The overlay system composites debug info, seek bar, subtitles, and
+ * other UI elements as a single RGBA texture drawn over the video
+ * with alpha blending. The texture is recreated when the window is
+ * resized. Upload happens once per frame when overlay_dirty is set.
+ */
+
+/* Ensure overlay texture and transfer buffer exist at the given size.
+ * Recreates if dimensions changed. Returns 0 on success, -1 on error. */
+int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
+    if (!ps->gpu_device || width <= 0 || height <= 0) return -1;
+
+    /* Already the right size? */
+    if (ps->gpu_overlay_tex &&
+        ps->overlay_tex_w == width && ps->overlay_tex_h == height) {
+        return 0;
+    }
+
+    /* Destroy old resources */
+    gpu_overlay_destroy(ps);
+
+    /* Create RGBA8888 texture */
+    SDL_GPUTextureCreateInfo tex_info;
+    SDL_zero(tex_info);
+    tex_info.type                 = SDL_GPU_TEXTURETYPE_2D;
+    tex_info.format               = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    tex_info.width                = width;
+    tex_info.height               = height;
+    tex_info.layer_count_or_depth = 1;
+    tex_info.num_levels           = 1;
+    tex_info.usage                = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+
+    ps->gpu_overlay_tex = SDL_CreateGPUTexture(ps->gpu_device, &tex_info);
+    if (!ps->gpu_overlay_tex) {
+        log_msg("ERROR: Failed to create overlay texture: %s", SDL_GetError());
+        return -1;
+    }
+
+    /* Create transfer buffer (RGBA = 4 bytes per pixel) */
+    SDL_GPUTransferBufferCreateInfo xfer_info;
+    SDL_zero(xfer_info);
+    xfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    xfer_info.size  = (Uint32)width * height * 4;
+
+    ps->gpu_overlay_xfer = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+    if (!ps->gpu_overlay_xfer) {
+        log_msg("ERROR: Failed to create overlay transfer buffer: %s", SDL_GetError());
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_overlay_tex);
+        ps->gpu_overlay_tex = NULL;
+        return -1;
+    }
+
+    ps->overlay_tex_w = width;
+    ps->overlay_tex_h = height;
+    ps->overlay_dirty = 0;
+
+    log_msg("GPU: overlay texture created (%dx%d RGBA)", width, height);
+    return 0;
+}
+
+/* Upload RGBA pixel data to the overlay GPU texture.
+ * `rgba` must be width×height×4 bytes, tightly packed. */
+void gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba,
+                        int width, int height) {
+    if (!ps->gpu_overlay_xfer || !ps->gpu_overlay_tex) return;
+    if (width != ps->overlay_tex_w || height != ps->overlay_tex_h) return;
+
+    /* Map transfer buffer and copy pixel data */
+    uint8_t *dst = SDL_MapGPUTransferBuffer(ps->gpu_device,
+                                             ps->gpu_overlay_xfer, true);
+    if (!dst) return;
+    memcpy(dst, rgba, (size_t)width * height * 4);
+    SDL_UnmapGPUTransferBuffer(ps->gpu_device, ps->gpu_overlay_xfer);
+
+    ps->overlay_dirty = 1;
+}
+
+/* Issue the GPU copy pass to transfer overlay data to the texture.
+ * Call this inside an existing command buffer, BEFORE the render pass.
+ * Returns the copy pass so the caller can end it, or does it inline. */
+void gpu_overlay_copy_cmd(SDL_GPUCommandBuffer *cmd, PlayerState *ps) {
+    if (!ps->overlay_dirty || !ps->gpu_overlay_tex) return;
+
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    {
+        SDL_GPUTextureTransferInfo src_info;
+        SDL_GPUTextureRegion dst_region;
+
+        SDL_zero(src_info);
+        SDL_zero(dst_region);
+        src_info.transfer_buffer = ps->gpu_overlay_xfer;
+        src_info.pixels_per_row  = ps->overlay_tex_w;
+        src_info.rows_per_layer  = ps->overlay_tex_h;
+        dst_region.texture = ps->gpu_overlay_tex;
+        dst_region.w = ps->overlay_tex_w;
+        dst_region.h = ps->overlay_tex_h;
+        dst_region.d = 1;
+        SDL_UploadToGPUTexture(copy, &src_info, &dst_region, true);
+    }
+    SDL_EndGPUCopyPass(copy);
+
+    ps->overlay_dirty = 0;
+}
+
+/* Draw the overlay quad within an existing render pass.
+ * Uses the overlay pipeline (alpha blend) and a fullscreen viewport.
+ * Call AFTER the video quad has been drawn. */
+void gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
+                      PlayerState *ps, Uint32 sc_w, Uint32 sc_h) {
+    if (!ps->gpu_overlay_tex || !ps->gpu_pipeline_overlay || !ps->overlay_active)
+        return;
+    (void)cmd;  /* uniform push would use cmd, but overlay has none */
+
+    SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_overlay);
+
+    /* Fullscreen viewport — overlay covers entire window, not just
+     * the letterboxed video area. This lets us draw seek bars,
+     * debug info, etc. in the black bar regions too. */
+    SDL_GPUViewport viewport;
+    viewport.x = 0;
+    viewport.y = 0;
+    viewport.w = (float)sc_w;
+    viewport.h = (float)sc_h;
+    viewport.min_depth = 0.0f;
+    viewport.max_depth = 1.0f;
+    SDL_SetGPUViewport(pass, &viewport);
+
+    SDL_GPUTextureSamplerBinding binding = {
+        .texture = ps->gpu_overlay_tex,
+        .sampler = ps->gpu_sampler
+    };
+    SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+
+    SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+}
+
+/* Destroy overlay GPU resources (texture + transfer buffer). */
+void gpu_overlay_destroy(PlayerState *ps) {
+    if (!ps->gpu_device) return;
+
+    if (ps->gpu_overlay_tex) {
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_overlay_tex);
+        ps->gpu_overlay_tex = NULL;
+    }
+    if (ps->gpu_overlay_xfer) {
+        SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_overlay_xfer);
+        ps->gpu_overlay_xfer = NULL;
+    }
+    ps->overlay_tex_w = 0;
+    ps->overlay_tex_h = 0;
+    ps->overlay_dirty = 0;
 }
 
 
@@ -1029,6 +1264,9 @@ void player_close(PlayerState *ps) {
     ps->seek_recovering    = 0;
     ps->show_debug         = 0;
     ps->show_info          = 0;
+    ps->show_seekbar       = 0;
+    ps->seekbar_hide_time  = 0.0;
+    ps->overlay_active     = 0;
     ps->aud_count          = 0;
     ps->aud_selection      = 0;
     ps->aud_osd[0]         = '\0';
@@ -1404,6 +1642,9 @@ void video_display(PlayerState *ps) {
     }
     SDL_EndGPUCopyPass(copy);
 
+    /* ── Overlay copy pass (if dirty) ── */
+    gpu_overlay_copy_cmd(cmd, ps);
+
     /* ── Acquire swapchain texture ── */
     SDL_GPUTexture *swapchain_tex = NULL;
     Uint32 sc_w, sc_h;
@@ -1454,6 +1695,9 @@ void video_display(PlayerState *ps) {
         SDL_BindGPUFragmentSamplers(pass, 0, bindings, 3);
 
         SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+
+        /* ── Overlay quad (alpha-blended over video) ── */
+        gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
     }
     SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
@@ -1469,6 +1713,9 @@ void video_reblit(PlayerState *ps) {
 
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
     if (!cmd) return;
+
+    /* ── Overlay copy pass (if dirty — e.g. first reblit after overlay update) ── */
+    gpu_overlay_copy_cmd(cmd, ps);
 
     SDL_GPUTexture *swapchain_tex = NULL;
     Uint32 sc_w, sc_h;
@@ -1517,6 +1764,9 @@ void video_reblit(PlayerState *ps) {
         SDL_BindGPUFragmentSamplers(pass, 0, bindings, 3);
 
         SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+
+        /* ── Overlay quad (alpha-blended over video) ── */
+        gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
     }
     SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
