@@ -120,24 +120,25 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
         ps->audio_buf_index += to_push;
     }
 
-    /* ── Audio clock latency correction ──
+    /* ── Audio clock sync snapshot ──
      *
-     * audio_clock reflects the PTS at the END of the last decoded frame,
-     * but that audio hasn't played yet — it's queued in our internal
-     * buffer and SDL's audio stream pipeline. Subtract the buffered
-     * duration so the main thread's A/V sync sees the actual playback
-     * position, not the decode position.
+     * audio_clock reflects the PTS at the END of the last decoded frame.
+     * But audio_decode_frame() updates audio_clock multiple times during
+     * the callback (line 70: set PTS, line 72: += samples, loop repeats).
+     * The main thread reads audio_clock for A/V sync at arbitrary times.
      *
-     * Without this, video chronically appears "behind" by ~30-50ms,
-     * causing the sync loop to set delay=0 and produce burst decodes
-     * on most display ticks.
+     * If the main thread reads DURING this callback, it sees the raw
+     * decode position (too far ahead) instead of the corrected playback
+     * position.  This data race causes audio_clock to appear ~20-40ms
+     * ahead, making av_diff chronically negative and locking 60fps
+     * content into a two-decode-per-VSync equilibrium.
      *
-     * CRITICAL: Cap the correction to avoid runaway drift. SDL may
-     * report large queued amounts during startup or with codecs that
-     * produce large frames (FLAC). Uncapped, this causes the audio
-     * clock to appear far in the past → video drops everything.
-     * 100ms cap is enough to fix the sync loop offset (~30-50ms)
-     * without overcorrecting. */
+     * Fix: compute the corrected value ONCE at the end of the callback
+     * and write it to audio_clock_sync.  The main thread reads ONLY
+     * audio_clock_sync, which always has the full correction applied.
+     *
+     * CRITICAL: Cap the correction at 100ms to prevent FLAC/large-buffer
+     * runaway where SDL reports huge queued amounts during startup. */
     if (ps->audio_spec.freq > 0 && !ps->seek_recovering) {
         int bytes_per_sample = 2 * 2;  /* S16 stereo = 4 bytes/frame */
 
@@ -155,7 +156,10 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
         /* Cap at 100ms — prevents FLAC/large-buffer runaway */
         if (buffered_sec > 0.1) buffered_sec = 0.1;
 
-        ps->audio_clock -= buffered_sec;
+        /* Single atomic write — main thread reads only this field */
+        ps->audio_clock_sync = ps->audio_clock - buffered_sec;
+    } else {
+        ps->audio_clock_sync = ps->audio_clock;
     }
 }
 
@@ -319,7 +323,7 @@ void audio_cycle(PlayerState *ps) {
     log_msg("Audio: now playing %s (%s %dHz)",
         ps->aud_stream_names[new_sel], codec->name, new_rate);
 
-    double pos = ps->audio_clock;
+    double pos = ps->audio_clock_sync;
     if (pos < 0.1) pos = 0.1;
     ps->seek_target  = (int64_t)(pos * AV_TIME_BASE);
     ps->seek_flags   = AVSEEK_FLAG_BACKWARD;

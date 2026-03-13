@@ -484,7 +484,7 @@ static void draw_menubar(uint8_t *buf, int bw, int bh) {
 static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     if (!ps->sub_valid || ps->sub_selection == 0) return;
 
-    double now = (ps->audio_stream_idx >= 0) ? ps->audio_clock : ps->video_clock;
+    double now = (ps->audio_stream_idx >= 0) ? ps->audio_clock_sync : ps->video_clock;
     if (now < ps->sub_start_pts || now > ps->sub_end_pts) return;
 
     /* Bitmap subtitles — not yet supported in GPU overlay, skip for now */

@@ -162,7 +162,8 @@ typedef struct PlayerState {
     int                         overlay_dirty;         /* 1 = need re-upload */
 
     /* ── Timing / A/V sync ── */
-    double              audio_clock;      /* current audio PTS in secs  */
+    double              audio_clock;      /* current audio PTS in secs (audio thread internal) */
+    double              audio_clock_sync; /* latency-corrected snapshot for main thread A/V sync */
     double              video_clock;      /* current video PTS in secs  */
     double              frame_timer;      /* when we last showed a frame*/
     double              frame_last_delay; /* last frame display duration*/

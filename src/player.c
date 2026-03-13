@@ -1290,6 +1290,7 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->frame_last_delay = 0.04;   /* assume ~25fps initially */
     ps->frame_last_pts   = 0.0;
     ps->audio_clock      = 0.0;
+    ps->audio_clock_sync = 0.0;
     ps->video_clock      = 0.0;
 
     /* Suppress frame drops until the first frame is displayed.
@@ -1496,6 +1497,7 @@ int demux_thread_func(void *arg) {
             {
                 double seek_pos = (double)target / AV_TIME_BASE;
                 ps->audio_clock = seek_pos;
+                ps->audio_clock_sync = seek_pos;
                 ps->video_clock = seek_pos;
             }
 
@@ -2079,9 +2081,9 @@ void player_build_debug_info(PlayerState *ps) {
     off += snprintf(buf + off, sz - off, "=== DEBUG ===\n");
     off += snprintf(buf + off, sz - off, "Renderer: SDL_GPU\n");
     off += snprintf(buf + off, sz - off, "Video Clock: %.3f s\n", ps->video_clock);
-    off += snprintf(buf + off, sz - off, "Audio Clock: %.3f s\n", ps->audio_clock);
+    off += snprintf(buf + off, sz - off, "Audio Clock: %.3f s\n", ps->audio_clock_sync);
     off += snprintf(buf + off, sz - off, "A/V Diff:    %.3f ms\n",
-        (ps->video_clock - ps->audio_clock) * 1000.0);
+        (ps->video_clock - ps->audio_clock_sync) * 1000.0);
     off += snprintf(buf + off, sz - off, "Video Queue: %d pkts (%d KB)\n",
         ps->video_pq.nb_packets, ps->video_pq.size / 1024);
     off += snprintf(buf + off, sz - off, "Audio Queue: %d pkts (%d KB)\n",

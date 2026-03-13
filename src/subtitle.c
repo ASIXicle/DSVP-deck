@@ -337,7 +337,7 @@ void sub_decode_pending(PlayerState *ps) {
     int queue_idx = ps->sub_selection - 1;
     PacketQueue *spq = &ps->sub_pqs[queue_idx];
 
-    double now = ps->audio_clock;
+    double now = ps->audio_clock_sync;
     if (ps->audio_stream_idx < 0) now = ps->video_clock;
 
     /* If current subtitle is still valid and on-screen, keep it */
@@ -519,7 +519,7 @@ void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
 
     /* ── Render active subtitle ── */
     if (ps->sub_valid) {
-        double now = ps->audio_clock;
+        double now = ps->audio_clock_sync;
         if (ps->audio_stream_idx < 0) now = ps->video_clock;
 
         if (now >= ps->sub_start_pts && now <= ps->sub_end_pts) {

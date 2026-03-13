@@ -526,7 +526,7 @@ int main(int argc, char *argv[]) {
                     double delay = pts_delay;
                     double av_diff = 0.0;
                     if (ps.audio_stream_idx >= 0) {
-                        av_diff = ps.video_clock - ps.audio_clock;
+                        av_diff = ps.video_clock - ps.audio_clock_sync;
                         double threshold = fmax(pts_delay, 0.01);
 
                         if (av_diff > threshold) {
@@ -599,7 +599,7 @@ int main(int argc, char *argv[]) {
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
                 double av_now = (ps.audio_stream_idx >= 0)
-                    ? ps.video_clock - ps.audio_clock : 0.0;
+                    ? ps.video_clock - ps.audio_clock_sync : 0.0;
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
                         "dropped=%d multi_ticks=%d snaps=%d "
                         "A/V=%.1fms peak=%.1fms",
