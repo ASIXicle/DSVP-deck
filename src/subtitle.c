@@ -16,6 +16,8 @@
 
 static TTF_Font *sub_font         = NULL;
 static TTF_Font *sub_font_outline = NULL;
+static TTF_Font *sub_font_cjk         = NULL;
+static TTF_Font *sub_font_cjk_outline = NULL;
 static int       font_loaded      = 0;
 
 /* Golden Yellow subtitle color and black outline */
@@ -46,6 +48,36 @@ static const char *find_system_font(void) {
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+#endif
+        NULL
+    };
+
+    for (int i = 0; candidates[i]; i++) {
+        FILE *f = fopen(candidates[i], "rb");
+        if (f) {
+            fclose(f);
+            return candidates[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *find_cjk_font(void) {
+    static const char *candidates[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msjh.ttc",
+        "C:\\Windows\\Fonts\\yugothm.ttc",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+#else
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/OTF/NotoSansCJK-Regular.ttc",
 #endif
         NULL
     };
@@ -100,12 +132,32 @@ int sub_init_font(void) {
     if (sub_font_outline)
         TTF_SetFontHinting(sub_font_outline, TTF_HINTING_LIGHT);
 
+    /* Try to attach CJK fallback font for Chinese/Japanese/Korean glyphs */
+    const char *cjk_path = find_cjk_font();
+    if (cjk_path) {
+        sub_font_cjk = TTF_OpenFont(cjk_path, font_size);
+        if (sub_font_cjk) {
+            TTF_SetFontHinting(sub_font_cjk, TTF_HINTING_LIGHT);
+            TTF_AddFallbackFont(sub_font, sub_font_cjk);
+
+            sub_font_cjk_outline = TTF_OpenFont(cjk_path, font_size);
+            if (sub_font_cjk_outline) {
+                TTF_SetFontOutline(sub_font_cjk_outline, 2);
+                TTF_SetFontHinting(sub_font_cjk_outline, TTF_HINTING_LIGHT);
+                TTF_AddFallbackFont(sub_font_outline, sub_font_cjk_outline);
+            }
+            log_msg("CJK fallback font loaded: %s", cjk_path);
+        }
+    }
+
     font_loaded = 1;
     log_msg("Subtitle font loaded: %s (%dpt)", font_path, font_size);
     return 0;
 }
 
 void sub_close_font(void) {
+    if (sub_font_cjk)         { TTF_CloseFont(sub_font_cjk);         sub_font_cjk = NULL; }
+    if (sub_font_cjk_outline) { TTF_CloseFont(sub_font_cjk_outline); sub_font_cjk_outline = NULL; }
     if (sub_font)         { TTF_CloseFont(sub_font);         sub_font = NULL; }
     if (sub_font_outline) { TTF_CloseFont(sub_font_outline); sub_font_outline = NULL; }
     if (font_loaded)      { TTF_Quit(); font_loaded = 0; }
@@ -115,12 +167,12 @@ void sub_close_font(void) {
 TTF_Font *sub_get_font(void)         { return sub_font; }
 TTF_Font *sub_get_outline_font(void) { return sub_font_outline; }
 
-/* Free any active bitmap subtitle textures */
+/* Free any active bitmap subtitle data */
 static void sub_clear_bitmaps(PlayerState *ps) {
     for (int i = 0; i < ps->sub_bitmap_count; i++) {
-        if (ps->sub_bitmaps[i]) {
-            SDL_DestroyTexture(ps->sub_bitmaps[i]);
-            ps->sub_bitmaps[i] = NULL;
+        if (ps->sub_bitmap_data[i]) {
+            av_free(ps->sub_bitmap_data[i]);
+            ps->sub_bitmap_data[i] = NULL;
         }
     }
     ps->sub_bitmap_count = 0;
@@ -340,12 +392,25 @@ void sub_decode_pending(PlayerState *ps) {
     double now = ps->audio_clock_sync;
     if (ps->audio_stream_idx < 0) now = ps->video_clock;
 
-    /* If current subtitle is still valid and on-screen, keep it */
-    if (ps->sub_valid && now <= ps->sub_end_pts) return;
+    /* If current subtitle is still valid and on-screen, keep it.
+     * Exception: bitmap subs currently DISPLAYING need to drain the queue
+     * for "clear" packets (0 rects) that signal when to hide.
+     * Once the clear is found (end_pts updated from the 30s cap), stop draining. */
+    if (ps->sub_valid && now <= ps->sub_end_pts) {
+        if (!ps->sub_is_bitmap) return;
+        if (now < ps->sub_start_pts) return;  /* not showing yet, don't drain */
+        /* If end_pts was updated from the 30s cap, clear was already found */
+        if (ps->sub_end_pts - ps->sub_start_pts < 29.0) return;
+        /* Bitmap currently displayed, clear not yet found — drain for it */
+    }
 
-    /* Current subtitle expired (or none active) — try the next one */
-    ps->sub_valid = 0;
-    sub_clear_bitmaps(ps);
+    /* Current subtitle expired or bitmap needs clear-packet drain */
+    int draining_for_clear = (ps->sub_is_bitmap && ps->sub_valid
+                              && now >= ps->sub_start_pts && now <= ps->sub_end_pts);
+    if (!draining_for_clear) {
+        ps->sub_valid = 0;
+        sub_clear_bitmaps(ps);
+    }
 
     AVPacket pkt;
     while (pq_get(spq, &pkt, 0) > 0) {
@@ -375,6 +440,13 @@ void sub_decode_pending(PlayerState *ps) {
             end = pkt_pts + (double)pkt.duration * av_q2d(st->time_base);
         } else if (sub.end_display_time == 0) {
             end = start + 3.0;  /* last resort fallback */
+        }
+
+        /* PGS/DVB: end_display_time is often UINT32_MAX (duration unknown
+         * until the clear packet arrives). Cap to 30s as a safety net —
+         * the 0-rect clear packet will expire it earlier. */
+        if (end - start > 30.0) {
+            end = start + 30.0;
         }
 
         /* Extract text or bitmap data */
@@ -423,24 +495,17 @@ void sub_decode_pending(PlayerState *ps) {
                         }
                     }
 
-                    /* Phase 1 (SDL_GPU): skip bitmap texture creation.
-                     * Bitmap sub decode still runs; rendering in Phase 2. */
-                    SDL_Texture *tex = NULL;
-                    (void)tex;
-                    if (tex) {
-                        SDL_UpdateTexture(tex, NULL, rgba, w * 4);
-                        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+                    /* Store RGBA data for GPU overlay compositing */
+                    int bi = ps->sub_bitmap_count;
+                    ps->sub_bitmap_data[bi] = rgba;  /* ownership transferred */
+                    ps->sub_bitmap_w[bi] = w;
+                    ps->sub_bitmap_h[bi] = h;
+                    ps->sub_bitmap_rects[bi] = (SDL_Rect){ rect->x, rect->y, w, h };
+                    ps->sub_bitmap_count++;
+                    got_bitmap = 1;
 
-                        int bi = ps->sub_bitmap_count;
-                        ps->sub_bitmaps[bi] = tex;
-                        ps->sub_bitmap_rects[bi] = (SDL_Rect){ rect->x, rect->y, w, h };
-                        ps->sub_bitmap_count++;
-                        got_bitmap = 1;
-
-                        log_msg("Sub [BITMAP] %.1f-%.1f: %dx%d at (%d,%d)",
-                            start, end, w, h, rect->x, rect->y);
-                    }
-                    av_free(rgba);
+                    log_msg("Sub [BITMAP] %.1f-%.1f: %dx%d at (%d,%d)",
+                        start, end, w, h, rect->x, rect->y);
                 }
             } else {
                 log_msg("Sub: unknown rect type %d", rect->type);
@@ -448,7 +513,23 @@ void sub_decode_pending(PlayerState *ps) {
         }
 
         if (sub.num_rects == 0) {
-            log_msg("Sub: packet decoded but 0 rects (pts=%.1f)", pkt_pts);
+            /* PGS/DVB: a 0-rect packet is the "clear" signal. */
+            log_msg("Sub: clear signal (0 rects, pts=%.1f)", pkt_pts);
+            if (draining_for_clear && pkt_pts > now) {
+                /* Clear is in the future — set the real end time and stop.
+                 * The sub will expire naturally via the time check. */
+                ps->sub_end_pts = pkt_pts;
+                avsubtitle_free(&sub);
+                av_packet_unref(&pkt);
+                break;
+            }
+            /* Clear is for now or past — expire immediately */
+            ps->sub_valid = 0;
+            sub_clear_bitmaps(ps);
+            draining_for_clear = 0;
+            avsubtitle_free(&sub);
+            av_packet_unref(&pkt);
+            continue;
         }
 
         avsubtitle_free(&sub);
@@ -524,31 +605,9 @@ void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
 
         if (now >= ps->sub_start_pts && now <= ps->sub_end_pts) {
             if (ps->sub_is_bitmap && ps->sub_bitmap_count > 0) {
-                /* ── Bitmap subtitle: scale from canvas coords to display area ──
-                 *
-                 * Subtitle positions are relative to the subtitle canvas (e.g.
-                 * 1920×1080). We map into the letterboxed display_rect, not the
-                 * full window, so subs stay properly aligned with the video.
-                 */
-                int canvas_w = (ps->sub_codec_ctx && ps->sub_codec_ctx->width  > 0)
-                    ? ps->sub_codec_ctx->width  : ps->vid_w;
-                int canvas_h = (ps->sub_codec_ctx && ps->sub_codec_ctx->height > 0)
-                    ? ps->sub_codec_ctx->height : ps->vid_h;
-
-                SDL_Rect dr = ps->display_rect;
-                double sx = (canvas_w > 0) ? (double)dr.w / canvas_w : 1.0;
-                double sy = (canvas_h > 0) ? (double)dr.h / canvas_h : 1.0;
-
-                for (int i = 0; i < ps->sub_bitmap_count; i++) {
-                    if (!ps->sub_bitmaps[i]) continue;
-                    SDL_Rect dst = {
-                        dr.x + (int)(ps->sub_bitmap_rects[i].x * sx),
-                        dr.y + (int)(ps->sub_bitmap_rects[i].y * sy),
-                        (int)(ps->sub_bitmap_rects[i].w * sx),
-                        (int)(ps->sub_bitmap_rects[i].h * sy)
-                    };
-                    {SDL_FRect _fdst = rect_to_frect(&dst); SDL_RenderTexture(renderer, ps->sub_bitmaps[i], NULL, &_fdst);}
-                }
+                /* Bitmap subtitles now rendered via overlay.c GPU path.
+                 * This legacy sub_render() is unused. */
+                (void)renderer; (void)win_w; (void)win_h;
             } else if (!ps->sub_is_bitmap && ps->sub_text[0]) {
                 /* ── Text subtitle: render with SDL_ttf ── */
                 if (font_loaded) {

@@ -3,7 +3,8 @@ build/
 *.o
 *.exe
 DSVP-portable/
-dsvp
+dsvp/
+shadercross/
 
 # Dependencies (downloaded locally, not committed)
 deps/ffmpeg/

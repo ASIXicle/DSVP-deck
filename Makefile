@@ -21,8 +21,9 @@ ifeq ($(OS),Windows_NT)
   SC_CFLAGS  = -I$(SC_ROOT)/include
   SC_LDFLAGS = -L$(SC_ROOT)/lib -lSDL3_shadercross
 else
-  SC_CFLAGS  = $(shell pkg-config --cflags SDL3_shadercross 2>/dev/null)
-  SC_LDFLAGS = $(shell pkg-config --libs SDL3_shadercross 2>/dev/null)
+  SC_ROOT    = shadercross/SDL3_shadercross-3.0.0-linux-x64
+  SC_CFLAGS  = -I$(SC_ROOT)/include
+  SC_LDFLAGS = -L$(SC_ROOT)/lib -lSDL3_shadercross -Wl,-rpath,'$$ORIGIN/../shadercross/SDL3_shadercross-3.0.0-linux-x64/lib'
 endif
 
 CFLAGS  = $(BASE_CFLAGS) $(SC_CFLAGS)

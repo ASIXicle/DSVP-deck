@@ -680,6 +680,8 @@ int main(int argc, char *argv[]) {
             /* Paused — decode pending subs, render overlays, redraw current frame */
             sub_decode_pending(&ps);
             overlay_render(&ps);
+            if (!ps.show_seekbar && !ps.show_debug && !ps.show_info)
+                SDL_HideCursor();
             if (ps.gpu_tex_y) {
                 video_reblit(&ps);
             }

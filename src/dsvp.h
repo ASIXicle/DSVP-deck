@@ -217,8 +217,10 @@ typedef struct PlayerState {
     int                 sub_valid;          /* 1 = sub_text should display  */
     int                 sub_is_bitmap;      /* 1 = bitmap sub, 0 = text     */
 
-    /* Bitmap subtitle textures — Phase 2: convert to GPU textures */
-    SDL_Texture        *sub_bitmaps[MAX_SUB_BITMAPS];
+    /* Bitmap subtitle pixel data (RGBA, freed via av_free) */
+    uint8_t            *sub_bitmap_data[MAX_SUB_BITMAPS];
+    int                 sub_bitmap_w[MAX_SUB_BITMAPS];
+    int                 sub_bitmap_h[MAX_SUB_BITMAPS];
     SDL_Rect            sub_bitmap_rects[MAX_SUB_BITMAPS];
     int                 sub_bitmap_count;
 

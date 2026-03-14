@@ -292,6 +292,47 @@ static void blit_surface(uint8_t *buf, int bw, int bh,
 }
 
 
+/* Blit raw RGBA pixel data with nearest-neighbor scaling + alpha blend.
+ * Used for bitmap subtitle compositing (PGS, VobSub, DVB). */
+static void blit_rgba_scaled(uint8_t *buf, int bw, int bh,
+                              const uint8_t *src, int sw, int sh,
+                              int dst_x, int dst_y, int dst_w, int dst_h) {
+    if (!src || sw <= 0 || sh <= 0 || dst_w <= 0 || dst_h <= 0) return;
+    int stride = bw * 4;
+    for (int dy = 0; dy < dst_h; dy++) {
+        int py = dst_y + dy;
+        if (py < 0 || py >= bh) continue;
+        int sy = dy * sh / dst_h;
+        if (sy >= sh) sy = sh - 1;
+        const uint8_t *src_row = src + sy * sw * 4;
+        uint8_t *dst_row = buf + py * stride;
+        for (int dx = 0; dx < dst_w; dx++) {
+            int px = dst_x + dx;
+            if (px < 0 || px >= bw) continue;
+            int sx_val = dx * sw / dst_w;
+            if (sx_val >= sw) sx_val = sw - 1;
+            const uint8_t *sp = src_row + sx_val * 4;
+            uint8_t sa = sp[3];
+            if (sa == 0) continue;
+            uint8_t *dp = dst_row + px * 4;
+            if (sa == 255 || dp[3] == 0) {
+                dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = sa;
+            } else {
+                float sf = sa / 255.0f;
+                float df = dp[3] / 255.0f;
+                float of = sf + df * (1.0f - sf);
+                if (of > 0.0f) {
+                    dp[0] = (uint8_t)((sp[0]*sf + dp[0]*df*(1.0f-sf)) / of);
+                    dp[1] = (uint8_t)((sp[1]*sf + dp[1]*df*(1.0f-sf)) / of);
+                    dp[2] = (uint8_t)((sp[2]*sf + dp[2]*df*(1.0f-sf)) / of);
+                    dp[3] = (uint8_t)(of * 255.0f);
+                }
+            }
+        }
+    }
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════
  * Overlay Components
  * ═══════════════════════════════════════════════════════════════════ */
@@ -487,8 +528,35 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     double now = (ps->audio_stream_idx >= 0) ? ps->audio_clock_sync : ps->video_clock;
     if (now < ps->sub_start_pts || now > ps->sub_end_pts) return;
 
-    /* Bitmap subtitles — not yet supported in GPU overlay, skip for now */
-    if (ps->sub_is_bitmap) return;
+    /* Bitmap subtitles — scale from canvas coords to overlay pixel buffer */
+    if (ps->sub_is_bitmap && ps->sub_bitmap_count > 0) {
+        int canvas_w = (ps->sub_codec_ctx && ps->sub_codec_ctx->width > 0)
+            ? ps->sub_codec_ctx->width : ps->vid_w;
+        int canvas_h = (ps->sub_codec_ctx && ps->sub_codec_ctx->height > 0)
+            ? ps->sub_codec_ctx->height : ps->vid_h;
+
+        /* Map display_rect from logical window coords to physical overlay pixels */
+        double px_sx = (ps->win_w > 0) ? (double)bw / ps->win_w : 1.0;
+        double px_sy = (ps->win_h > 0) ? (double)bh / ps->win_h : 1.0;
+        int dr_x = (int)(ps->display_rect.x * px_sx);
+        int dr_y = (int)(ps->display_rect.y * px_sy);
+        int dr_w = (int)(ps->display_rect.w * px_sx);
+        int dr_h = (int)(ps->display_rect.h * px_sy);
+
+        double sx = (canvas_w > 0) ? (double)dr_w / canvas_w : 1.0;
+        double sy = (canvas_h > 0) ? (double)dr_h / canvas_h : 1.0;
+
+        for (int i = 0; i < ps->sub_bitmap_count; i++) {
+            if (!ps->sub_bitmap_data[i]) continue;
+            blit_rgba_scaled(buf, bw, bh,
+                ps->sub_bitmap_data[i], ps->sub_bitmap_w[i], ps->sub_bitmap_h[i],
+                dr_x + (int)(ps->sub_bitmap_rects[i].x * sx),
+                dr_y + (int)(ps->sub_bitmap_rects[i].y * sy),
+                (int)(ps->sub_bitmap_rects[i].w * sx),
+                (int)(ps->sub_bitmap_rects[i].h * sy));
+        }
+        return;
+    }
 
     /* Text subtitles — need the font */
     TTF_Font *font = sub_get_font();
