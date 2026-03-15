@@ -449,6 +449,34 @@ void sub_decode_pending(PlayerState *ps) {
             end = start + 30.0;
         }
 
+        /* If we're only draining for a clear packet, handle it here
+         * without touching the currently-displaying bitmap data. */
+        if (draining_for_clear) {
+            if (sub.num_rects == 0) {
+                /* Found the clear signal */
+                log_msg("Sub: clear signal (0 rects, pts=%.1f)", pkt_pts);
+                if (pkt_pts > now) {
+                    /* Clear is in the future — set the real end time.
+                     * The sub will expire naturally via the time check. */
+                    ps->sub_end_pts = pkt_pts;
+                    avsubtitle_free(&sub);
+                    av_packet_unref(&pkt);
+                    break;
+                }
+                /* Clear is for now or past — expire immediately */
+                ps->sub_valid = 0;
+                sub_clear_bitmaps(ps);
+                draining_for_clear = 0;
+                avsubtitle_free(&sub);
+                av_packet_unref(&pkt);
+                continue;
+            }
+            /* Not a clear packet — skip it, keep looking */
+            avsubtitle_free(&sub);
+            av_packet_unref(&pkt);
+            continue;
+        }
+
         /* Extract text or bitmap data */
         char text[SUB_TEXT_SIZE] = {0};
         int got_bitmap = 0;
@@ -513,20 +541,12 @@ void sub_decode_pending(PlayerState *ps) {
         }
 
         if (sub.num_rects == 0) {
-            /* PGS/DVB: a 0-rect packet is the "clear" signal. */
+            /* PGS/DVB: a 0-rect packet is the "clear" signal.
+             * (Drain-for-clear case is handled above; this covers
+             * clear packets encountered during normal scanning.) */
             log_msg("Sub: clear signal (0 rects, pts=%.1f)", pkt_pts);
-            if (draining_for_clear && pkt_pts > now) {
-                /* Clear is in the future — set the real end time and stop.
-                 * The sub will expire naturally via the time check. */
-                ps->sub_end_pts = pkt_pts;
-                avsubtitle_free(&sub);
-                av_packet_unref(&pkt);
-                break;
-            }
-            /* Clear is for now or past — expire immediately */
             ps->sub_valid = 0;
             sub_clear_bitmaps(ps);
-            draining_for_clear = 0;
             avsubtitle_free(&sub);
             av_packet_unref(&pkt);
             continue;
