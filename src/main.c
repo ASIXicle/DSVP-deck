@@ -211,13 +211,26 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Create GPU device ──
-     * SDL_GPU replaces SDL_Renderer. Uses shadercross to query which
-     * shader formats the platform supports (DXIL on Windows D3D12,
-     * SPIRV on Vulkan, MSL on Metal). Debug mode enables GPU validation. */
+     * Force Vulkan on all platforms. SDL_GPU's D3D12 backend has a
+     * transfer buffer synchronization bottleneck: SDL_MapGPUTransferBuffer
+     * stalls on GPU fences from the previous frame's copy command,
+     * adding 30-180ms per frame depending on texture size. On 4K 10-bit
+     * content (19.2MB/frame), this made real-time playback impossible.
+     * Vulkan's memory model handles transfer buffer cycling without
+     * fence stalls, giving ~1-2ms per frame on the same content.
+     * Verified: identical DSVP code, same hardware, D3D12 = 62% drops
+     * on Ugetsu, Vulkan = 0% drops. */
+    SDL_SetHint(SDL_HINT_GPU_DRIVER, "vulkan");
+
+#ifdef DSVP_DEBUG
+    bool gpu_debug = true;
+#else
+    bool gpu_debug = false;
+#endif
     SDL_GPUDevice *gpu_device = SDL_CreateGPUDevice(
         SDL_ShaderCross_GetSPIRVShaderFormats(),
-        true,   /* debug_mode — GPU validation layers */
-        NULL    /* preferred driver — auto-select */
+        gpu_debug,
+        NULL    /* preferred driver — vulkan (set by hint above) */
     );
     if (!gpu_device) {
         fprintf(stderr, "[DSVP] Cannot create GPU device: %s\n", SDL_GetError());
