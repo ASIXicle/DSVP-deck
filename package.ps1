@@ -17,6 +17,29 @@ $outDir  = "DSVP-portable"
 
 Write-Host "=== DSVP Packager v$version ===" -ForegroundColor Cyan
 
+# ── Ensure MSYS2 MinGW64 tools are on PATH ───────────────────────
+$msysRoot = "C:\msys64\mingw64"
+if (Test-Path "$msysRoot\bin") {
+    $env:PATH = "$msysRoot\bin;C:\msys64\usr\bin;$env:PATH"
+    $env:PKG_CONFIG_PATH = "$msysRoot\lib\pkgconfig;$env:PKG_CONFIG_PATH"
+} else {
+    Write-Host "WARNING: MSYS2 MinGW64 not found at $msysRoot." -ForegroundColor Yellow
+}
+
+# Verify pkg-config can find SDL3
+$pkgCheck = & pkg-config --cflags sdl3 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: pkg-config cannot find sdl3. Install MSYS2 deps first (see SETUP.md)." -ForegroundColor Red
+    exit 1
+}
+
+# Verify shadercross is present
+$scDir = "deps\SDL3_shadercross-3.0.0-windows-mingw-x64"
+if (-not (Test-Path "$scDir\include\SDL3_shadercross\SDL_shadercross.h")) {
+    Write-Host "ERROR: SDL3_shadercross not found at $scDir\" -ForegroundColor Red
+    exit 1
+}
+
 # ── Build ──────────────────────────────────────────────────────────
 
 if (-not $SkipBuild) {
