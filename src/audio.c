@@ -1,19 +1,17 @@
 /*
  * DSVP — Dead Simple Video Player
- * audio.c — Audio decode, resample, and SDL audio callback
+ * audio.c — Audio decode, resample, and SDL3 audio stream
  *
- * How audio playback works:
+ * SDL3 audio model:
  *
- *   1. SDL opens an audio device with a callback function.
- *   2. SDL's audio thread calls audio_callback() whenever it needs
- *      more samples to play.
- *   3. audio_callback() pulls data from an internal buffer. When the
- *      buffer runs out, it calls audio_decode_frame() to decode more
- *      packets from the audio packet queue and resample them to the
- *      output format (signed 16-bit, stereo, device sample rate).
- *   4. As samples are consumed, we update audio_clock to track the
- *      current playback position. The video sync uses this clock
- *      as the master reference.
+ *   1. We open an SDL_AudioStream via SDL_OpenAudioDeviceStream(),
+ *      which creates a stream bound to a playback device.
+ *   2. A "get" callback fires when the device needs more samples.
+ *      We decode FFmpeg audio frames, resample to S16 stereo, and
+ *      push data into the stream via SDL_PutAudioStreamData().
+ *   3. Volume is controlled via SDL_SetAudioStreamGain() — no
+ *      manual mixing needed.
+ *   4. audio_clock tracks playback position for A/V sync.
  */
 
 #include "dsvp.h"
@@ -22,47 +20,29 @@
  * Audio Decode
  * ═══════════════════════════════════════════════════════════════════ */
 
-/*
- * Decode one audio frame from the packet queue and resample it
- * to the SDL output format. Returns the number of bytes of
- * resampled data, or -1 on error / no data.
- */
 int audio_decode_frame(PlayerState *ps) {
     AVPacket pkt;
     int ret;
     int data_size = 0;
 
     for (;;) {
-        /* Try to receive a decoded frame */
         ret = avcodec_receive_frame(ps->audio_codec_ctx, ps->audio_frame);
         if (ret == 0) {
-            /* Got a frame — resample to output format */
-
-            /* Lazy-init SwrContext on first frame (we need the actual
-             * frame's channel layout which may differ from codecpar) */
             if (!ps->swr_ctx) {
                 AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
-
                 ret = swr_alloc_set_opts2(&ps->swr_ctx,
-                    &out_layout,                        /* out ch layout  */
-                    AV_SAMPLE_FMT_S16,                  /* out format     */
-                    ps->audio_spec.freq,                /* out sample rate*/
-                    &ps->audio_frame->ch_layout,        /* in ch layout   */
-                    ps->audio_frame->format,            /* in format      */
-                    ps->audio_frame->sample_rate,       /* in sample rate */
-                    0, NULL
-                );
-            if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
+                    &out_layout, AV_SAMPLE_FMT_S16, ps->audio_spec.freq,
+                    &ps->audio_frame->ch_layout, ps->audio_frame->format,
+                    ps->audio_frame->sample_rate, 0, NULL);
+                if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
                     log_msg("ERROR: swr init failed: %s", av_err2str(ret));
                     return -1;
                 }
             }
 
-            /* Calculate output buffer size */
             int out_samples = swr_get_out_samples(ps->swr_ctx, ps->audio_frame->nb_samples);
-            int out_size = out_samples * 2 * 2; /* stereo * 16-bit */
+            int out_size = out_samples * 2 * 2;
 
-            /* Grow buffer if needed */
             if (!ps->audio_buf || out_size > AUDIO_BUF_SIZE) {
                 av_free(ps->audio_buf);
                 ps->audio_buf = av_malloc(AUDIO_BUF_SIZE);
@@ -73,18 +53,15 @@ int audio_decode_frame(PlayerState *ps) {
             int converted = swr_convert(ps->swr_ctx,
                 &out_buf, out_samples,
                 (const uint8_t **)ps->audio_frame->data,
-                ps->audio_frame->nb_samples
-            );
+                ps->audio_frame->nb_samples);
 
             if (converted < 0) {
                 fprintf(stderr, "[DSVP] Resample error\n");
                 return -1;
             }
 
-            data_size = converted * 2 * 2; /* stereo * 16-bit */
+            data_size = converted * 2 * 2;
 
-            /* Update audio clock from frame PTS.
-             * Prefer best_effort_timestamp for same reasons as video. */
             int64_t frame_pts = ps->audio_frame->best_effort_timestamp;
             if (frame_pts == AV_NOPTS_VALUE)
                 frame_pts = ps->audio_frame->pts;
@@ -92,75 +69,97 @@ int audio_decode_frame(PlayerState *ps) {
                 AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
                 ps->audio_clock = (double)frame_pts * av_q2d(as->time_base);
             }
-            /* Advance clock by the duration of the samples we just decoded */
             ps->audio_clock += (double)converted / ps->audio_spec.freq;
 
             av_frame_unref(ps->audio_frame);
             return data_size;
         }
 
-        if (ret != AVERROR(EAGAIN)) {
-            return -1; /* decoder error or EOF */
-        }
+        if (ret != AVERROR(EAGAIN))
+            return -1;
 
-        /* Need more packets — pull from queue (non-blocking) */
         ret = pq_get(&ps->audio_pq, &pkt, 0);
-        if (ret <= 0) return -1; /* no packets right now */
+        if (ret <= 0) return -1;
 
         ret = avcodec_send_packet(ps->audio_codec_ctx, &pkt);
         av_packet_unref(&pkt);
-
         if (ret < 0) return -1;
     }
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * SDL Audio Callback
- * ═══════════════════════════════════════════════════════════════════
- *
- * Called by SDL's audio thread whenever the device needs more samples.
- * We fill `stream` with `len` bytes of audio data, mixing our volume.
- */
+ * SDL3 Audio Stream Callback
+ * ═══════════════════════════════════════════════════════════════════ */
 
-void audio_callback(void *userdata, Uint8 *stream, int len) {
+void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
+                             int additional_amount, int total_amount) {
     PlayerState *ps = (PlayerState *)userdata;
-
-    /* Silence the buffer first (prevents noise on underrun) */
-    memset(stream, 0, len);
+    (void)total_amount;
 
     if (ps->paused || ps->seek_request || ps->seeking) return;
+    if (additional_amount <= 0) return;
 
     int written = 0;
-
-    while (written < len) {
-        /* If our internal buffer is exhausted, decode more */
+    while (written < additional_amount) {
         if (ps->audio_buf_index >= ps->audio_buf_size) {
             int decoded = audio_decode_frame(ps);
-            if (decoded <= 0) {
-                /* No data available — output silence for remainder */
-                break;
-            }
+            if (decoded <= 0) break;
             ps->audio_buf_size  = decoded;
             ps->audio_buf_index = 0;
         }
 
-        /* Copy from our buffer to SDL's buffer */
         int remaining = ps->audio_buf_size - ps->audio_buf_index;
-        int to_copy   = len - written;
-        if (to_copy > remaining) to_copy = remaining;
+        int to_push   = additional_amount - written;
+        if (to_push > remaining) to_push = remaining;
 
-        /* Apply volume: mix into the stream buffer */
-        SDL_MixAudioFormat(
-            stream + written,
-            ps->audio_buf + ps->audio_buf_index,
-            AUDIO_S16SYS,
-            to_copy,
-            (int)(ps->volume * SDL_MIX_MAXVOLUME)
-        );
+        SDL_PutAudioStreamData(stream,
+            ps->audio_buf + ps->audio_buf_index, to_push);
 
-        written             += to_copy;
-        ps->audio_buf_index += to_copy;
+        written             += to_push;
+        ps->audio_buf_index += to_push;
+    }
+
+    /* ── Audio clock sync snapshot ──
+     *
+     * audio_clock reflects the PTS at the END of the last decoded frame.
+     * But audio_decode_frame() updates audio_clock multiple times during
+     * the callback (line 70: set PTS, line 72: += samples, loop repeats).
+     * The main thread reads audio_clock for A/V sync at arbitrary times.
+     *
+     * If the main thread reads DURING this callback, it sees the raw
+     * decode position (too far ahead) instead of the corrected playback
+     * position.  This data race causes audio_clock to appear ~20-40ms
+     * ahead, making av_diff chronically negative and locking 60fps
+     * content into a two-decode-per-VSync equilibrium.
+     *
+     * Fix: compute the corrected value ONCE at the end of the callback
+     * and write it to audio_clock_sync.  The main thread reads ONLY
+     * audio_clock_sync, which always has the full correction applied.
+     *
+     * CRITICAL: Cap the correction at 100ms to prevent FLAC/large-buffer
+     * runaway where SDL reports huge queued amounts during startup. */
+    if (ps->audio_spec.freq > 0 && !ps->seek_recovering) {
+        int bytes_per_sample = 2 * 2;  /* S16 stereo = 4 bytes/frame */
+
+        /* Our internal buffer: decoded but not yet pushed to SDL */
+        int internal_pending = ps->audio_buf_size - ps->audio_buf_index;
+        if (internal_pending < 0) internal_pending = 0;
+
+        /* SDL stream pipeline: pushed but not yet played by device */
+        int stream_pending = SDL_GetAudioStreamQueued(stream);
+        if (stream_pending < 0) stream_pending = 0;
+
+        double buffered_sec = (double)(internal_pending + stream_pending)
+                            / (ps->audio_spec.freq * bytes_per_sample);
+
+        /* Cap at 100ms — prevents FLAC/large-buffer runaway */
+        if (buffered_sec > 0.1) buffered_sec = 0.1;
+
+        /* Single atomic write — main thread reads only this field */
+        ps->audio_clock_sync = ps->audio_clock - buffered_sec;
+    } else {
+        ps->audio_clock_sync = ps->audio_clock;
     }
 }
 
@@ -172,51 +171,46 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
 int audio_open(PlayerState *ps) {
     if (!ps->audio_codec_ctx) return -1;
 
-    SDL_AudioSpec wanted;
-    SDL_zero(wanted);
+    SDL_AudioSpec spec;
+    SDL_zero(spec);
+    spec.format   = SDL_AUDIO_S16;
+    spec.channels = 2;
+    spec.freq     = ps->audio_codec_ctx->sample_rate;
 
-    wanted.freq     = ps->audio_codec_ctx->sample_rate;
-    wanted.format   = AUDIO_S16SYS;     /* signed 16-bit, native byte order */
-    wanted.channels = 2;                /* always output stereo              */
-    wanted.samples  = SDL_AUDIO_BUFFER_SZ;
-    wanted.callback = audio_callback;
-    wanted.userdata = ps;
+    ps->audio_stream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+        &spec, audio_callback, ps);
 
-    ps->audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted, &ps->audio_spec, 0);
-    if (ps->audio_dev == 0) {
-        log_msg("ERROR: SDL_OpenAudioDevice failed: %s", SDL_GetError());
+    if (!ps->audio_stream) {
+        log_msg("ERROR: SDL_OpenAudioDeviceStream failed: %s", SDL_GetError());
         return -1;
     }
 
-    /* Allocate initial audio buffer */
+    ps->audio_spec = spec;
+
     ps->audio_buf       = av_malloc(AUDIO_BUF_SIZE);
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;
 
-    /* Start playback */
-    SDL_PauseAudioDevice(ps->audio_dev, 0);
+    SDL_SetAudioStreamGain(ps->audio_stream, ps->volume);
+    SDL_ResumeAudioStreamDevice(ps->audio_stream);
 
-    log_msg("Audio opened: %d Hz, %d ch, buffer %d samples",
-        ps->audio_spec.freq, ps->audio_spec.channels, ps->audio_spec.samples);
-
+    log_msg("Audio opened: %d Hz, %d ch (SDL3 stream)",
+        spec.freq, spec.channels);
     return 0;
 }
 
 void audio_close(PlayerState *ps) {
-    if (ps->audio_dev) {
-        SDL_CloseAudioDevice(ps->audio_dev);
-        ps->audio_dev = 0;
+    if (ps->audio_stream) {
+        SDL_DestroyAudioStream(ps->audio_stream);
+        ps->audio_stream = NULL;
     }
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Stream Discovery
- * ═══════════════════════════════════════════════════════════════════
- *
- * Catalogs all audio streams in the container. Called once during
- * player_open, after the initial audio codec is already opened.
- */
+ * ═══════════════════════════════════════════════════════════════════ */
 
 void audio_find_streams(PlayerState *ps) {
     ps->aud_count     = 0;
@@ -229,7 +223,6 @@ void audio_find_streams(PlayerState *ps) {
         int idx = ps->aud_count;
         ps->aud_stream_indices[idx] = (int)i;
 
-        /* Build a display name from metadata + codec info */
         const AVDictionaryEntry *lang  = av_dict_get(st->metadata, "language", NULL, 0);
         const AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
         const char *codec_name = avcodec_get_name(st->codecpar->codec_id);
@@ -237,25 +230,22 @@ void audio_find_streams(PlayerState *ps) {
         int rate     = st->codecpar->sample_rate;
 
         char desc[128] = {0};
-        if (title && lang) {
+        if (title && lang)
             snprintf(desc, sizeof(desc), "%s (%s)", title->value, lang->value);
-        } else if (lang) {
+        else if (lang)
             snprintf(desc, sizeof(desc), "%s", lang->value);
-        } else if (title) {
+        else if (title)
             snprintf(desc, sizeof(desc), "%s", title->value);
-        } else {
+        else
             snprintf(desc, sizeof(desc), "Track %d", idx + 1);
-        }
 
         snprintf(ps->aud_stream_names[idx], sizeof(ps->aud_stream_names[idx]),
             "%s [%s %dch %dHz]", desc, codec_name, channels, rate);
 
-        /* If this is the stream that was auto-selected, mark it */
         if ((int)i == ps->audio_stream_idx)
             ps->aud_selection = idx;
 
-        log_msg("Audio stream %d: [%d] %s", idx, (int)i,
-            ps->aud_stream_names[idx]);
+        log_msg("Audio stream %d: [%d] %s", idx, (int)i, ps->aud_stream_names[idx]);
         ps->aud_count++;
     }
 
@@ -267,17 +257,7 @@ void audio_find_streams(PlayerState *ps) {
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Track Cycling
- * ═══════════════════════════════════════════════════════════════════
- *
- * Switches to the next audio track:
- *   1. Pause SDL audio device (stop callback)
- *   2. Flush audio queue
- *   3. Close old audio codec + resampler
- *   4. Open new audio codec
- *   5. Reopen SDL audio device (sample rate may differ)
- *   6. Seek to current position (resets demux read-head)
- *   7. Resume playback
- */
+ * ═══════════════════════════════════════════════════════════════════ */
 
 void audio_cycle(PlayerState *ps) {
     if (ps->aud_count <= 1) {
@@ -287,33 +267,25 @@ void audio_cycle(PlayerState *ps) {
         return;
     }
 
-    /* Cycle to next track */
     int new_sel = (ps->aud_selection + 1) % ps->aud_count;
     int new_stream_idx = ps->aud_stream_indices[new_sel];
 
     log_msg("Audio: switching to %s (stream %d)",
         ps->aud_stream_names[new_sel], new_stream_idx);
 
-    /* 1. Pause audio device — stops callback from touching codec */
-    if (ps->audio_dev)
-        SDL_PauseAudioDevice(ps->audio_dev, 1);
+    if (ps->audio_stream)
+        SDL_PauseAudioStreamDevice(ps->audio_stream);
 
-    /* 2. Flush audio queue — discard old stream's packets */
     pq_flush(&ps->audio_pq);
 
-    /* 3. Close old audio codec and resampler */
-    if (ps->audio_codec_ctx) {
+    if (ps->audio_codec_ctx)
         avcodec_free_context(&ps->audio_codec_ctx);
-    }
-    if (ps->swr_ctx) {
+    if (ps->swr_ctx)
         swr_free(&ps->swr_ctx);
-    }
 
-    /* Reset audio buffer */
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;
 
-    /* 4. Open new audio codec */
     AVStream *as = ps->fmt_ctx->streams[new_stream_idx];
     const AVCodec *codec = avcodec_find_decoder(as->codecpar->codec_id);
     if (!codec) {
@@ -337,35 +309,29 @@ void audio_cycle(PlayerState *ps) {
         return;
     }
 
-    /* 5. Reopen SDL audio device if sample rate changed */
     int new_rate = ps->audio_codec_ctx->sample_rate;
     if (new_rate != ps->audio_spec.freq) {
-        log_msg("Audio: sample rate changed %d → %d, reopening device",
+        log_msg("Audio: sample rate changed %d -> %d, reopening stream",
             ps->audio_spec.freq, new_rate);
         audio_close(ps);
         audio_open(ps);
     }
 
-    /* Update state */
     ps->aud_selection    = new_sel;
     ps->audio_stream_idx = new_stream_idx;
 
     log_msg("Audio: now playing %s (%s %dHz)",
         ps->aud_stream_names[new_sel], codec->name, new_rate);
 
-    /* 6. Seek to current position — resets demux read-head so the new
-     * audio stream picks up packets from the right spot. */
-    double pos = ps->audio_clock;
+    double pos = ps->audio_clock_sync;
     if (pos < 0.1) pos = 0.1;
     ps->seek_target  = (int64_t)(pos * AV_TIME_BASE);
     ps->seek_flags   = AVSEEK_FLAG_BACKWARD;
     ps->seek_request = 1;
 
-    /* 7. Resume */
-    if (ps->audio_dev && !ps->paused)
-        SDL_PauseAudioDevice(ps->audio_dev, 0);
+    if (ps->audio_stream && !ps->paused)
+        SDL_ResumeAudioStreamDevice(ps->audio_stream);
 
-    /* OSD */
     snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: %s",
         ps->aud_stream_names[new_sel]);
     ps->aud_osd_until = get_time_sec() + 2.0;

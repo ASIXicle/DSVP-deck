@@ -1,64 +1,74 @@
-# DSVP Makefile
-# Targets: Windows (MinGW), Linux, macOS
+# DSVP — Dead Simple Video Player
+# Makefile for SDL_GPU build (v0.1.4-beta)
 
-CC       = gcc
-CFLAGS   = -Wall -Wextra -O2 -std=c11
-CFLAGS  += -D_REENTRANT
+CC      = gcc
+SRCDIR  = src
+BUILDDIR = build
 
-SRCS     = src/main.c src/player.c src/audio.c src/subtitle.c src/log.c
-TARGET   = build/dsvp
+# ── Base flags (SDL3, FFmpeg) ──
+BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample)
+BASE_LDFLAGS = $(shell pkg-config --libs sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample) -lm
 
-# --- Platform detection ---
-
-ifeq ($(OS),Windows_NT)
-    # Windows / MinGW
-    TARGET       := build/dsvp.exe
-    CFLAGS       += -I./deps/ffmpeg/include -I./deps/SDL2/include -I./deps/SDL2/include/SDL2 -I./deps/SDL2_ttf/include -I./deps/SDL2_ttf/include/SDL2
-    LDFLAGS       = -L./deps/ffmpeg/lib -L./deps/SDL2/lib -L./deps/SDL2_ttf/lib
-    LIBS          = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf
-    LIBS         += -lavformat -lavcodec -lswscale -lswresample -lavutil
-    LIBS         += -lm -lpthread
-    # Win32 API for native file dialog
-    LIBS         += -lole32 -lcomdlg32 -luuid
-    # Hide console window for release (comment out for debug)
-    LDFLAGS      += -mwindows
-else
-    UNAME_S := $(shell uname -s)
-    ifeq ($(UNAME_S),Darwin)
-        # macOS
-        CFLAGS   += $(shell pkg-config --cflags libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-        LIBS      = $(shell pkg-config --libs libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-    else
-        # Linux
-        CFLAGS   += $(shell pkg-config --cflags libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-        LIBS      = $(shell pkg-config --libs libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-        LIBS     += -lm -lpthread
-    endif
+# If pkg-config doesn't find SDL3_ttf, try sdl3-ttf
+ifeq ($(shell pkg-config --exists SDL3_ttf 2>/dev/null && echo yes),)
+  BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null)
+  BASE_LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) -lm
 endif
 
-# --- Build rules ---
-
-all: dirs $(TARGET)
-
-dirs:
+# ── SDL3_shadercross (bundled on Windows, pkg-config on Linux) ──
 ifeq ($(OS),Windows_NT)
-	@if not exist build mkdir build
+  SC_ROOT    = deps/SDL3_shadercross-3.0.0-windows-mingw-x64
+  SC_CFLAGS  = -I$(SC_ROOT)/include
+  SC_LDFLAGS = -L$(SC_ROOT)/lib -lSDL3_shadercross
 else
-	@mkdir -p build
+  SC_ROOT    = shadercross/SDL3_shadercross-3.0.0-linux-x64
+  SC_CFLAGS  = -I$(SC_ROOT)/include
+  SC_LDFLAGS = -L$(SC_ROOT)/lib -lSDL3_shadercross -Wl,-rpath,'$$ORIGIN/../shadercross/SDL3_shadercross-3.0.0-linux-x64/lib'
 endif
 
-$(TARGET): $(SRCS) src/dsvp.h
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS) $(LIBS)
+CFLAGS  = $(BASE_CFLAGS) $(SC_CFLAGS)
+LDFLAGS = $(BASE_LDFLAGS) $(SC_LDFLAGS)
 
-debug: CFLAGS += -g -DDSVP_DEBUG -O0
-debug: LDFLAGS := $(filter-out -mwindows,$(LDFLAGS))
-debug: all
+SRCS    = main.c player.c audio.c subtitle.c overlay.c log.c
+OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
+
+# Windows: append .exe, locate SDL3 DLLs via pkg-config, compile .rc for icon
+ifeq ($(OS),Windows_NT)
+  TARGET   = $(BUILDDIR)/dsvp.exe
+  SDL3_BIN = $(shell pkg-config --variable=prefix sdl3)/bin
+  RC_OBJ   = $(BUILDDIR)/dsvp_res.o
+else
+  TARGET   = $(BUILDDIR)/dsvp
+  RC_OBJ   =
+endif
+
+.PHONY: all clean debug
+
+all: $(BUILDDIR) $(TARGET)
+
+debug: CFLAGS += -g -DDSVP_DEBUG
+debug: $(BUILDDIR) $(TARGET)
+
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
+
+$(TARGET): $(OBJS) $(RC_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+	rm -f $(OBJS)
+ifeq ($(OS),Windows_NT)
+	cp -u $(SDL3_BIN)/SDL3.dll $(BUILDDIR)/
+	cp -u $(SDL3_BIN)/SDL3_ttf.dll $(BUILDDIR)/
+	cp -u $(SC_ROOT)/bin/SDL3_shadercross.dll $(BUILDDIR)/
+	cp -u $(SC_ROOT)/bin/dxcompiler.dll $(BUILDDIR)/
+	cp -u $(SC_ROOT)/bin/dxil.dll $(BUILDDIR)/
+endif
+
+# Windows resource file (application icon for taskbar/explorer)
+$(BUILDDIR)/dsvp_res.o: dsvp.rc src/dsvp.ico
+	windres $< -o $@
+
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/dsvp.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-ifeq ($(OS),Windows_NT)
-	@if exist build\dsvp.exe del build\dsvp.exe
-else
-	rm -f $(TARGET)
-endif
-
-.PHONY: all dirs clean debug
+	rm -rf $(BUILDDIR)

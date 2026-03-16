@@ -1,0 +1,2 @@
+/* dsvp.rc — Windows resource file for application icon */
+IDI_ICON1 ICON "src/dsvp.ico"

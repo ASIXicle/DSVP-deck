@@ -3,6 +3,8 @@ build/
 *.o
 *.exe
 DSVP-portable/
+dsvp/
+shadercross/
 
 # Dependencies (downloaded locally, not committed)
 deps/ffmpeg/
@@ -23,3 +25,4 @@ Thumbs.db
 # My notes
 WORKING.txt
 *.txt
+dsvp.log
