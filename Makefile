@@ -54,7 +54,7 @@ $(BUILDDIR):
 
 $(TARGET): $(OBJS) $(RC_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
-	rm -f $(OBJS)
+	rm -f $(OBJS) $(RC_OBJ)
 ifeq ($(OS),Windows_NT)
 	cp -u $(SDL3_BIN)/SDL3.dll $(BUILDDIR)/
 	cp -u $(SDL3_BIN)/SDL3_ttf.dll $(BUILDDIR)/
