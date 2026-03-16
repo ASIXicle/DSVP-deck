@@ -1,5 +1,7 @@
 # DSVP Portable Packaging Script (Windows)
-# Creates a clean DSVP-portable/ folder ready for distribution.
+# Creates a clean DSVP-portable/ folder with exe + all DLLs.
+#
+# Run from git-bash or PowerShell in the DSVP repo root.
 #
 # Usage:
 #   .\package.ps1
@@ -10,7 +12,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$version = "0.1.2"
+$version = "0.1.4-beta"
 $outDir  = "DSVP-portable"
 
 Write-Host "=== DSVP Packager v$version ===" -ForegroundColor Cyan
@@ -18,7 +20,7 @@ Write-Host "=== DSVP Packager v$version ===" -ForegroundColor Cyan
 # ── Build ──────────────────────────────────────────────────────────
 
 if (-not $SkipBuild) {
-    Write-Host "`n[1/4] Building..." -ForegroundColor Yellow
+    Write-Host "`n[1/5] Building..." -ForegroundColor Yellow
     mingw32-make clean 2>$null
     mingw32-make
     if ($LASTEXITCODE -ne 0) {
@@ -27,7 +29,7 @@ if (-not $SkipBuild) {
     }
     Write-Host "      Build OK" -ForegroundColor Green
 } else {
-    Write-Host "`n[1/4] Skipping build" -ForegroundColor DarkGray
+    Write-Host "`n[1/5] Skipping build" -ForegroundColor DarkGray
 }
 
 # ── Verify exe exists ──────────────────────────────────────────────
@@ -39,85 +41,91 @@ if (-not (Test-Path "build\dsvp.exe")) {
 
 # ── Create output directory ────────────────────────────────────────
 
-Write-Host "[2/4] Creating $outDir\" -ForegroundColor Yellow
+Write-Host "[2/5] Creating $outDir\" -ForegroundColor Yellow
 if (Test-Path $outDir) {
     Remove-Item -Recurse -Force $outDir
 }
 New-Item -ItemType Directory -Path $outDir | Out-Null
 
-# ── Copy exe ───────────────────────────────────────────────────────
+# ── Copy exe and build/ DLLs ──────────────────────────────────────
 
-Write-Host "[3/4] Copying files..." -ForegroundColor Yellow
+Write-Host "[3/5] Copying exe and build DLLs..." -ForegroundColor Yellow
 Copy-Item "build\dsvp.exe" "$outDir\"
 
-# ── Copy FFmpeg DLLs ───────────────────────────────────────────────
-
-$ffmpegBin = "deps\ffmpeg\bin"
-if (-not (Test-Path $ffmpegBin)) {
-    Write-Host "ERROR: $ffmpegBin not found." -ForegroundColor Red
-    exit 1
+# Makefile already copies SDL3.dll, SDL3_ttf.dll, SDL3_shadercross.dll,
+# dxcompiler.dll, dxil.dll to build/
+$buildDlls = Get-ChildItem "build\*.dll" -ErrorAction SilentlyContinue
+foreach ($f in $buildDlls) {
+    Copy-Item $f.FullName "$outDir\"
 }
+Write-Host "      Copied $($buildDlls.Count) DLLs from build/" -ForegroundColor Green
 
-# Only copy the DLLs we actually link against (plus their dependencies)
-$requiredDlls = @(
-    "avcodec-*.dll",
-    "avformat-*.dll",
-    "avutil-*.dll",
-    "swscale-*.dll",
-    "swresample-*.dll",
-    "postproc-*.dll"
-)
+# ── Resolve transitive DLL dependencies ────────────────────────────
 
-$copied = 0
-foreach ($pattern in $requiredDlls) {
-    $files = Get-ChildItem -Path $ffmpegBin -Filter $pattern -ErrorAction SilentlyContinue
-    foreach ($f in $files) {
-        Copy-Item $f.FullName "$outDir\"
-        $copied++
+Write-Host "[4/5] Resolving DLL dependencies..." -ForegroundColor Yellow
+
+# Find MSYS2 bin directory (where MinGW DLLs live)
+$msysBin = "C:\msys64\mingw64\bin"
+if (-not (Test-Path $msysBin)) {
+    # Try pkg-config to locate it
+    $prefix = & pkg-config --variable=prefix sdl3 2>$null
+    if ($prefix) {
+        $msysBin = Join-Path $prefix "bin"
     }
 }
 
-# Also copy any other DLLs that FFmpeg depends on (OpenSSL, etc.)
-# The gyan.dev full build bundles these in bin/
-$supportDlls = Get-ChildItem -Path $ffmpegBin -Filter "*.dll" -ErrorAction SilentlyContinue
-foreach ($f in $supportDlls) {
-    $dest = Join-Path $outDir $f.Name
-    if (-not (Test-Path $dest)) {
-        Copy-Item $f.FullName "$outDir\"
-        $copied++
-    }
-}
-
-Write-Host "      Copied $copied DLLs from FFmpeg" -ForegroundColor Green
-
-# ── Copy SDL2 DLL ──────────────────────────────────────────────────
-
-$sdlDll = "deps\SDL2\bin\SDL2.dll"
-if (Test-Path $sdlDll) {
-    Copy-Item $sdlDll "$outDir\"
-    Write-Host "      Copied SDL2.dll" -ForegroundColor Green
+if (-not (Test-Path $msysBin)) {
+    Write-Host "WARNING: MSYS2 mingw64 bin not found. Skipping dependency resolution." -ForegroundColor Yellow
 } else {
-    Write-Host "WARNING: SDL2.dll not found at $sdlDll" -ForegroundColor Yellow
-}
+    # Iteratively resolve: check each DLL/exe in outDir, find missing deps in msysBin
+    $systemDirs = @("C:\Windows\system32", "C:\Windows\SysWOW64", "C:\Windows")
+    $resolved = @{}
+    $changed = $true
 
-# ── Copy SDL2_ttf DLLs ────────────────────────────────────────────
+    while ($changed) {
+        $changed = $false
+        $files = Get-ChildItem "$outDir\*.dll", "$outDir\*.exe" -ErrorAction SilentlyContinue
 
-$ttfBin = "deps\SDL2_ttf\bin"
-if (Test-Path $ttfBin) {
-    $ttfDlls = Get-ChildItem -Path $ttfBin -Filter "*.dll" -ErrorAction SilentlyContinue
-    $ttfCount = 0
-    foreach ($f in $ttfDlls) {
-        Copy-Item $f.FullName "$outDir\"
-        $ttfCount++
+        foreach ($f in $files) {
+            if ($resolved[$f.Name]) { continue }
+            $resolved[$f.Name] = $true
+
+            # Use objdump to find DLL imports
+            $deps = & objdump -p $f.FullName 2>$null | Select-String "DLL Name:" |
+                ForEach-Object { ($_ -replace '.*DLL Name:\s*', '').Trim() }
+
+            foreach ($dep in $deps) {
+                $destPath = Join-Path $outDir $dep
+                if (Test-Path $destPath) { continue }
+
+                # Skip system DLLs
+                $isSystem = $false
+                foreach ($sysDir in $systemDirs) {
+                    if (Test-Path (Join-Path $sysDir $dep)) {
+                        $isSystem = $true
+                        break
+                    }
+                }
+                if ($isSystem) { continue }
+
+                # Try to find in MSYS2
+                $srcPath = Join-Path $msysBin $dep
+                if (Test-Path $srcPath) {
+                    Copy-Item $srcPath "$outDir\"
+                    Write-Host "      + $dep" -ForegroundColor DarkGray
+                    $changed = $true
+                }
+            }
+        }
     }
-    Write-Host "      Copied $ttfCount DLLs from SDL2_ttf" -ForegroundColor Green
-} else {
-    Write-Host "WARNING: SDL2_ttf not found at $ttfBin" -ForegroundColor Yellow
 }
+
+$totalDlls = (Get-ChildItem "$outDir\*.dll" -ErrorAction SilentlyContinue).Count
+Write-Host "      Total DLLs: $totalDlls" -ForegroundColor Green
 
 # ── Summary ────────────────────────────────────────────────────────
 
-Write-Host "`n[4/4] Package complete!" -ForegroundColor Green
+Write-Host "`n[5/5] Package complete!" -ForegroundColor Green
 
 $files = Get-ChildItem $outDir
 $totalSize = ($files | Measure-Object -Property Length -Sum).Sum / 1MB
