@@ -13,7 +13,7 @@ If you want to integrate DSVP (or portions of it) into a proprietary product wit
 
 For commercial licensing inquiries, contact:
 
-**Holden — [github.com/ASIXicle](https://github.com/ASIXicle)
+**Holden** — [github.com/ASIXicle](https://github.com/ASIXicle)
 
 Please open a GitHub issue with the subject "Commercial License Inquiry" or reach out via email APPsix@protonmail.com .
 

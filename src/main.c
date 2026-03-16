@@ -16,6 +16,7 @@
  */
 
 #include "dsvp.h"
+#include "dsvp_icon.h"
 
 /* Platform-specific file dialog */
 #ifdef _WIN32
@@ -208,6 +209,18 @@ int main(int argc, char *argv[]) {
         SDL_ShaderCross_Quit();
         SDL_Quit();
         return 1;
+    }
+
+    /* ── Set window icon ── */
+    {
+        SDL_IOStream *io = SDL_IOFromConstMem(dsvp_icon_bmp, dsvp_icon_bmp_size);
+        if (io) {
+            SDL_Surface *icon = SDL_LoadBMP_IO(io, true);  /* true = auto-close io */
+            if (icon) {
+                SDL_SetWindowIcon(window, icon);
+                SDL_DestroySurface(icon);
+            }
+        }
     }
 
     /* ── Create GPU device ──

@@ -32,12 +32,14 @@ LDFLAGS = $(BASE_LDFLAGS) $(SC_LDFLAGS)
 SRCS    = main.c player.c audio.c subtitle.c overlay.c log.c
 OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
 
-# Windows: append .exe, locate SDL3 DLLs via pkg-config
+# Windows: append .exe, locate SDL3 DLLs via pkg-config, compile .rc for icon
 ifeq ($(OS),Windows_NT)
   TARGET   = $(BUILDDIR)/dsvp.exe
   SDL3_BIN = $(shell pkg-config --variable=prefix sdl3)/bin
+  RC_OBJ   = $(BUILDDIR)/dsvp_res.o
 else
   TARGET   = $(BUILDDIR)/dsvp
+  RC_OBJ   =
 endif
 
 .PHONY: all clean debug
@@ -50,7 +52,7 @@ debug: $(BUILDDIR) $(TARGET)
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(RC_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	rm -f $(OBJS)
 ifeq ($(OS),Windows_NT)
@@ -60,6 +62,10 @@ ifeq ($(OS),Windows_NT)
 	cp -u $(SC_ROOT)/bin/dxcompiler.dll $(BUILDDIR)/
 	cp -u $(SC_ROOT)/bin/dxil.dll $(BUILDDIR)/
 endif
+
+# Windows resource file (application icon for taskbar/explorer)
+$(BUILDDIR)/dsvp_res.o: dsvp.rc src/dsvp.ico
+	windres $< -o $@
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/dsvp.h
 	$(CC) $(CFLAGS) -c -o $@ $<
