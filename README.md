@@ -5,7 +5,7 @@
 
 WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There is a portable Windows build you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/).
+There are portable Windows & Debian builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/).
 
 REQUIRES Visual C++ Redistributable runtime (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
@@ -103,18 +103,20 @@ sudo apt install gcc make pkg-config \
     fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
-**2. SDL3_shadercross** is not available in apt. Download the Linux x64 build from the [SDL_shadercross GitHub Actions CI](https://github.com/libsdl-org/SDL_shadercross/actions/workflows/main.yml) (requires GitHub login). Extract to `shadercross/SDL3_shadercross-3.0.0-linux-x64/`, then create the required symlinks:
-```bash
-cd shadercross/SDL3_shadercross-3.0.0-linux-x64/lib
-ln -sf libSDL3_shadercross.so.0.0.0 libSDL3_shadercross.so.0
-ln -sf libSDL3_shadercross.so.0.0.0 libSDL3_shadercross.so
-ln -sf libspirv-cross-c-shared.so.0.64.0 libspirv-cross-c-shared.so.0
-ln -sf libspirv-cross-c-shared.so.0.64.0 libspirv-cross-c-shared.so
-ln -sf libvkd3d.so.1.19.0 libvkd3d.so.1
-ln -sf libvkd3d.so.1.19.0 libvkd3d.so
-ln -sf libvkd3d-shader.so.1.17.0 libvkd3d-shader.so.1
-ln -sf libvkd3d-shader.so.1.17.0 libvkd3d-shader.so
-```
+**2. SDL3_shadercross** is bundled in `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. No action needed — the Makefile finds it automatically.
+
+> **Note:** If you see linker errors about missing `.so` files, the soname symlinks may not have survived cloning (some Git/OS combinations don't preserve symlinks). Recreate them with:
+> ```bash
+> cd shadercross/SDL3_shadercross-3.0.0-linux-x64/lib
+> ln -sf libSDL3_shadercross.so.0.0.0 libSDL3_shadercross.so.0
+> ln -sf libSDL3_shadercross.so.0.0.0 libSDL3_shadercross.so
+> ln -sf libspirv-cross-c-shared.so.0.64.0 libspirv-cross-c-shared.so.0
+> ln -sf libspirv-cross-c-shared.so.0.64.0 libspirv-cross-c-shared.so
+> ln -sf libvkd3d.so.1.19.0 libvkd3d.so.1
+> ln -sf libvkd3d.so.1.19.0 libvkd3d.so
+> ln -sf libvkd3d-shader.so.1.17.0 libvkd3d-shader.so.1
+> ln -sf libvkd3d-shader.so.1.17.0 libvkd3d-shader.so
+> ```
 
 **3. Build:**
 ```bash
