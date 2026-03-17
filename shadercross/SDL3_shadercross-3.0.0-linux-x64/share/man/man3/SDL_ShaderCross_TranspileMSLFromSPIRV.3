@@ -1,0 +1,43 @@
+.\" This manpage content is licensed under Creative Commons
+.\"  Attribution 4.0 International (CC BY 4.0)
+.\"   https://creativecommons.org/licenses/by/4.0/
+.\" This manpage was generated from SDL_shadercross's wiki page for SDL_ShaderCross_TranspileMSLFromSPIRV:
+.\"   https://wiki.libsdl.org/SDL_shadercross/SDL_ShaderCross_TranspileMSLFromSPIRV
+.\" Generated with SDL/build-scripts/wikiheaders.pl
+.\"  revision 3a31448
+.\" Please report issues in this manpage's content at:
+.\"   https://github.com/libsdl-org/sdlwiki/issues/new
+.\" Please report issues in the generation of this manpage from the wiki at:
+.\"   https://github.com/libsdl-org/SDL/issues/new?title=Misgenerated%20manpage%20for%20SDL_ShaderCross_TranspileMSLFromSPIRV
+.\" SDL_shadercross can be found at https://libsdl.org/projects/SDL_shadercross
+.de URL
+\$2 \(laURL: \$1 \(ra\$3
+..
+.if \n[.g] .mso www.tmac
+.TH SDL_ShaderCross_TranspileMSLFromSPIRV 3 "SDL_shadercross 3.0.0" "SDL_shadercross" "SDL_shadercross3 FUNCTIONS"
+.SH NAME
+SDL_ShaderCross_TranspileMSLFromSPIRV \- Transpile to MSL code from SPIRV code\[char46]
+.SH SYNOPSIS
+.nf
+.B #include <SDL3_shadercross/SDL_shadercross.h>
+.PP
+.BI "void * SDL_ShaderCross_TranspileMSLFromSPIRV(
+.BI "    const SDL_ShaderCross_SPIRV_Info *info);
+.fi
+.SH DESCRIPTION
+You must SDL_free the returned string once you are done with it\[char46]
+.PP
+These are the optional properties that can be used:
+.PP
+
+\(bu
+.BR SDL_SHADERCROSS_PROP_SPIRV_MSL_VERSION_STRING :
+specifies the MSL version that should be emitted\[char46] Defaults to 1\[char46]2\[char46]0\[char46]
+
+.SH FUNCTION PARAMETERS
+.TP
+.I info
+a struct describing the shader to transpile\[char46]
+.SH RETURN VALUE
+Returns an SDL_malloc\(aqd string containing MSL code\[char46]
+

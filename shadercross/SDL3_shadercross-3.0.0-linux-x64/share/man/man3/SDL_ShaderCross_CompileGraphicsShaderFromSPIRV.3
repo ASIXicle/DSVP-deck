@@ -1,0 +1,54 @@
+.\" This manpage content is licensed under Creative Commons
+.\"  Attribution 4.0 International (CC BY 4.0)
+.\"   https://creativecommons.org/licenses/by/4.0/
+.\" This manpage was generated from SDL_shadercross's wiki page for SDL_ShaderCross_CompileGraphicsShaderFromSPIRV:
+.\"   https://wiki.libsdl.org/SDL_shadercross/SDL_ShaderCross_CompileGraphicsShaderFromSPIRV
+.\" Generated with SDL/build-scripts/wikiheaders.pl
+.\"  revision 3a31448
+.\" Please report issues in this manpage's content at:
+.\"   https://github.com/libsdl-org/sdlwiki/issues/new
+.\" Please report issues in the generation of this manpage from the wiki at:
+.\"   https://github.com/libsdl-org/SDL/issues/new?title=Misgenerated%20manpage%20for%20SDL_ShaderCross_CompileGraphicsShaderFromSPIRV
+.\" SDL_shadercross can be found at https://libsdl.org/projects/SDL_shadercross
+.de URL
+\$2 \(laURL: \$1 \(ra\$3
+..
+.if \n[.g] .mso www.tmac
+.TH SDL_ShaderCross_CompileGraphicsShaderFromSPIRV 3 "SDL_shadercross 3.0.0" "SDL_shadercross" "SDL_shadercross3 FUNCTIONS"
+.SH NAME
+SDL_ShaderCross_CompileGraphicsShaderFromSPIRV \- Compile an SDL GPU shader from SPIRV code\[char46]
+.SH SYNOPSIS
+.nf
+.B #include <SDL3_shadercross/SDL_shadercross.h>
+.PP
+.BI "SDL_GPUShader * SDL_ShaderCross_CompileGraphicsShaderFromSPIRV(
+.BI "    SDL_GPUDevice *device,
+.BI "    const SDL_ShaderCross_SPIRV_Info *info,
+.BI "    const SDL_ShaderCross_GraphicsShaderResourceInfo *resource_info,
+.BI "    SDL_PropertiesID props);
+.fi
+.SH DESCRIPTION
+If your shader source is HLSL, you should obtain SPIR-V bytecode from
+.BR SDL_ShaderCross_CompileSPIRVFromHLSL ()\[char46]
+
+.SH FUNCTION PARAMETERS
+.TP
+.I device
+the SDL GPU device\[char46]
+.TP
+.I info
+a struct describing the shader to transpile\[char46]
+.TP
+.I resource_info
+a struct describing resource info of the shader\[char46] Can be obtained from
+.BR SDL_ShaderCross_ReflectGraphicsSPIRV ()\[char46]
+
+.TP
+.I props
+a properties object filled in with extra shader metadata\[char46]
+.SH RETURN VALUE
+Returns a compiled SDL_GPUShader\[char46]
+
+.SH THREAD SAFETY
+It is safe to call this function from any thread\[char46]
+

@@ -1,0 +1,58 @@
+.\" This manpage content is licensed under Creative Commons
+.\"  Attribution 4.0 International (CC BY 4.0)
+.\"   https://creativecommons.org/licenses/by/4.0/
+.\" This manpage was generated from SDL_shadercross's wiki page for SDL_ShaderCross_CompileDXBCFromHLSL:
+.\"   https://wiki.libsdl.org/SDL_shadercross/SDL_ShaderCross_CompileDXBCFromHLSL
+.\" Generated with SDL/build-scripts/wikiheaders.pl
+.\"  revision 3a31448
+.\" Please report issues in this manpage's content at:
+.\"   https://github.com/libsdl-org/sdlwiki/issues/new
+.\" Please report issues in the generation of this manpage from the wiki at:
+.\"   https://github.com/libsdl-org/SDL/issues/new?title=Misgenerated%20manpage%20for%20SDL_ShaderCross_CompileDXBCFromHLSL
+.\" SDL_shadercross can be found at https://libsdl.org/projects/SDL_shadercross
+.de URL
+\$2 \(laURL: \$1 \(ra\$3
+..
+.if \n[.g] .mso www.tmac
+.TH SDL_ShaderCross_CompileDXBCFromHLSL 3 "SDL_shadercross 3.0.0" "SDL_shadercross" "SDL_shadercross3 FUNCTIONS"
+.SH NAME
+SDL_ShaderCross_CompileDXBCFromHLSL \- Compile to DXBC bytecode from HLSL code via a SPIRV-Cross round trip\[char46]
+.SH SYNOPSIS
+.nf
+.B #include <SDL3_shadercross/SDL_shadercross.h>
+.PP
+.BI "void * SDL_ShaderCross_CompileDXBCFromHLSL(
+.BI "    const SDL_ShaderCross_HLSL_Info *info,
+.BI "    size_t *size);
+.fi
+.SH DESCRIPTION
+You must SDL_free the returned buffer once you are done with it\[char46]
+.PP
+These are the optional properties that can be used:
+.PP
+
+\(bu
+.BR SDL_SHADERCROSS_PROP_SHADER_DEBUG_ENABLE_BOOLEAN :
+allows debug info to be emitted when relevant\[char46] Should only be used with debugging tools like Renderdoc\[char46]
+.PP
+\(bu
+.BR SDL_SHADERCROSS_PROP_SHADER_DEBUG_ENABLE_BOOLEAN :
+a UTF-8 name to be used with the shader\[char46] Relevant for use with debugging tools like Renderdoc\[char46]
+.PP
+\(bu
+.BR SDL_SHADERCROSS_PROP_SHADER_CULL_UNUSED_BINDINGS_BOOLEAN :
+When true, indicates that the compiler should not cull unused shader resources\[char46] This behavior is disabled by default\[char46]
+
+.SH FUNCTION PARAMETERS
+.TP
+.I info
+a struct describing the shader to transpile\[char46]
+.TP
+.I size
+filled in with the bytecode buffer size\[char46]
+.SH RETURN VALUE
+Returns an SDL_malloc\(aqd buffer containing DXBC bytecode\[char46]
+
+.SH THREAD SAFETY
+It is safe to call this function from any thread\[char46]
+

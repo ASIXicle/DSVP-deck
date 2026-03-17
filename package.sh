@@ -77,6 +77,19 @@ if [ "$(uname)" = "Linux" ]; then
         done
     fi
 
+    # Create soname symlinks (dynamic linker needs these)
+    for so in "$OUTDIR/lib"/*.so.*.*.*; do
+        if [ -f "$so" ]; then
+            base=$(basename "$so")
+            # libFoo.so.X.Y.Z → libFoo.so.X
+            soname=$(echo "$base" | sed 's/\(\.so\.[0-9]*\)\..*/\1/')
+            if [ "$soname" != "$base" ] && [ ! -e "$OUTDIR/lib/$soname" ]; then
+                ln -s "$base" "$OUTDIR/lib/$soname"
+                echo "      $soname → $base (symlink)"
+            fi
+        fi
+    done
+
     LIB_COUNT=$(ls -1 "$OUTDIR/lib/" 2>/dev/null | wc -l)
     echo "      Bundled $LIB_COUNT libraries"
 
