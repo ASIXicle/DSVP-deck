@@ -6,13 +6,13 @@ Tested: 4K 60fps software decode, Vulkan, zero dropped frames on Steam Deck OLED
 
 ## Quick Start
 
-**1. Download** the latest `DSVP-portable-linux.tar.gz` from [Releases](https://github.com/ASIXicle/DSVP/releases/).
+**1. Download** the latest `DSVP-*-linux-x64.tar.gz` from [Releases](https://github.com/ASIXicle/DSVP/releases/).
 
 **2. Extract and install.** Switch to Desktop Mode, open Konsole, and run:
 
 ```bash
 cd ~
-tar xzf ~/Downloads/DSVP-portable-linux.tar.gz
+tar xzf ~/Downloads/DSVP-*-linux-x64.tar.gz
 mv DSVP-portable DSVP
 chmod +x DSVP/dsvp DSVP/dsvp.sh
 ```
@@ -83,6 +83,7 @@ For best results with DSVP's quality pipeline:
 | `A` | Cycle audio tracks |
 | `←` / `→` | Seek ±5 seconds |
 | `↑` / `↓` | Volume up / down |
+| `B` / `N` | Previous / next file in folder |
 | `D` | Debug overlay |
 | `I` | Media info overlay |
 

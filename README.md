@@ -21,12 +21,13 @@ Claude wrote most of this:
 
 ## Features
 
-- **Reference-quality playback** — Lanczos-2 luma scaling, Catmull-Rom chroma upsampling, blue noise dithering, faithful color/gamma/framerate
+- **Reference-quality playback** — Lanczos-2 luma scaling (anti-ringing clamp), Catmull-Rom chroma upsampling (siting-corrected), temporal blue noise dithering, faithful color/gamma/framerate
 - **10-bit passthrough** — YUV420P10LE content uploads as R16_UNORM planar textures with no truncation
 - **Software decode only** — no hardware decode, no driver quirks, bit-exact output
 - **Supports everything FFmpeg supports** — H.264, HEVC, AV1, VP9, VC-1, MKV, MP4, and hundreds more
 - **Multi-threaded decoding** — uses all available CPU cores
 - **Full subtitle support** — text (SRT, ASS/SSA), bitmap (PGS, VobSub), CJK fallback fonts, golden yellow with black outline, cycle tracks with `S`
+- **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons
 - **Portable** — single folder, no installer, no PATH changes
 - **Secure** — no networking capabilities whatsoever
 - **Cross-platform** — Vulkan on Windows/Linux, Metal on macOS
@@ -43,6 +44,7 @@ Claude wrote most of this:
 | `A` | Cycle audio tracks |
 | `←` / `→` | Seek ±5 seconds |
 | `↑` / `↓` | Volume up / down |
+| `B` / `N` | Previous / next file in folder |
 | `D` | Toggle debug overlay |
 | `I` | Toggle media info overlay |
 
@@ -55,6 +57,7 @@ Claude wrote most of this:
 - **SDL3** development libraries
 - **SDL3_ttf** development libraries
 - **SDL3_shadercross 3.0.0** (bundled — not available via package managers)
+- **zlib** (for PGS subtitle decompression)
 - **GNU Make**
 - **pkg-config**
 
@@ -64,7 +67,7 @@ Claude wrote most of this:
 
 **2. Install dependencies** (from MSYS2 MinGW 64-bit shell):
 ```bash
-pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf
+pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-pkg-config
 ```
 
 FFmpeg 8.0+ shared libraries are also needed via MSYS2:
@@ -100,7 +103,7 @@ sudo apt install gcc make pkg-config \
     libavformat-dev libavcodec-dev libswscale-dev \
     libswresample-dev libavutil-dev \
     libsdl3-dev libsdl3-ttf-dev \
-    fonts-dejavu-core fonts-noto-cjk zenity
+    zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
 **2. SDL3_shadercross** is bundled in `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. No action needed — the Makefile finds it automatically.
@@ -161,7 +164,7 @@ DSVP/
 
 ## Technical Details
 
-DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc), Catmull-Rom bicubic interpolation on chroma (16-tap), limited→full range expansion, BT.601/BT.709 color matrix conversion, and blue noise dithering (64×64 void-and-cluster texture) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
+DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc with anti-ringing clamp at 0.8), Catmull-Rom bicubic interpolation on chroma (16-tap with sub-texel siting correction), limited→full range expansion, BT.601/BT.709 color matrix conversion, and temporal blue noise dithering (64×64 void-and-cluster texture, per-frame offset) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
 
 The GPU backend is Vulkan on Windows and Linux, Metal on macOS (untested). Audio is the master clock with adaptive bias correction (EMA α=0.05) for OS audio pipeline latency. At 1:1 content/display framerate (≥50fps), VSync is the sole pacing source with frame drops and delay correction bypassed.
 

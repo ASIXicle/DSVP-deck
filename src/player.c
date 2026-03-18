@@ -208,6 +208,8 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "\n"
     "    float filtered = (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "    /* Anti-ringing: clamp to local tap range. Strength 0.8 per\n"
+    "     * Artoriuz's scaler benchmarks (mpv community). */\n"
     "    float clamped  = clamp(filtered, tap_min, tap_max);\n"
     "    return lerp(filtered, clamped, 0.8);\n"
     "}\n"

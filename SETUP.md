@@ -87,18 +87,18 @@ sudo apt install gcc make pkg-config \
     libavformat-dev libavcodec-dev libswscale-dev \
     libswresample-dev libavutil-dev \
     libsdl3-dev libsdl3-ttf-dev \
-    fonts-dejavu-core fonts-noto-cjk zenity
+    zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
 `fonts-noto-cjk` provides CJK subtitle fallback. `zenity` provides the file-open dialog.
 
 ### Step 2: SDL3_shadercross
 
-Shadercross is not in Debian's repos. Download the Linux x64 build from the [SDL_shadercross GitHub Actions CI](https://github.com/libsdl-org/SDL_shadercross/actions/workflows/main.yml) (requires GitHub login). Pick the latest successful workflow run, download `SDL3_shadercross-3.0.0-linux-x64` from the Artifacts section.
+Already bundled in the repo at `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. The Makefile finds it automatically. No action needed.
 
-Extract to `shadercross/SDL3_shadercross-3.0.0-linux-x64/` at the repo root.
+If you need a fresh copy, download from [SDL_shadercross GitHub Actions CI](https://github.com/libsdl-org/SDL_shadercross/actions/workflows/main.yml) → latest successful run → Artifacts → `SDL3_shadercross-3.0.0-linux-x64`.
 
-**Important:** GitHub CI artifacts are zipped without preserving symlinks. You must recreate them:
+**Note:** Some Git/OS combinations don't preserve symlinks on clone. If you see linker errors about missing `.so` files, recreate the symlinks:
 
 ```bash
 cd shadercross/SDL3_shadercross-3.0.0-linux-x64/lib
