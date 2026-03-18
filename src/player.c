@@ -167,7 +167,8 @@ static const char hlsl_yuv_planar_frag[] =
     "    float2 texSizeY;\n"
     "    float2 texSizeUV;\n"
     "    float2 chromaOffset;\n"
-    "    float2 _pad;\n"
+    "    float frameCount;\n"
+    "    float _pad1;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -254,9 +255,12 @@ static const char hlsl_yuv_planar_frag[] =
     "    float3 rgb = mul(colorMatrix, yuv).rgb;\n"
     "\n"
     "    /* Blue noise dither: ±0.5 LSB in 8-bit (±1/510 in [0,1]).\n"
-    "     * 64x64 void-and-cluster texture, tiled via frac(). All spectral\n"
-    "     * energy in high frequencies — perceptually invisible. */\n"
-    "    float d = (texNoise.SampleLevel(sampNoise, frac(pos.xy / 64.0), 0).r - 0.5) / 255.0;\n"
+    "     * 64x64 void-and-cluster texture, tiled via frac(). Temporal\n"
+    "     * offset shifts the pattern each frame so quantization error\n"
+    "     * averages out over ~4 frames — perceived bit depth increases. */\n"
+    "    uint fc = (uint)frameCount;\n"
+    "    float2 ditherCoord = pos.xy + float2(fc % 4u, (fc / 4u) % 4u);\n"
+    "    float d = (texNoise.SampleLevel(sampNoise, frac(ditherCoord / 64.0), 0).r - 0.5) / 255.0;\n"
     "    rgb += float3(d, d, d);\n"
     "\n"
     "    return float4(saturate(rgb), 1.0);\n"
@@ -894,8 +898,8 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             break;
     }
 
-    ps->gpu_uniforms._pad[0] = 0.0f;
-    ps->gpu_uniforms._pad[1] = 0.0f;
+    ps->gpu_uniforms.frameCount = 0.0f;
+    ps->gpu_uniforms._pad1 = 0.0f;
 
     static const char *chroma_names[] = {
         "unspecified", "left", "center", "top-left",
@@ -2011,6 +2015,8 @@ void video_display(PlayerState *ps) {
         viewport.max_depth = 1.0f;
         SDL_SetGPUViewport(pass, &viewport);
 
+        ps->gpu_uniforms.frameCount = (float)ps->diag_frames_displayed;
+
         SDL_PushGPUFragmentUniformData(cmd, 0,
             &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
 
@@ -2086,6 +2092,8 @@ void video_reblit(PlayerState *ps) {
         viewport.min_depth = 0.0f;
         viewport.max_depth = 1.0f;
         SDL_SetGPUViewport(pass, &viewport);
+
+        ps->gpu_uniforms.frameCount = (float)ps->diag_frames_displayed;
 
         SDL_PushGPUFragmentUniformData(cmd, 0,
             &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));

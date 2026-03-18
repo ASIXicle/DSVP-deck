@@ -89,7 +89,8 @@ typedef struct GPUUniforms {
     float texSizeY[2];      /* { width, height } of Y texture     8 bytes */
     float texSizeUV[2];     /* { width, height } of UV textures   8 bytes */
     float chromaOffset[2];  /* chroma siting correction (texels)  8 bytes */
-    float _pad[2];          /* 16-byte alignment for std140       8 bytes */
+    float frameCount;       /* frame counter for temporal dither  4 bytes */
+    float _pad1;            /* 16-byte alignment for std140       4 bytes */
 } GPUUniforms;              /*                                  112 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
