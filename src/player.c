@@ -1235,9 +1235,37 @@ int player_open(PlayerState *ps, const char *filename) {
         ps->video_codec_ctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
 
-        /* Force software decode — configurable thread count for tuning */
+        /* Force software decode — adaptive thread count for Deck
+         *
+         * Heuristic derived from Steam Deck (Zen 2 4C/8T) benchmarks:
+         *   HEVC ≤30fps → 1 thread  (Dogma 4K HEVC 10-bit: 1.05% drops vs 3.01% at 2T)
+         *   H.264 ≥50fps → 4 threads (French Kiss 4K 60fps: clean, 6 multi-ticks)
+         *   Everything else → 2 threads (safe default)
+         *
+         * DSVP_THREADS env var overrides the heuristic (0 = FFmpeg auto-detect).
+         */
+        int tcount;
         const char *tenv = getenv("DSVP_THREADS");
-        int tcount = tenv ? atoi(tenv) : 0;  /* 0 = FFmpeg auto-detect */
+        if (tenv && tenv[0] != '\0') {
+            tcount = atoi(tenv);
+            log_msg("Thread selection: DSVP_THREADS=%d (env override)", tcount);
+        } else {
+            double fps = 0.0;
+            if (vs->avg_frame_rate.den > 0)
+                fps = av_q2d(vs->avg_frame_rate);
+
+            enum AVCodecID cid = vs->codecpar->codec_id;
+
+            if (cid == AV_CODEC_ID_HEVC && fps <= 30.0) {
+                tcount = 1;
+            } else if (cid == AV_CODEC_ID_H264 && fps >= 50.0) {
+                tcount = 4;
+            } else {
+                tcount = 2;
+            }
+            log_msg("Thread selection: codec=%s fps=%.2f → %d threads (adaptive)",
+                    avcodec_get_name(cid), fps, tcount);
+        }
         ps->video_codec_ctx->thread_count = tcount;
         ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
@@ -1280,6 +1308,72 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* ── Find audio streams ── */
     audio_find_streams(ps);
+
+    /* ── Discard unused streams (reduces demux I/O) ──
+     *
+     * Tell the demuxer to skip packets for streams we won't decode.
+     * Saves I/O on files with many streams (e.g. Dogma: 29 streams).
+     * Also eliminates DV dual-layer enhancement layer overhead if present.
+     */
+    {
+        int discarded = 0;
+        int dv_el_found = 0;
+
+        for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
+            AVStream *st = ps->fmt_ctx->streams[i];
+            int dominated_by_stream = (int)i;
+
+            /* Keep the selected video and audio streams */
+            if (dominated_by_stream == ps->video_stream_idx) continue;
+            if (dominated_by_stream == ps->audio_stream_idx) continue;
+
+            /* Keep all cataloged subtitle streams */
+            int is_sub = 0;
+            for (int s = 0; s < ps->sub_count; s++) {
+                if (dominated_by_stream == ps->sub_stream_indices[s]) {
+                    is_sub = 1;
+                    break;
+                }
+            }
+            if (is_sub) continue;
+
+            /* Keep all cataloged audio streams (for audio cycling) */
+            int is_aud = 0;
+            for (int a = 0; a < ps->aud_count; a++) {
+                if (dominated_by_stream == ps->aud_stream_indices[a]) {
+                    is_aud = 1;
+                    break;
+                }
+            }
+            if (is_aud) continue;
+
+            /* Check if this is a DV enhancement layer video stream */
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                dominated_by_stream != ps->video_stream_idx) {
+                dv_el_found = 1;
+                log_msg("Stream %d: DV enhancement layer video — discarding", dominated_by_stream);
+            }
+
+            st->discard = AVDISCARD_ALL;
+            discarded++;
+        }
+
+        if (discarded > 0)
+            log_msg("Demux: discarding %d unused stream(s) to reduce I/O", discarded);
+
+        /* Log DV detection from codec tag (dvhe/dvh1 = DV HEVC single-layer) */
+        if (ps->video_stream_idx >= 0) {
+            AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
+            unsigned int tag = vs->codecpar->codec_tag;
+            if (tag == MKTAG('d','v','h','e') || tag == MKTAG('d','v','h','1') ||
+                tag == MKTAG('d','v','a','v') || tag == MKTAG('d','v','a','1')) {
+                log_msg("Dolby Vision detected (tag=%.4s) — base layer decode only (no HDR pipeline)",
+                        (const char *)&tag);
+            } else if (dv_el_found) {
+                log_msg("Dolby Vision dual-layer detected — enhancement layer discarded");
+            }
+        }
+    }
 
     /* ── Allocate decode frames ── */
     ps->video_frame = av_frame_alloc();

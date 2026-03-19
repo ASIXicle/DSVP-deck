@@ -340,6 +340,8 @@ int main(int argc, char *argv[]) {
 #else
     av_log_set_level(AV_LOG_ERROR);
 #endif
+    /* Bypass X11 compositor (eliminates KWin jitter in desktop mode) */
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "1");
 
     /* ── Create window ── */
     SDL_Window *window = SDL_CreateWindow(
