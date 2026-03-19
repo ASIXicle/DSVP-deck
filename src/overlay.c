@@ -444,6 +444,10 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     int track_y = bar_y + bar_h / 2 - 2 * sc;
     int track_h = 4 * sc;
 
+    /* Export geometry for click handler in main.c */
+    ps->seekbar_track_x = track_x;
+    ps->seekbar_track_w = track_w;
+
     if (track_w > 20) {
         fill_rect(buf, bw, bh, track_x, track_y, track_w, track_h, 80, 80, 80, 200);
 

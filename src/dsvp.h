@@ -37,7 +37,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.1.5-beta"
+#define DSVP_VERSION        "0.1.6-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -203,6 +203,8 @@ typedef struct PlayerState {
     int                 show_info;
     int                 show_seekbar;         /* 1 = seek bar visible       */
     double              seekbar_hide_time;    /* auto-hide after this time  */
+    int                 seekbar_track_x;      /* progress track left edge   */
+    int                 seekbar_track_w;      /* progress track width       */
     int                 overlay_active;       /* 1 = overlay has content    */
 
     /* ── Subtitles ── */

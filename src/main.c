@@ -316,6 +316,8 @@ int main(int argc, char *argv[]) {
     /* ── Initialize logging (before anything else) ── */
     log_init();
     log_msg("Starting DSVP v" DSVP_VERSION " (argc=%d)", argc);
+    log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),
+            LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR);
 
     /* ── Initialize SDL ── */
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
@@ -657,12 +659,11 @@ int main(int argc, char *argv[]) {
                  * match s_ui_scale in overlay.c. */
                 if (ev.button.button == SDL_BUTTON_LEFT && ps.playing
                         && ps.show_seekbar) {
-                    int w_now, h_now;
-                    SDL_GetWindowSize(window, &w_now, &h_now);
+                    int h_now;
+                    SDL_GetWindowSize(window, NULL, &h_now);
                     int s = ps.fullscreen ? 2 : 1;
                     int bar_h = 30 * s;
                     int bar_y = h_now - bar_h;
-                    int margin = 20 * s;
 
                     if (ev.button.y >= bar_y && ev.button.y <= h_now) {
                         /* Button geometry (must match overlay.c) */
@@ -670,7 +671,7 @@ int main(int argc, char *argv[]) {
                         int btn_sz = 8 * s;
                         int btn_gap = 10 * s;
                         int btn2_x = btn_x + btn_sz + btn_gap;
-                        int content_x = btn2_x + btn_sz + btn_gap;
+
 
                         /* Prev button click area */
                         if (ev.button.x >= btn_x &&
@@ -690,11 +691,8 @@ int main(int argc, char *argv[]) {
                         }
                         /* Seek track */
                         else {
-                            int vol_area_w = margin + 60 * s;
-                            int sep_x = w_now - vol_area_w - 12 * s;
-                            /* Time text: ≈ 17 chars × 6px = 102 */
-                            int track_x = content_x + 110 * s;
-                            int track_w = sep_x - track_x - 12 * s;
+                            int track_x = ps.seekbar_track_x;
+                            int track_w = ps.seekbar_track_w;
 
                             if (track_w > 20 && ev.button.x >= track_x
                                     && ev.button.x <= track_x + track_w) {
