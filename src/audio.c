@@ -268,6 +268,27 @@ void audio_cycle(PlayerState *ps) {
     }
 
     int new_sel = (ps->aud_selection + 1) % ps->aud_count;
+
+    /* Skip TrueHD tracks — unusable without HDMI bitstreaming */
+    int checked = 0;
+    while (checked < ps->aud_count) {
+        int idx = ps->aud_stream_indices[new_sel];
+        AVStream *st = ps->fmt_ctx->streams[idx];
+        if (st->codecpar->codec_id != AV_CODEC_ID_TRUEHD)
+            break;
+        log_msg("Audio: skipping TrueHD track %d (%s)",
+            new_sel, ps->aud_stream_names[new_sel]);
+        new_sel = (new_sel + 1) % ps->aud_count;
+        checked++;
+    }
+    if (checked >= ps->aud_count || new_sel == ps->aud_selection) {
+        /* All other tracks are TrueHD — stay on current */
+        snprintf(ps->aud_osd, sizeof(ps->aud_osd),
+            "No other non-TrueHD audio tracks");
+        ps->aud_osd_until = get_time_sec() + 2.0;
+        return;
+    }
+
     int new_stream_idx = ps->aud_stream_indices[new_sel];
 
     log_msg("Audio: switching to %s (stream %d)",

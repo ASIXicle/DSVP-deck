@@ -1213,6 +1213,41 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->video_stream_idx = av_find_best_stream(ps->fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     ps->audio_stream_idx = av_find_best_stream(ps->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, ps->video_stream_idx, NULL, 0);
 
+    /* ── Skip TrueHD audio (unusable without HDMI bitstreaming) ──
+     *
+     * TrueHD Atmos 7.1 MLP decode is extremely CPU-heavy and starves the
+     * video pipeline on complex files (4K HEVC 10-bit + 29 streams).
+     * Without an AVR/soundbar via HDMI, it just gets crushed to S16 stereo
+     * anyway — pointless pain. Every Blu-ray with TrueHD ships an AC3 or
+     * EAC3 compatibility track. Pick that instead.
+     *
+     * Will be removed when HDMI bitstreaming support lands. */
+    if (ps->audio_stream_idx >= 0) {
+        AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
+        if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD) {
+            log_msg("Audio: default stream is TrueHD — skipping (no bitstream support)");
+            int fallback = -1;
+            for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
+                AVStream *st = ps->fmt_ctx->streams[i];
+                if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+                if ((int)i == ps->audio_stream_idx) continue;
+                if (st->codecpar->codec_id == AV_CODEC_ID_TRUEHD) continue;
+                fallback = (int)i;
+                break;
+            }
+            if (fallback >= 0) {
+                const AVCodec *fc = avcodec_find_decoder(
+                    ps->fmt_ctx->streams[fallback]->codecpar->codec_id);
+                log_msg("Audio: fallback to stream %d (%s)",
+                    fallback, fc ? fc->name : "unknown");
+                ps->audio_stream_idx = fallback;
+            } else {
+                log_msg("Audio: no non-TrueHD fallback found — playing without audio");
+                ps->audio_stream_idx = -1;
+            }
+        }
+    }
+
     if (ps->video_stream_idx < 0) {
         log_msg("ERROR: No video stream found");
         avformat_close_input(&ps->fmt_ctx);
