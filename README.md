@@ -5,10 +5,7 @@
 
 WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a  keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There are portable Windows & Debian (and eventually Steam Deck) builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/).
-
-REQUIRES Visual C++ Redistributable runtime (vcruntime140.dll). It's probably already on your PC but you can get it here:
-https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
+There are portable Windows & Debian builds on the [main branch](https://github.com/ASIXicle/DSVP/tree/main). Steam Deck builds are on this branch — download the latest tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/).
 
 Claude wrote most of this:
 
@@ -17,19 +14,21 @@ Claude wrote most of this:
 
 ![Windows](https://img.shields.io/badge/Windows-supported-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-blue)
+![Steam Deck](https://img.shields.io/badge/Steam_Deck-supported-green)
 ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
 
 ## Features
 
 - **Reference-quality playback** — Lanczos-2 luma scaling (anti-ringing clamp), Catmull-Rom chroma upsampling (siting-corrected), temporal blue noise dithering, faithful color/gamma/framerate
 - **10-bit passthrough** — YUV420P10LE content uploads as R16_UNORM planar textures with no truncation
+- **VAAPI hardware decode** — HEVC content decoded on the Deck's VCN hardware (bit-exact P010 output), freeing CPU for demux and audio
 - **Supports everything FFmpeg supports** — H.264, HEVC, AV1, VP9, VC-1, MKV, MP4, and hundreds more
-- **Multi-threaded decoding** — uses all available CPU cores
+- **Adaptive thread tuning** — per-codec/per-file thread selection optimized for the Deck's 4C/8T Zen 2
 - **Full subtitle support** — text (SRT, ASS/SSA), bitmap (PGS, VobSub), CJK fallback fonts, golden yellow with black outline, cycle tracks with `S`
 - **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons
-- **Portable** — single folder, no installer, no PATH changes
+- **Portable** — single folder, no installer, no root required, survives SteamOS updates
 - **Secure** — no networking capabilities whatsoever
-- **Cross-platform** — Vulkan on Windows/Linux, Metal on macOS
+- **Cross-platform** — Vulkan on Windows/Linux/Deck, Metal on macOS
 
 ## Controls
 
@@ -47,23 +46,39 @@ Claude wrote most of this:
 | `D` | Toggle debug overlay |
 | `I` | Toggle media info overlay |
 
-## Building from Source
+## Installing on Steam Deck
+
+See [SteamOS.md](SteamOS.md) for download, install, desktop/Game Mode setup, and display configuration.
+
+## Building from Source on Steam Deck
+
+See [SETUP.md](SETUP.md) for the full build-from-source walkthrough. The short version:
+
+SteamOS has a read-only root filesystem and ships no development headers. Building from source requires unlocking the filesystem, installing dev tools via `pacman`, and building FFmpeg 8.1, SDL3, and SDL3_ttf from source into `~/` prefixes. The resulting portable tarball is self-contained and runs without any of the dev tools installed.
 
 ### Requirements
 
-- **GCC** (MSYS2 MinGW64 on Windows, gcc on Linux, clang on macOS)
-- **FFmpeg 8.0+** shared development libraries
-- **SDL3** development libraries
-- **SDL3_ttf** development libraries
-- **SDL3_shadercross 3.0.0** (bundled — not available via package managers)
+- **SteamOS** with filesystem unlocked (`sudo steamos-readonly disable`)
+- **base-devel** (gcc, make, pkg-config) via `pacman`
+- **FFmpeg 8.1** built from source with `--enable-vaapi`
+- **SDL3 3.2.10** built from source
+- **SDL3_ttf 3.2.2** built from source
+- **SDL3_shadercross 3.0.0** (bundled in repo — not available via package managers)
+- **libva + libva-utils** for VAAPI hardware decode
 - **zlib** (for PGS subtitle decompression)
-- **GNU Make**
-- **pkg-config**
 
-### Steam Deck Build Instructions:
+### Quick Build
 
-This needs to be filled out
-
+```bash
+cd ~/DSVP-build
+git checkout steamdeck
+export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
+make clean && make
+export LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib:$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
+./package.sh
+rm -f DSVP-portable/dsvp.log
+rm -rf ~/DSVP-old && mv ~/DSVP ~/DSVP-old && mv DSVP-portable ~/DSVP
+```
 
 ## Project Structure
 
@@ -72,7 +87,7 @@ DSVP/
   src/
     dsvp.h       ← Central state struct, GPU uniforms, constants, declarations
     main.c       ← SDL init, event loop, frame pacing, hotkey handling
-    player.c     ← Demux thread, video decode/display, GPU pipelines, HLSL shaders, seeking, media info
+    player.c     ← Demux thread, video decode/display, GPU pipelines, HLSL shaders, VAAPI, seeking, media info
     audio.c      ← Audio decode, resample, SDL3 audio stream, A/V clock, track cycling
     subtitle.c   ← Subtitle detection, decode, SDL3_ttf rendering, CJK fallback fonts
     overlay.c    ← GPU-composited overlays: bitmap font, seek bar, debug/info panels, OSD, subtitles
@@ -86,17 +101,24 @@ DSVP/
 
 DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc with anti-ringing clamp at 0.8), Catmull-Rom bicubic interpolation on chroma (16-tap with sub-texel siting correction), limited→full range expansion, BT.601/BT.709 color matrix conversion, and temporal blue noise dithering (64×64 void-and-cluster texture, per-frame offset) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
 
-ADD VAAPI FUNTION FOR HEVC ON DECK (bit perfect, akin to software decode)
+HEVC content on the Steam Deck uses VAAPI hardware decode via the APU's VCN engine. VAAPI outputs P010LE (10-bit semi-planar), which is deinterleaved on CPU into separate Y/U/V planes and uploaded through the same R16_UNORM texture path as software-decoded 10-bit content. The decode is bit-exact — identical output to software decode with no fidelity compromise. H.264 content remains software decoded (4K 60fps plays perfectly at 4 threads on the Deck). Set `DSVP_HWDEC=0` to force software decode for comparison.
 
 The GPU backend is Vulkan on Windows and Linux, Metal on macOS (untested). Audio is the master clock with adaptive bias correction (EMA α=0.05) for OS audio pipeline latency. At 1:1 content/display framerate (≥50fps), VSync is the sole pacing source with frame drops and delay correction bypassed.
 
 ## Debug Build
 
 ```bash
-make debug          # Deck
+make debug
 ```
 
 Enables GPU validation layers, console output, verbose FFmpeg logging, and debug symbols. A `dsvp.log` file is written to the working directory.
+
+## Environment Variables
+
+| Variable | Effect |
+|---|---|
+| `DSVP_THREADS=N` | Override adaptive thread count (0 = FFmpeg auto) |
+| `DSVP_HWDEC=0` | Disable VAAPI hardware decode, force software |
 
 ## License
 
