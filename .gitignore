@@ -25,3 +25,4 @@ WORKING.txt
 dsvp.log
 *.zip
 *.tar.gz
+*.patch

@@ -2,7 +2,7 @@
 
 DSVP runs on SteamOS desktop mode via a portable tarball — no developer mode, no pacman, no root access required. Everything lives in your home directory and survives SteamOS updates.
 
-Tested: 4K 60fps software decode, Vulkan, zero dropped frames on Steam Deck OLED via official dock at 4K 4:4:4 60Hz.
+Tested: 4K 60fps software/VAAPI decode, Vulkan, zero dropped frames on LG OLED via official dock at 4K 4:4:4 60Hz.
 
 ## Quick Start
 
