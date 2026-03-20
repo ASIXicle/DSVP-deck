@@ -23,6 +23,7 @@
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
@@ -37,7 +38,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.1.6.2-beta"
+#define DSVP_VERSION        "0.1.6.5-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -111,6 +112,13 @@ typedef struct PlayerState {
     AVFrame            *video_frame;      /* raw decoded frame          */
     AVFrame            *rgb_frame;        /* scaled/converted for SDL   */
     uint8_t            *rgb_buffer;       /* backing buffer for rgb_frame */
+
+    /* ── VAAPI hardware decode (Linux only, HEVC) ── */
+    AVBufferRef        *hw_device_ctx;    /* VAAPI device (/dev/dri/renderD128) */
+    AVFrame            *hw_frame;         /* temp frame for hw→sw transfer      */
+    uint8_t            *p010_u_plane;     /* deinterleaved U from P010 UV       */
+    uint8_t            *p010_v_plane;     /* deinterleaved V from P010 UV       */
+    int                 vaapi_active;     /* 1 = current file uses VAAPI decode */
 
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;

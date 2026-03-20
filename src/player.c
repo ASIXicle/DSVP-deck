@@ -644,7 +644,8 @@ static int gpu_create_video_textures(PlayerState *ps) {
     int cw = w / 2;  /* chroma width  (4:2:0) */
     int ch = h / 2;  /* chroma height (4:2:0) */
 
-    int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE);
+    int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
+                    || ps->vaapi_active);  /* P010 from VAAPI is also 16-bit */
 
     SDL_GPUTextureFormat fmt = is_10bit
         ? SDL_GPU_TEXTUREFORMAT_R16_UNORM
@@ -778,7 +779,36 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         is_full_range = (par->color_range == AVCOL_RANGE_JPEG);
     }
 
-    if (is_10bit_passthrough) {
+    if (ps->vaapi_active) {
+        /* ── P010 from VAAPI — 10-bit values left-shifted by 6 in uint16 ──
+         *
+         * P010 stores 10-bit code V as (V << 6) in a uint16.
+         * R16_UNORM reads uint16 as value/65535.
+         *
+         * Limited range:
+         *   Y  codes 64-940   → stored as 4096-60160  → R16 = 4096/65535 to 60160/65535
+         *   UV codes 64-960   → stored as 4096-61440  → R16 = 4096/65535 to 61440/65535
+         *
+         * Full range:
+         *   codes 0-1023 → stored as 0-65472 → R16 = 0 to 65472/65535
+         */
+        if (is_full_range) {
+            ps->gpu_uniforms.rangeY[0]  = 0.0f;
+            ps->gpu_uniforms.rangeY[1]  = 65535.0f / 65472.0f;
+            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            ps->gpu_uniforms.rangeUV[1] = 65535.0f / 65472.0f;
+        } else {
+            ps->gpu_uniforms.rangeY[0]  = 4096.0f / 65535.0f;
+            ps->gpu_uniforms.rangeY[1]  = 65535.0f / (60160.0f - 4096.0f);
+            ps->gpu_uniforms.rangeUV[0] = 4096.0f / 65535.0f;
+            ps->gpu_uniforms.rangeUV[1] = 65535.0f / (61440.0f - 4096.0f);
+        }
+
+        log_msg("GPU: uniforms set (%s, P010 %s range → shader)",
+                is_bt709 ? "BT.709" : "BT.601",
+                is_full_range ? "full" : "limited");
+
+    } else if (is_10bit_passthrough) {
         /* 10-bit passthrough — range correction in shader */
         if (is_full_range) {
             ps->gpu_uniforms.rangeY[0]  = 0.0f;
@@ -1180,6 +1210,26 @@ void pq_flush(PacketQueue *q) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * VAAPI Hardware Decode (Linux only, HEVC)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef __linux__
+/* Callback for FFmpeg to select hardware pixel format.
+ * If VAAPI is in the list, select it; otherwise fall back. */
+static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
+                                           const enum AVPixelFormat *pix_fmts)
+{
+    for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == AV_PIX_FMT_VAAPI)
+            return AV_PIX_FMT_VAAPI;
+    }
+    log_msg("VAAPI: hardware format not offered by decoder — software fallback");
+    return AV_PIX_FMT_NONE;
+}
+#endif /* __linux__ */
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Open / Close
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -1221,7 +1271,7 @@ int player_open(PlayerState *ps, const char *filename) {
     log_msg("Video stream: idx=%d, Audio stream: idx=%d",
         ps->video_stream_idx, ps->audio_stream_idx);
 
-    /* ── Open video decoder (SOFTWARE ONLY) ── */
+    /* ── Open video decoder ── */
     {
         AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
         const AVCodec *codec = avcodec_find_decoder(vs->codecpar->codec_id);
@@ -1235,53 +1285,124 @@ int player_open(PlayerState *ps, const char *filename) {
         ps->video_codec_ctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
 
-        /* Force software decode — adaptive thread count for Deck
+        /* ── VAAPI hardware decode (Linux, HEVC only) ──
          *
-         * Heuristic derived from Steam Deck (Zen 2 4C/8T) benchmarks:
-         *   HEVC ≤30fps → 1 thread  (Dogma 4K HEVC 10-bit: 1.05% drops vs 3.01% at 2T)
-         *   H.264 ≥50fps → 4 threads (French Kiss 4K 60fps: clean, 6 multi-ticks)
-         *   Everything else → 2 threads (safe default)
+         * VAAPI is used exclusively for HEVC because software decode can't
+         * sustain 4K HEVC 10-bit at 24fps on the Steam Deck's Zen 2.
+         * H.264 4K 60fps plays perfectly with 4-thread software decode.
          *
-         * DSVP_THREADS env var overrides the heuristic (0 = FFmpeg auto-detect).
+         * VAAPI decode is bit-exact (same output as software) — no fidelity
+         * compromise. Output is P010LE (10-bit semi-planar), which we
+         * deinterleave on CPU and feed the existing R16_UNORM pipeline.
+         *
+         * DSVP_HWDEC=0 disables hardware decode (for testing/comparison).
          */
-        int tcount;
-        const char *tenv = getenv("DSVP_THREADS");
-        if (tenv && tenv[0] != '\0') {
-            tcount = atoi(tenv);
-            log_msg("Thread selection: DSVP_THREADS=%d (env override)", tcount);
-        } else {
-            double fps = 0.0;
-            if (vs->avg_frame_rate.den > 0)
-                fps = av_q2d(vs->avg_frame_rate);
-
+        int use_vaapi = 0;
+#ifdef __linux__
+        {
+            const char *hwdec_env = getenv("DSVP_HWDEC");
+            int hwdec_disabled = (hwdec_env && hwdec_env[0] == '0');
             enum AVCodecID cid = vs->codecpar->codec_id;
 
-            if (cid == AV_CODEC_ID_HEVC && fps <= 30.0) {
-                tcount = 1;
-            } else if (cid == AV_CODEC_ID_H264 && fps >= 50.0) {
-                tcount = 4;
-            } else {
-                tcount = 2;
+            if (cid == AV_CODEC_ID_HEVC && !hwdec_disabled) {
+                /* Try to create VAAPI device context */
+                if (!ps->hw_device_ctx) {
+                    ret = av_hwdevice_ctx_create(&ps->hw_device_ctx,
+                        AV_HWDEVICE_TYPE_VAAPI,
+                        "/dev/dri/renderD128", NULL, 0);
+                    if (ret < 0) {
+                        log_msg("VAAPI: device init failed (%s) — software fallback",
+                                av_err2str(ret));
+                        ps->hw_device_ctx = NULL;
+                    }
+                }
+
+                if (ps->hw_device_ctx) {
+                    ps->video_codec_ctx->hw_device_ctx =
+                        av_buffer_ref(ps->hw_device_ctx);
+                    ps->video_codec_ctx->get_format = vaapi_get_format;
+                    use_vaapi = 1;
+                    log_msg("VAAPI: attempting hardware decode for HEVC");
+                }
+            } else if (hwdec_disabled && cid == AV_CODEC_ID_HEVC) {
+                log_msg("VAAPI: disabled by DSVP_HWDEC=0");
             }
-            log_msg("Thread selection: codec=%s fps=%.2f → %d threads (adaptive)",
-                    avcodec_get_name(cid), fps, tcount);
         }
-        ps->video_codec_ctx->thread_count = tcount;
-        ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+#endif /* __linux__ */
+
+        if (!use_vaapi) {
+            /* Software decode — adaptive thread count for Deck
+             *
+             * Heuristic derived from Steam Deck (Zen 2 4C/8T) OLED benchmarks:
+             *   HEVC ≤30fps → 1 thread  (Dogma 4K HEVC 10-bit: 1.05% at 1T)
+             *   H.264 ≥50fps → 4 threads (French Kiss 4K 60fps: clean)
+             *   Everything else → 2 threads (safe default)
+             *
+             * DSVP_THREADS env var overrides the heuristic (0 = FFmpeg auto).
+             */
+            int tcount;
+            const char *tenv = getenv("DSVP_THREADS");
+            if (tenv && tenv[0] != '\0') {
+                tcount = atoi(tenv);
+                log_msg("Thread selection: DSVP_THREADS=%d (env override)", tcount);
+            } else {
+                double fps = 0.0;
+                if (vs->avg_frame_rate.den > 0)
+                    fps = av_q2d(vs->avg_frame_rate);
+
+                enum AVCodecID cid = vs->codecpar->codec_id;
+
+                if (cid == AV_CODEC_ID_HEVC && fps <= 30.0) {
+                    tcount = 1;
+                } else if (cid == AV_CODEC_ID_H264 && fps >= 50.0) {
+                    tcount = 4;
+                } else {
+                    tcount = 2;
+                }
+                log_msg("Thread selection: codec=%s fps=%.2f → %d threads (adaptive)",
+                        avcodec_get_name(cid), fps, tcount);
+            }
+            ps->video_codec_ctx->thread_count = tcount;
+            ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        }
 
         ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
         if (ret < 0) {
-            fprintf(stderr, "[DSVP] Cannot open video codec: %s\n", av_err2str(ret));
-            avformat_close_input(&ps->fmt_ctx);
-            return -1;
+            if (use_vaapi) {
+                /* VAAPI open failed — retry with software decode */
+                log_msg("VAAPI: avcodec_open2 failed (%s) — retrying software",
+                        av_err2str(ret));
+                avcodec_free_context(&ps->video_codec_ctx);
+                ps->video_codec_ctx = avcodec_alloc_context3(codec);
+                avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
+                ps->video_codec_ctx->thread_count = 1;
+                ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+                use_vaapi = 0;
+                ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
+            }
+            if (ret < 0) {
+                fprintf(stderr, "[DSVP] Cannot open video codec: %s\n", av_err2str(ret));
+                avformat_close_input(&ps->fmt_ctx);
+                return -1;
+            }
         }
 
+        ps->vaapi_active = use_vaapi;
         ps->vid_w = ps->video_codec_ctx->width;
         ps->vid_h = ps->video_codec_ctx->height;
-        log_msg("Video: %dx%d, pix_fmt=%s, threads=%d",
-            ps->vid_w, ps->vid_h,
-            av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt),
-            ps->video_codec_ctx->thread_count);
+
+        if (use_vaapi) {
+            log_msg("VAAPI: active — HEVC hardware decode, P010 output");
+            log_msg("Video: %dx%d, pix_fmt=%s (sw=%s)",
+                ps->vid_w, ps->vid_h,
+                av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt),
+                av_get_pix_fmt_name(ps->video_codec_ctx->sw_pix_fmt));
+        } else {
+            log_msg("Video: %dx%d, pix_fmt=%s, threads=%d",
+                ps->vid_w, ps->vid_h,
+                av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt),
+                ps->video_codec_ctx->thread_count);
+        }
     }
 
     /* ── Open audio decoder ── */
@@ -1380,11 +1501,34 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->rgb_frame   = av_frame_alloc();
     ps->audio_frame = av_frame_alloc();
 
+    /* ── VAAPI: allocate hw→sw transfer frame and UV deinterleave buffers ── */
+    if (ps->vaapi_active) {
+        ps->hw_frame = av_frame_alloc();
+        if (!ps->hw_frame) {
+            log_msg("ERROR: Failed to allocate hw_frame");
+            player_close(ps);
+            return -1;
+        }
+        /* P010 UV plane: interleaved uint16 pairs → split into U and V.
+         * Each plane: (w/2) × (h/2) × 2 bytes = ~4MB for 4K. */
+        int cw = ps->vid_w / 2;
+        int ch = ps->vid_h / 2;
+        ps->p010_u_plane = (uint8_t *)av_malloc((size_t)cw * ch * 2);
+        ps->p010_v_plane = (uint8_t *)av_malloc((size_t)cw * ch * 2);
+        if (!ps->p010_u_plane || !ps->p010_v_plane) {
+            log_msg("ERROR: Failed to allocate P010 deinterleave buffers");
+            player_close(ps);
+            return -1;
+        }
+        log_msg("VAAPI: allocated P010 deinterleave buffers (%dx%d chroma)", cw, ch);
+    }
+
     /* ── Set up swscale (or skip for GPU passthrough) ──
      *
-     * yuv420p10le: bypass swscale. Raw 10-bit planes → R16_UNORM textures.
-     * yuv420p:     bypass swscale. Raw 8-bit planes → R8_UNORM textures.
-     *              Range expansion (limited→full) done in fragment shader.
+     * VAAPI P010:    bypass swscale. CPU deinterleave UV → R16_UNORM textures.
+     * yuv420p10le:   bypass swscale. Raw 10-bit planes → R16_UNORM textures.
+     * yuv420p:       bypass swscale. Raw 8-bit planes → R8_UNORM textures.
+     *                Range expansion (limited→full) done in fragment shader.
      *
      * All other pixel formats need swscale conversion to YUV420P first.
      * Shader handles the color matrix and any remaining range work.
@@ -1394,7 +1538,13 @@ int player_open(PlayerState *ps, const char *filename) {
         int is_10bit  = (src_fmt == AV_PIX_FMT_YUV420P10LE);
         int is_yuv420p = (src_fmt == AV_PIX_FMT_YUV420P);
 
-        if (is_10bit) {
+        if (ps->vaapi_active) {
+            /* ── VAAPI P010 — deinterleave on CPU, range in shader ── */
+            ps->sws_ctx    = NULL;
+            ps->rgb_buffer = NULL;
+            log_msg("swscale: bypassed (VAAPI P010 → CPU deinterleave → R16_UNORM)");
+
+        } else if (is_10bit) {
             /* ── 10-bit GPU passthrough — no swscale needed ── */
             ps->sws_ctx    = NULL;
             ps->rgb_buffer = NULL;
@@ -1661,10 +1811,13 @@ void player_close(PlayerState *ps) {
     if (ps->video_frame)  av_frame_free(&ps->video_frame);
     if (ps->rgb_frame)    av_frame_free(&ps->rgb_frame);
     if (ps->audio_frame)  av_frame_free(&ps->audio_frame);
+    if (ps->hw_frame)     av_frame_free(&ps->hw_frame);
 
     /* Free buffers */
     if (ps->rgb_buffer)    { av_free(ps->rgb_buffer);    ps->rgb_buffer    = NULL; }
     if (ps->audio_buf)     { av_free(ps->audio_buf);     ps->audio_buf     = NULL; }
+    if (ps->p010_u_plane)  { av_free(ps->p010_u_plane);  ps->p010_u_plane  = NULL; }
+    if (ps->p010_v_plane)  { av_free(ps->p010_v_plane);  ps->p010_v_plane  = NULL; }
 
     /* Free scale/resample contexts */
     if (ps->sws_ctx)      { sws_freeContext(ps->sws_ctx); ps->sws_ctx = NULL; }
@@ -1685,6 +1838,7 @@ void player_close(PlayerState *ps) {
     ps->paused             = 0;
     ps->eof                = 0;
     ps->quit               = 0;
+    ps->vaapi_active       = 0;
     ps->video_stream_idx   = -1;
     ps->audio_stream_idx   = -1;
     ps->audio_buf_size     = 0;
@@ -1873,9 +2027,27 @@ int video_decode_frame(PlayerState *ps) {
     }
 
     for (;;) {
-        /* Try to receive a decoded frame first (may have buffered frames) */
-        ret = avcodec_receive_frame(ps->video_codec_ctx, ps->video_frame);
+        /* Try to receive a decoded frame first (may have buffered frames).
+         * VAAPI path: receive into hw_frame (VAAPI surface), then
+         * av_hwframe_transfer_data to get P010 in system memory. */
+        AVFrame *recv_frame = ps->vaapi_active ? ps->hw_frame : ps->video_frame;
+        ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
         if (ret == 0) {
+            /* ── VAAPI: transfer GPU surface → system memory P010 ── */
+            if (ps->vaapi_active) {
+                av_frame_unref(ps->video_frame);
+                ret = av_hwframe_transfer_data(ps->video_frame, ps->hw_frame, 0);
+                if (ret < 0) {
+                    log_msg("ERROR: av_hwframe_transfer_data failed: %s", av_err2str(ret));
+                    av_frame_unref(ps->hw_frame);
+                    SDL_UnlockMutex(ps->seek_mutex);
+                    return -1;
+                }
+                /* Copy timing metadata (PTS, etc.) from hw frame */
+                av_frame_copy_props(ps->video_frame, ps->hw_frame);
+                av_frame_unref(ps->hw_frame);
+            }
+
             /* Got a frame — compute its PTS in seconds.
              * best_effort_timestamp is preferred: FFmpeg computes it
              * from DTS/packet timing even when the codec doesn't set
@@ -1988,14 +2160,47 @@ void video_display(PlayerState *ps) {
     int ch = h / 2;
 
     /* ── Determine source frame and byte width ── */
-    AVFrame *src_frame;
-    int bpp;  /* bytes per sample for upload_plane */
+    AVFrame *src_frame = NULL;
+    int bpp = 0;  /* bytes per sample for upload_plane */
 
     int is_10bit_passthrough =
         (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
          && !ps->sws_ctx);
 
-    if (is_10bit_passthrough) {
+    if (ps->vaapi_active) {
+        /* ── VAAPI P010 path ──
+         *
+         * P010 is semi-planar: Y plane (uint16) + interleaved UV plane (UVUV...).
+         * Deinterleave UV into separate U and V planes on CPU, then upload
+         * all three as R16_UNORM — identical to the yuv420p10le path from
+         * the GPU's perspective.
+         *
+         * This is a memory shuffle, not a math operation — every 16-bit
+         * sample value is preserved bit-exact. */
+        AVFrame *f = ps->video_frame;
+        int uv_stride = f->linesize[1];
+
+        /* Deinterleave UV plane: UVUV... → separate U[], V[] */
+        for (int row = 0; row < ch; row++) {
+            const uint16_t *uv_row = (const uint16_t *)(f->data[1] + row * uv_stride);
+            uint16_t *u_row = (uint16_t *)(ps->p010_u_plane + row * cw * 2);
+            uint16_t *v_row = (uint16_t *)(ps->p010_v_plane + row * cw * 2);
+            for (int x = 0; x < cw; x++) {
+                u_row[x] = uv_row[x * 2];
+                v_row[x] = uv_row[x * 2 + 1];
+            }
+        }
+
+        /* Upload Y plane directly from P010 frame */
+        upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+                     f->data[0], f->linesize[0], w * 2, h);
+        /* Upload deinterleaved U and V planes */
+        upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+                     ps->p010_u_plane, cw * 2, cw * 2, ch);
+        upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+                     ps->p010_v_plane, cw * 2, cw * 2, ch);
+
+    } else if (is_10bit_passthrough) {
         /* 10-bit passthrough — raw frame directly to R16_UNORM textures */
         src_frame = ps->video_frame;
         bpp = 2;
@@ -2015,13 +2220,16 @@ void video_display(PlayerState *ps) {
         bpp = 1;
     }
 
-    /* ── Upload plane data to GPU transfer buffers ── */
-    upload_plane(ps->gpu_device, ps->gpu_xfer_y,
-                 src_frame->data[0], src_frame->linesize[0], w * bpp, h);
-    upload_plane(ps->gpu_device, ps->gpu_xfer_u,
-                 src_frame->data[1], src_frame->linesize[1], cw * bpp, ch);
-    upload_plane(ps->gpu_device, ps->gpu_xfer_v,
-                 src_frame->data[2], src_frame->linesize[2], cw * bpp, ch);
+    /* ── Upload plane data to GPU transfer buffers ──
+     * (VAAPI path does its own upload above — skip for that case) */
+    if (!ps->vaapi_active) {
+        upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+                     src_frame->data[0], src_frame->linesize[0], w * bpp, h);
+        upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+                     src_frame->data[1], src_frame->linesize[1], cw * bpp, ch);
+        upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+                     src_frame->data[2], src_frame->linesize[2], cw * bpp, ch);
+    }
 
     /* ── GPU command buffer ── */
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
@@ -2281,6 +2489,8 @@ void player_build_media_info(PlayerState *ps) {
             par->width, par->height);
         off += snprintf(buf + off, sz - off, "Pixel Format: %s\n",
             av_get_pix_fmt_name(par->format));
+        off += snprintf(buf + off, sz - off, "Decode: %s\n",
+            ps->vaapi_active ? "VAAPI hardware" : "software");
 
         if (vs->avg_frame_rate.den > 0) {
             off += snprintf(buf + off, sz - off, "Frame Rate: %.3f fps\n",
@@ -2392,15 +2602,23 @@ void player_build_debug_info(PlayerState *ps) {
     off += snprintf(buf + off, sz - off, "EOF:         %s\n", ps->eof ? "yes" : "no");
 
     if (ps->video_codec_ctx) {
-        off += snprintf(buf + off, sz - off, "Decoder Threads: %d\n",
-            ps->video_codec_ctx->thread_count);
+        if (ps->vaapi_active) {
+            off += snprintf(buf + off, sz - off, "Decode: VAAPI (hardware)\n");
+        } else {
+            off += snprintf(buf + off, sz - off, "Decoder Threads: %d\n",
+                ps->video_codec_ctx->thread_count);
+        }
 
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
         int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE);
         int is_full_range = (ps->fmt_ctx &&
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
 
-        if (is_10bit && !ps->sws_ctx) {
+        if (ps->vaapi_active) {
+            off += snprintf(buf + off, sz - off,
+                "SWS: bypassed (VAAPI P010 → deinterleave → R16_UNORM, %s)\n",
+                is_full_range ? "full" : "limited");
+        } else if (is_10bit && !ps->sws_ctx) {
             off += snprintf(buf + off, sz - off,
                 "SWS: bypassed (10-bit passthrough, %s->full in shader)\n",
                 is_full_range ? "full" : "limited");

@@ -8,7 +8,7 @@
 
 set -e
 
-VERSION="0.1.6.2-beta"
+VERSION="0.1.6.5-beta"
 OUTDIR="DSVP-portable"
 SKIP_BUILD=0
 
