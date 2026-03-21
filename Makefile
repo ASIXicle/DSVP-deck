@@ -15,6 +15,11 @@ ifeq ($(shell pkg-config --exists SDL3_ttf 2>/dev/null && echo yes),)
   BASE_LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) -lm -lz
 endif
 
+# ── Windows: explicit link for Unicode Win32 APIs ──
+ifeq ($(OS),Windows_NT)
+  BASE_LDFLAGS += -lshell32 -lcomdlg32
+endif
+
 # ── SDL3_shadercross (bundled on Windows, pkg-config on Linux) ──
 ifeq ($(OS),Windows_NT)
   SC_ROOT    = deps/SDL3_shadercross-3.0.0-windows-mingw-x64

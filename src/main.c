@@ -17,13 +17,38 @@
 
 #include "dsvp.h"
 #include "dsvp_icon.h"
-#include <dirent.h>
+#ifndef _WIN32
+  #include <dirent.h>
+#endif
 
 /* Platform-specific file dialog */
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
   #include <commdlg.h>
+  #include <shellapi.h>   /* CommandLineToArgvW */
+
+/* Convert UTF-16 wide string to UTF-8.  Caller must free() the result. */
+static char *win_wide_to_utf8(const wchar_t *wstr) {
+    if (!wstr) return NULL;
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return NULL;
+    char *out = malloc(len);
+    if (!out) return NULL;
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, out, len, NULL, NULL);
+    return out;
+}
+
+/* Convert UTF-8 string to UTF-16 wide.  Caller must free() the result. */
+static wchar_t *win_utf8_to_wide(const char *str) {
+    if (!str) return NULL;
+    int len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
+    if (len <= 0) return NULL;
+    wchar_t *out = malloc(len * sizeof(wchar_t));
+    if (!out) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, str, -1, out, len);
+    return out;
+}
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -33,26 +58,30 @@
 /* Returns 1 if a file was selected (path written to `out`), 0 if cancelled. */
 static int open_file_dialog(char *out, int out_size) {
 #ifdef _WIN32
-    /* Native Win32 file dialog */
-    OPENFILENAMEA ofn;
-    char file[1024] = {0};
+    /* Native Win32 file dialog — wide (Unicode) version */
+    OPENFILENAMEW ofn;
+    wchar_t file[1024] = {0};
 
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize  = sizeof(ofn);
     ofn.hwndOwner    = NULL;
     ofn.lpstrFile    = file;
-    ofn.nMaxFile     = sizeof(file);
-    ofn.lpstrFilter  = "Video Files\0"
-                       "*.mkv;*.mp4;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.mpg;*.mpeg\0"
-                       "Audio Files\0"
-                       "*.mp3;*.flac;*.wav;*.aac;*.ogg;*.opus;*.m4a;*.wma\0"
-                       "All Files\0*.*\0";
+    ofn.nMaxFile     = sizeof(file) / sizeof(file[0]);
+    ofn.lpstrFilter  = L"Video Files\0"
+                       L"*.mkv;*.mp4;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.mpg;*.mpeg\0"
+                       L"Audio Files\0"
+                       L"*.mp3;*.flac;*.wav;*.aac;*.ogg;*.opus;*.m4a;*.wma\0"
+                       L"All Files\0*.*\0";
     ofn.nFilterIndex = 1;
     ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
 
-    if (GetOpenFileNameA(&ofn)) {
-        snprintf(out, out_size, "%s", file);
-        return 1;
+    if (GetOpenFileNameW(&ofn)) {
+        char *utf8 = win_wide_to_utf8(file);
+        if (utf8) {
+            snprintf(out, out_size, "%s", utf8);
+            free(utf8);
+            return 1;
+        }
     }
     return 0;
 
@@ -187,38 +216,81 @@ static void playlist_scan(PlayerState *ps) {
     }
 
     /* Scan directory */
-    DIR *d = opendir(dir);
-    if (!d) {
-        log_msg("playlist_scan: cannot open directory: %s", dir);
-        return;
-    }
-
-    /* First pass: count files */
     int capacity = 64;
     char **files = malloc(capacity * sizeof(char *));
-    if (!files) { closedir(d); return; }
+    if (!files) return;
     int count = 0;
 
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;  /* skip hidden */
-        if (!is_media_file(ent->d_name)) continue;
+#ifdef _WIN32
+    /* Windows: FindFirstFileW/FindNextFileW for Unicode filenames */
+    {
+        char pattern[2048];
+        snprintf(pattern, sizeof(pattern), "%s*", dir);
+        wchar_t *wpattern = win_utf8_to_wide(pattern);
+        if (!wpattern) { free(files); return; }
 
-        /* Build full path */
-        char fullpath[2048];
-        snprintf(fullpath, sizeof(fullpath), "%s%s", dir, ent->d_name);
-
-        if (count >= capacity) {
-            capacity *= 2;
-            char **tmp = realloc(files, capacity * sizeof(char *));
-            if (!tmp) break;
-            files = tmp;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(wpattern, &fd);
+        free(wpattern);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            log_msg("playlist_scan: cannot open directory: %s", dir);
+            free(files);
+            return;
         }
-        files[count] = strdup(fullpath);
-        if (!files[count]) break;
-        count++;
+
+        do {
+            if (fd.cFileName[0] == L'.') continue;  /* skip hidden */
+            char *name = win_wide_to_utf8(fd.cFileName);
+            if (!name) continue;
+            if (!is_media_file(name)) { free(name); continue; }
+
+            char fullpath[2048];
+            snprintf(fullpath, sizeof(fullpath), "%s%s", dir, name);
+            free(name);
+
+            if (count >= capacity) {
+                capacity *= 2;
+                char **tmp = realloc(files, capacity * sizeof(char *));
+                if (!tmp) break;
+                files = tmp;
+            }
+            files[count] = strdup(fullpath);
+            if (!files[count]) break;
+            count++;
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
     }
-    closedir(d);
+#else
+    /* POSIX: opendir/readdir (UTF-8 native on Linux/macOS) */
+    {
+        DIR *d = opendir(dir);
+        if (!d) {
+            log_msg("playlist_scan: cannot open directory: %s", dir);
+            free(files);
+            return;
+        }
+
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            if (!is_media_file(ent->d_name)) continue;
+
+            char fullpath[2048];
+            snprintf(fullpath, sizeof(fullpath), "%s%s", dir, ent->d_name);
+
+            if (count >= capacity) {
+                capacity *= 2;
+                char **tmp = realloc(files, capacity * sizeof(char *));
+                if (!tmp) break;
+                files = tmp;
+            }
+            files[count] = strdup(fullpath);
+            if (!files[count]) break;
+            count++;
+        }
+        closedir(d);
+    }
+#endif
 
     if (count == 0) {
         free(files);
@@ -318,6 +390,25 @@ int main(int argc, char *argv[]) {
     log_msg("Starting DSVP v" DSVP_VERSION " (argc=%d)", argc);
     log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),
             LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR);
+
+    /* ── Get UTF-8 filepath from command line ──
+     * On Windows, argv[] is in the system ANSI codepage, which corrupts
+     * non-ASCII characters (accents, CJK, fullwidth punctuation).
+     * Use GetCommandLineW → CommandLineToArgvW → UTF-8 conversion. */
+    char *open_path = NULL;
+#ifdef _WIN32
+    {
+        int wargc = 0;
+        LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        if (wargv && wargc > 1) {
+            open_path = win_wide_to_utf8(wargv[1]);
+        }
+        if (wargv) LocalFree(wargv);
+    }
+#else
+    if (argc > 1)
+        open_path = strdup(argv[1]);
+#endif
 
     /* ── Initialize SDL ── */
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
@@ -446,12 +537,14 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Open file from command line if provided ── */
-    if (argc > 1) {
-        if (player_open(&ps, argv[1]) != 0) {
-            log_msg("ERROR: Failed to open: %s", argv[1]);
+    if (open_path) {
+        if (player_open(&ps, open_path) != 0) {
+            log_msg("ERROR: Failed to open: %s", open_path);
         } else {
             playlist_scan(&ps);
         }
+        free(open_path);
+        open_path = NULL;
     }
 
     /* ── Main loop ── */
