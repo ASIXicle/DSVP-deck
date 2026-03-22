@@ -250,6 +250,33 @@ static const char hlsl_yuv_planar_frag[] =
     "    return (wsum > 0.0) ? result / wsum : 0.0;\n"
     "}\n"
     "\n"
+    "/* PQ EOTF (SMPTE ST 2084 inverse): PQ code values [0,1] → linear\n"
+    " * light [0, 10000] nits. Constants from ITU-R BT.2100. */\n"
+    "float3 pq_eotf(float3 pq) {\n"
+    "    float m1 = 0.1593017578125;\n"      /* 2610/16384 */
+    "    float m2 = 78.84375;\n"              /* 2523/32 * 128 */
+    "    float c1 = 0.8359375;\n"             /* 3424/4096 */
+    "    float c2 = 18.8515625;\n"            /* 2413/128 */
+    "    float c3 = 18.6875;\n"               /* 2392/128 */
+    "    float3 Np = pow(max(pq, 0.0), 1.0 / m2);\n"
+    "    float3 num = max(Np - c1, 0.0);\n"
+    "    float3 den = c2 - c3 * Np;\n"
+    "    return 10000.0 * pow(max(num / den, 0.0), 1.0 / m1);\n"
+    "}\n"
+    "\n"
+    "/* BT.2390 EETF: Hermite spline shoulder rolloff for tone mapping.\n"
+    " * Maps normalized luminance [0,1] through a soft knee at ks,\n"
+    " * compressing highlights to maxLum. Below ks is linear passthrough. */\n"
+    "float bt2390_eetf(float e, float ks, float maxLum) {\n"
+    "    if (e <= ks) return e;\n"
+    "    float t = (e - ks) / (1.0 - ks);\n"
+    "    float t2 = t * t;\n"
+    "    float t3 = t2 * t;\n"
+    "    return (2.0*t3 - 3.0*t2 + 1.0) * ks\n"
+    "         + (t3 - 2.0*t2 + t) * (1.0 - ks)\n"
+    "         + (-2.0*t3 + 3.0*t2) * maxLum;\n"
+    "}\n"
+    "\n"
     "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target0 {\n"
     "    /* Chroma siting: shift UV to actual sample position */\n"
     "    float2 uv_chroma = uv + chromaOffset / texSizeUV;\n"
@@ -265,6 +292,58 @@ static const char hlsl_yuv_planar_frag[] =
     "\n"
     "    float4 yuv = float4(y, cb - 0.5, cr - 0.5, 1.0);\n"
     "    float3 rgb = mul(colorMatrix, yuv).rgb;\n"
+    "\n"
+    "    /* ── HDR→SDR Tone Mapping (BT.2390 EETF) ──\n"
+    "     * Only active when is_hdr == 1.0. Pipeline:\n"
+    "     *   1. PQ EOTF → linear light (nits)\n"
+    "     *   2. Normalize by source peak\n"
+    "     *   3. BT.2390 Hermite spline on luminance\n"
+    "     *   4. Proportional RGB scale (preserves hue)\n"
+    "     *   5. BT.2020→BT.709 gamut matrix (if hdr_gamut == 1.0)\n"
+    "     *   6. Rescale so SDR white (203 nits) → 1.0\n"
+    "     *   7. sRGB gamma curve */\n"
+    "    if (is_hdr > 0.5) {\n"
+    "        float3 lin = pq_eotf(rgb);\n"
+    "        float3 E = lin / hdr_peak_nits;\n"
+    "\n"
+    "        float maxLum = 203.0 / hdr_peak_nits;\n"
+    "        float ks = max(1.5 * maxLum - 0.5, 0.0);\n"
+    "\n"
+    "        /* Luminance-based tone map — use source-appropriate luma\n"
+    "         * coefficients to preserve color ratios through compression */\n"
+    "        float3 lc = (hdr_gamut > 0.5)\n"
+    "            ? float3(0.2627, 0.6780, 0.0593)\n"
+    "            : float3(0.2126, 0.7152, 0.0722);\n"
+    "        float Y = dot(E, lc);\n"
+    "        float Yt = bt2390_eetf(Y, ks, maxLum);\n"
+    "        float3 rgb_tm = (Y > 0.0) ? E * (Yt / Y) : float3(0,0,0);\n"
+    "\n"
+    "        /* BT.2020→BT.709 gamut conversion (linear light).\n"
+    "         * Only for true BT.2020 content — DV P5 base layer is\n"
+    "         * already BT.709 and must NOT be converted. */\n"
+    "        if (hdr_gamut > 0.5) {\n"
+    "            float3 r2 = rgb_tm;\n"
+    "            rgb_tm = float3(\n"
+    "                 1.6605*r2.r - 0.5877*r2.g - 0.0728*r2.b,\n"
+    "                -0.1246*r2.r + 1.1330*r2.g - 0.0084*r2.b,\n"
+    "                -0.0182*r2.r - 0.1006*r2.g + 1.1187*r2.b);\n"
+    "            rgb_tm = max(rgb_tm, 0.0);\n"
+    "        }\n"
+    "\n"
+    "        /* Normalize so SDR reference white (203 nits) maps to 1.0.\n"
+    "         * With KS=0 (full spline), eetf(maxLum) < maxLum due to\n"
+    "         * spline compression. Dividing by eetf(maxLum) corrects this,\n"
+    "         * ensuring mid-tones aren't darkened by highlight compression. */\n"
+    "        float sdr_norm = bt2390_eetf(maxLum, ks, maxLum);\n"
+    "        rgb_tm = rgb_tm / max(sdr_norm, 0.001);\n"
+    "\n"
+    "        /* sRGB gamma (IEC 61966-2-1 piecewise) */\n"
+    "        rgb_tm = max(rgb_tm, 0.0);\n"
+    "        rgb = float3(\n"
+    "            rgb_tm.r <= 0.0031308 ? 12.92*rgb_tm.r : 1.055*pow(rgb_tm.r, 1.0/2.4) - 0.055,\n"
+    "            rgb_tm.g <= 0.0031308 ? 12.92*rgb_tm.g : 1.055*pow(rgb_tm.g, 1.0/2.4) - 0.055,\n"
+    "            rgb_tm.b <= 0.0031308 ? 12.92*rgb_tm.b : 1.055*pow(rgb_tm.b, 1.0/2.4) - 0.055);\n"
+    "    }\n"
     "\n"
     "    /* Blue noise dither: ±0.5 LSB in 8-bit (±1/510 in [0,1]).\n"
     "     * 64x64 void-and-cluster texture, tiled via frac(). Temporal\n"
@@ -942,6 +1021,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      */
     int is_hdr = 0;
     int is_dolby_vision = 0;
+    int has_pq_transfer = 0;
     float peak_nits = 0.0f;
     int has_bt2020_primaries = 0;
 
@@ -952,6 +1032,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         /* --- Transfer function check --- */
         if (par->color_trc == AVCOL_TRC_SMPTE2084) {
             is_hdr = 1;
+            has_pq_transfer = 1;
             log_msg("HDR: detected PQ transfer (SMPTE ST 2084)");
         } else if (par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
             /* HLG — flag for future support, don't activate HDR path yet */
@@ -1037,6 +1118,16 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         hdr_gamut = 1.0f;   /* 1.0 = BT.2020 primaries */
     }
 
+    /* DV-only content (no PQ transfer tag): base layer is intentionally
+     * distorted by DV polynomial reshaping. Without libdovi RPU processing,
+     * the R/G/B channels are NOT valid PQ values — applying pq_eotf()
+     * produces garbage colors. Skip tone mapping entirely. */
+    if (is_hdr && is_dolby_vision && !has_pq_transfer) {
+        is_hdr = 0;
+        log_msg("HDR: Dolby Vision only (no PQ transfer) — "
+                "tone mapping disabled (requires libdovi RPU processing)");
+    }
+
     ps->gpu_uniforms.is_hdr        = is_hdr ? 1.0f : 0.0f;
     ps->gpu_uniforms.hdr_peak_nits = peak_nits;
     ps->gpu_uniforms.hdr_gamut     = hdr_gamut;
@@ -1044,10 +1135,15 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     ps->gpu_uniforms._pad2         = 0.0f;
 
     if (is_hdr) {
-        log_msg("GPU: HDR→SDR active (peak=%.0f nits, gamut=%s%s)",
+        float maxLum = 203.0f / peak_nits;
+        float ks = 1.5f * maxLum - 0.5f;
+        if (ks < 0.0f) ks = 0.0f;
+        log_msg("GPU: HDR→SDR tone mapping active (peak=%.0f nits, gamut=%s%s)",
                 peak_nits,
                 has_bt2020_primaries ? "BT.2020" : "BT.709",
                 is_dolby_vision ? ", Dolby Vision" : "");
+        log_msg("HDR: BT.2390 EETF (target=203 nits, KS=%.3f, maxLum=%.4f)",
+                ks, maxLum);
     }
 
     static const char *chroma_names[] = {
