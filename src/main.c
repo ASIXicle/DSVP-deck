@@ -526,6 +526,9 @@ int main(int argc, char *argv[]) {
     ps.sub_active_idx   = -1;
     ps.win_w = DEFAULT_WIN_W;
     ps.win_h = DEFAULT_WIN_H;
+    ps.hdr_target_idx = 0;  /* default: 203 nits (industry standard) */
+    ps.gpu_uniforms.hdr_target_nits = 203.0f;
+    ps.gpu_uniforms.hdr_midtone_gain = 1.0f;  /* default: no lift */
 
     /* ── Compile shaders and create GPU pipelines ── */
     if (gpu_create_pipelines(&ps) < 0) {
@@ -651,14 +654,43 @@ int main(int argc, char *argv[]) {
                         int mode = (int)ps.gpu_uniforms.hdr_debug;
                         mode = (mode + 1) % 4;
                         ps.gpu_uniforms.hdr_debug = (float)mode;
-                        const char *names[] = {
-                            "HDR: BT.2390 (203 nit target)",
-                            "HDR: BT.2390 (300 nit target)",
+                        float tn = ps.gpu_uniforms.hdr_target_nits;
+                        const char *fmt[] = {
+                            "HDR: BT.2390 (%.0f nit target)",
+                            "HDR: BT.2390 (%.0f+100 nit target)",
                             "HDR: PQ bypass (raw stream)",
                             "HDR: Luminance visualization"
                         };
-                        snprintf(ps.aud_osd, sizeof(ps.aud_osd), "%s", names[mode]);
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd), fmt[mode],
+                                 mode <= 1 ? tn : 0.0f);
                         ps.aud_osd_until = get_time_sec() + 2.0;
+                    }
+                    break;
+
+                case SDLK_T:
+                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        static const float targets[] = { 203.0f, 300.0f, 400.0f };
+                        ps.hdr_target_idx = (ps.hdr_target_idx + 1) % 3;
+                        ps.gpu_uniforms.hdr_target_nits = targets[ps.hdr_target_idx];
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "SDR target: %.0f nits", targets[ps.hdr_target_idx]);
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        log_msg("HDR: SDR target changed to %.0f nits",
+                                targets[ps.hdr_target_idx]);
+                    }
+                    break;
+
+                case SDLK_G:
+                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f };
+                        static int gain_idx = 0;
+                        gain_idx = (gain_idx + 1) % 4;
+                        ps.gpu_uniforms.hdr_midtone_gain = gains[gain_idx];
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Midtone gain: %.1f", gains[gain_idx]);
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        log_msg("HDR: midtone gain changed to %.1f",
+                                gains[gain_idx]);
                     }
                     break;
 

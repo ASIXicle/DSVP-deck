@@ -172,7 +172,11 @@ static const char hlsl_yuv_planar_frag[] =
     "    float hdr_peak_nits;\n"
     "    float hdr_gamut;\n"
     "    float hdr_debug;\n"
-    "    float _pad2;\n"
+    "    float hdr_target_nits;\n"
+    "    float hdr_midtone_gain;\n"
+    "    float _pad3;\n"
+    "    float _pad4;\n"
+    "    float _pad5;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -318,10 +322,10 @@ static const char hlsl_yuv_planar_frag[] =
     "            float3 lin = pq_eotf(rgb);\n"
     "            float3 E = lin / hdr_peak_nits;\n"
     "\n"
-    "            /* Mode 1: raised target (300 nits vs 203). Gives brighter\n"
-    "             * midtones and more linear passthrough at lower peaks. */\n"
+    "            /* Target comes from T-key toggle (203/300/400 nits).\n"
+    "             * Debug mode 1: override to target+100 for comparison. */\n"
     "            float target = (hdr_debug > 0.5 && hdr_debug < 1.5)\n"
-    "                ? 300.0 : 203.0;\n"
+    "                ? hdr_target_nits + 100.0 : hdr_target_nits;\n"
     "            float maxLum = target / hdr_peak_nits;\n"
     "            float ks = max(1.5 * maxLum - 0.5, 0.0);\n"
     "\n"
@@ -332,6 +336,8 @@ static const char hlsl_yuv_planar_frag[] =
     "            float Yt = bt2390_eetf(Y, ks, maxLum);\n"
     "            float3 rgb_tm = (Y > 0.0) ? E * (Yt / Y) : float3(0,0,0);\n"
     "\n"
+    "            rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
+    "\n"
     "            if (hdr_gamut > 0.5) {\n"
     "                float3 r2 = rgb_tm;\n"
     "                rgb_tm = float3(\n"
@@ -341,10 +347,12 @@ static const char hlsl_yuv_planar_frag[] =
     "                rgb_tm = max(rgb_tm, 0.0);\n"
     "            }\n"
     "\n"
-    "            float sdr_norm = bt2390_eetf(maxLum, ks, maxLum);\n"
-    "            rgb_tm = rgb_tm / max(sdr_norm, 0.001);\n"
     "\n"
     "            rgb_tm = max(rgb_tm, 0.0);\n"
+    "            if (hdr_midtone_gain > 1.001) {\n"
+    "                float inv = 1.0 / hdr_midtone_gain;\n"
+    "                rgb_tm = float3(pow(rgb_tm.r, inv), pow(rgb_tm.g, inv), pow(rgb_tm.b, inv));\n"
+    "            }\n"
     "            rgb = float3(\n"
     "                rgb_tm.r <= 0.0031308 ? 12.92*rgb_tm.r : 1.055*pow(rgb_tm.r, 1.0/2.4) - 0.055,\n"
     "                rgb_tm.g <= 0.0031308 ? 12.92*rgb_tm.g : 1.055*pow(rgb_tm.g, 1.0/2.4) - 0.055,\n"
@@ -1140,18 +1148,29 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     ps->gpu_uniforms.hdr_peak_nits = peak_nits;
     ps->gpu_uniforms.hdr_gamut     = hdr_gamut;
     ps->gpu_uniforms.hdr_debug     = 0.0f;
-    ps->gpu_uniforms._pad2         = 0.0f;
+
+    /* SDR target nits — preserved across file opens (N key cycles).
+     * Only initialize to default if not already set by a previous file. */
+    if (ps->gpu_uniforms.hdr_target_nits < 1.0f)
+        ps->gpu_uniforms.hdr_target_nits = 203.0f;
+
+    /* Save static peak as ceiling for dynamic detection.
+     * Initialize smoothing state — first frame will set the actual peak. */
+    ps->hdr_static_peak      = peak_nits;
+    ps->hdr_smoothed_peak    = 0.0f;   /* 0 = uninitialized, first frame jumps */
+    ps->hdr_prev_frame_peak  = 0.0f;
 
     if (is_hdr) {
-        float maxLum = 203.0f / peak_nits;
+        float target = ps->gpu_uniforms.hdr_target_nits;
+        float maxLum = target / peak_nits;
         float ks = 1.5f * maxLum - 0.5f;
         if (ks < 0.0f) ks = 0.0f;
-        log_msg("GPU: HDR→SDR tone mapping active (peak=%.0f nits, gamut=%s%s)",
-                peak_nits,
+        log_msg("GPU: HDR→SDR tone mapping active (peak=%.0f nits, target=%.0f nits, gamut=%s%s)",
+                peak_nits, target,
                 has_bt2020_primaries ? "BT.2020" : "BT.709",
                 is_dolby_vision ? ", Dolby Vision" : "");
-        log_msg("HDR: BT.2390 EETF (target=203 nits, KS=%.3f, maxLum=%.4f)",
-                ks, maxLum);
+        log_msg("HDR: BT.2390 EETF (target=%.0f nits, KS=%.3f, maxLum=%.4f)",
+                target, ks, maxLum);
     }
 
     static const char *chroma_names[] = {
@@ -2181,6 +2200,174 @@ static void upload_plane(
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════
+ * HDR Dynamic Peak Detection (Layer 1 — CPU histogram scan)
+ *
+ * Builds a 256-bin histogram of Y plane values per frame, reads off
+ * the 99.875th percentile, converts to nits via PQ EOTF, and applies
+ * temporal smoothing. Using a percentile instead of max avoids
+ * specular highlights (sun glints, lamp reflections) inflating the
+ * peak, which would cause BT.2390 to over-compress midtones.
+ *
+ * 99.875th percentile (skip top 0.125%) matches the spirit of
+ * libplacebo/mpv's approach (default 99.995, user-tunable).
+ * We use a slightly more aggressive value to better handle older
+ * film content with occasional bright hotspots.
+ *
+ * Layer 2 will move this to a GPU compute shader for zero CPU cost.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* PQ EOTF (SMPTE ST 2084): PQ code value [0,1] → linear nits [0,10000].
+ * Scalar version of the shader's pq_eotf() for CPU-side use. */
+static float pq_eotf_scalar(float pq) {
+    const float m1 = 0.1593017578125f;   /* 2610/16384 */
+    const float m2 = 78.84375f;          /* 2523/32 * 128 */
+    const float c1 = 0.8359375f;         /* 3424/4096 */
+    const float c2 = 18.8515625f;        /* 2413/128 */
+    const float c3 = 18.6875f;           /* 2392/128 */
+
+    float Np  = powf(fmaxf(pq, 0.0f), 1.0f / m2);
+    float num = fmaxf(Np - c1, 0.0f);
+    float den = c2 - c3 * Np;
+    return 10000.0f * powf(fmaxf(num / den, 0.0f), 1.0f / m1);
+}
+
+/* Temporal smoothing parameters.
+ * Fast attack (bright → brighter): adapt quickly so highlights aren't clipped.
+ * Slow decay (bright → darker): prevent flickering from fading highlights.
+ * Scene cut: jump immediately on large changes. */
+#define PEAK_ATTACK_RATE    0.3f     /* rise towards new peak per frame   */
+#define PEAK_DECAY_RATE     0.01f    /* decay towards new peak per frame  */
+#define PEAK_SCENE_CUT_THR  0.5f     /* 50% change = scene cut, jump      */
+#define PEAK_MIN_NITS       100.0f   /* floor to prevent near-zero peaks   */
+#define PEAK_PERCENTILE     99.875f  /* skip top 0.125% (specular hotspots) */
+
+/* Scan the Y plane, build histogram, extract percentile peak,
+ * convert to nits, smooth, and update the uniform.
+ * Called once per frame from video_display() for HDR content only. */
+static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
+                                   int is_10bit)
+{
+    /* Skip if not HDR or in PQ bypass debug mode */
+    if (ps->gpu_uniforms.is_hdr < 0.5f) return;
+    if (ps->gpu_uniforms.hdr_debug > 1.5f && ps->gpu_uniforms.hdr_debug < 2.5f)
+        return;  /* mode 2: PQ bypass, use static peak */
+
+    const uint8_t *data = frame->data[0];
+    int stride = frame->linesize[0];
+    int w = ps->vid_w;
+    int h = ps->vid_h;
+
+    /* ── Build 256-bin histogram of Y plane ──
+     * Subsample 4× in each dimension to reduce work.
+     * For 10-bit: bin = uint16 >> 8 (top 8 bits → 256 bins).
+     * For 8-bit:  bin = uint8 value directly. */
+    int histogram[256];
+    memset(histogram, 0, sizeof(histogram));
+    int total_samples = 0;
+
+    if (is_10bit) {
+        for (int y = 0; y < h; y += 4) {
+            const uint16_t *row = (const uint16_t *)(data + y * stride);
+            for (int x = 0; x < w; x += 4) {
+                histogram[row[x] >> 8]++;
+                total_samples++;
+            }
+        }
+    } else {
+        for (int y = 0; y < h; y += 4) {
+            const uint8_t *row = data + y * stride;
+            for (int x = 0; x < w; x += 4) {
+                histogram[row[x]]++;
+                total_samples++;
+            }
+        }
+    }
+
+    /* ── Find the 99.875th percentile bin ──
+     * Walk from the top bin downward, accumulating counts until
+     * we've passed (100 - PEAK_PERCENTILE)% of total samples. */
+    int skip_count = (int)((100.0f - PEAK_PERCENTILE) / 100.0f * total_samples);
+    if (skip_count < 1) skip_count = 1;
+
+    int accumulated = 0;
+    int percentile_bin = 255;
+    for (int i = 255; i >= 0; i--) {
+        accumulated += histogram[i];
+        if (accumulated >= skip_count) {
+            percentile_bin = i;
+            break;
+        }
+    }
+
+    /* ── Convert bin to normalized value [0,1] ──
+     * Use bin center: (bin + 0.5) / 256 for 10-bit (maps back to uint16 space).
+     * For 8-bit: (bin + 0.5) / 256 ≈ bin / 255 (close enough). */
+    float raw_max_norm;
+    if (is_10bit) {
+        /* Bin represents top 8 bits of uint16. Reconstruct midpoint. */
+        raw_max_norm = ((float)percentile_bin + 0.5f) * 256.0f / 65535.0f;
+    } else {
+        raw_max_norm = ((float)percentile_bin + 0.5f) / 256.0f;
+    }
+
+    /* ── Apply range expansion (same math as shader) ──
+     * Convert from texture-space to PQ code [0,1] */
+    float pq_code = (raw_max_norm - ps->gpu_uniforms.rangeY[0])
+                  * ps->gpu_uniforms.rangeY[1];
+    if (pq_code < 0.0f) pq_code = 0.0f;
+    if (pq_code > 1.0f) pq_code = 1.0f;
+
+    /* ── PQ → linear nits ── */
+    float raw_peak_nits = pq_eotf_scalar(pq_code);
+
+    /* ── Temporal smoothing ── */
+    float smoothed = ps->hdr_smoothed_peak;
+    float prev     = ps->hdr_prev_frame_peak;
+
+    if (smoothed < 1.0f) {
+        /* First frame — initialize directly */
+        smoothed = raw_peak_nits;
+    } else {
+        /* Scene cut detection: large change from previous frame → jump */
+        float change = fabsf(raw_peak_nits - prev) / fmaxf(prev, 1.0f);
+        if (change > PEAK_SCENE_CUT_THR) {
+            smoothed = raw_peak_nits;
+        } else if (raw_peak_nits > smoothed) {
+            /* Attack: scene getting brighter — rise quickly */
+            smoothed += PEAK_ATTACK_RATE * (raw_peak_nits - smoothed);
+        } else {
+            /* Decay: scene getting darker — fade slowly */
+            smoothed += PEAK_DECAY_RATE * (raw_peak_nits - smoothed);
+        }
+    }
+
+    /* Clamp: floor at PEAK_MIN_NITS, ceiling at static metadata peak */
+    if (smoothed < PEAK_MIN_NITS) smoothed = PEAK_MIN_NITS;
+    if (ps->hdr_static_peak > 0.0f && smoothed > ps->hdr_static_peak)
+        smoothed = ps->hdr_static_peak;
+
+    /* Update state */
+    ps->hdr_smoothed_peak   = smoothed;
+    ps->hdr_prev_frame_peak = raw_peak_nits;
+
+    /* Feed dynamic peak to the tone mapper */
+    ps->gpu_uniforms.hdr_peak_nits = smoothed;
+
+    /* Periodic log (every 120 frames ≈ 5s at 24fps) */
+    if (ps->diag_frames_displayed % 120 == 0) {
+        float target = ps->gpu_uniforms.hdr_target_nits;
+        float maxLum = target / smoothed;
+        float ks = 1.5f * maxLum - 0.5f;
+        if (ks < 0.0f) ks = 0.0f;
+        log_msg("HDR peak: raw=%.0f nits, smoothed=%.0f nits "
+                "(p%.1f, target=%.0f, static=%.0f, KS=%.3f, maxLum=%.4f)",
+                raw_peak_nits, smoothed, PEAK_PERCENTILE,
+                target, ps->hdr_static_peak, ks, maxLum);
+    }
+}
+
+
 /* Display the current video frame: upload to GPU → shader draw.
  *
  * This is the hot path. Called once per new frame from main.c.
@@ -2227,6 +2414,11 @@ void video_display(PlayerState *ps) {
         src_frame = ps->rgb_frame;
         bpp = 1;
     }
+
+    /* ── HDR dynamic peak detection (CPU scan) ──
+     * Scan luma plane to find actual scene peak before uploading.
+     * Updates hdr_peak_nits uniform with temporally smoothed value. */
+    hdr_compute_scene_peak(ps, src_frame, is_10bit_passthrough);
 
     /* ── Upload plane data to GPU transfer buffers ── */
     upload_plane(ps->gpu_device, ps->gpu_xfer_y,

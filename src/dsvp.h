@@ -95,8 +95,12 @@ typedef struct GPUUniforms {
     float hdr_peak_nits;    /* source peak luminance (nits)       4 bytes */
     float hdr_gamut;        /* 0.0=BT.709, 1.0=BT.2020 primaries 4 bytes */
     float hdr_debug;        /* 0-3: HDR debug viz mode             4 bytes */
-    float _pad2;            /* std140 alignment to 128 bytes       4 bytes */
-} GPUUniforms;              /*                                  128 bytes */
+    float hdr_target_nits;  /* SDR display peak (T key toggle)     4 bytes */
+    float hdr_midtone_gain; /* midtone lift exponent (G key)       4 bytes */
+    float _pad3;            /* \                                    4 bytes */
+    float _pad4;            /*  | std140 alignment to 144 bytes    4 bytes */
+    float _pad5;            /* /                                    4 bytes */
+} GPUUniforms;              /*                                  144 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -159,6 +163,12 @@ typedef struct PlayerState {
     SDL_GPUTransferBuffer      *gpu_xfer_u;
     SDL_GPUTransferBuffer      *gpu_xfer_v;
     GPUUniforms                 gpu_uniforms;         /* current color params */
+
+    /* ── HDR dynamic peak detection (Layer 1: CPU scan) ── */
+    float                       hdr_smoothed_peak;    /* temporally smoothed peak (nits) */
+    float                       hdr_prev_frame_peak;  /* raw peak from previous frame    */
+    float                       hdr_static_peak;      /* metadata peak (fallback ceiling) */
+    int                         hdr_target_idx;       /* index into SDR target nit table  */
 
     /* ── Overlay GPU handles (lifetime: application, resized as needed) ── */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_overlay; /* RGBA + alpha blend */
