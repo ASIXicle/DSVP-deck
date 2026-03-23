@@ -646,6 +646,21 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     break;
+                                    case SDLK_H:
+                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        int mode = (int)ps.gpu_uniforms.hdr_debug;
+                        mode = (mode + 1) % 4;
+                        ps.gpu_uniforms.hdr_debug = (float)mode;
+                        const char *names[] = {
+                            "HDR: BT.2390 (203 nit target)",
+                            "HDR: BT.2390 (300 nit target)",
+                            "HDR: PQ bypass (raw stream)",
+                            "HDR: Luminance visualization"
+                        };
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd), "%s", names[mode]);
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                    }
+                    break;
 
                 case SDLK_S:
                     sub_cycle(&ps);

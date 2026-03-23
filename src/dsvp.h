@@ -94,7 +94,8 @@ typedef struct GPUUniforms {
     float is_hdr;           /* 1.0 = HDR content detected         4 bytes */
     float hdr_peak_nits;    /* source peak luminance (nits)       4 bytes */
     float hdr_gamut;        /* 0.0=BT.709, 1.0=BT.2020 primaries 4 bytes */
-    float _pad1, _pad2;     /* std140 alignment to 128 bytes      8 bytes */
+    float hdr_debug;        /* 0-3: HDR debug viz mode             4 bytes */
+    float _pad2;            /* std140 alignment to 128 bytes       4 bytes */
 } GPUUniforms;              /*                                  128 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
