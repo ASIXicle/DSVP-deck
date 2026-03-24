@@ -889,18 +889,21 @@ int main(int argc, char *argv[]) {
                 ps.diag_frames_displayed++;
 
                 if (ps.seek_recovering) {
-                    ps.seek_recovering = 0;
+                    ps.seek_recovering--;
                     ps.frame_timer = get_time_sec();
 
-                    /* Resume audio now that video has produced its first
-                     * frame — clocks are aligned to the same seek target. */
-                    if (ps.audio_stream && !ps.paused)
-                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    if (ps.seek_recovering == 0) {
+                        /* Resume audio now that video decoder is producing
+                         * frames steadily — VAAPI DPB rebuild is past.
+                         * Waiting for 3 frames prevents a single buffered
+                         * keyframe from clearing recovery prematurely. */
+                        if (ps.audio_stream && !ps.paused)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
 
-                    log_msg("DIAG: seek recovery complete at %.3fs",
-                            ps.video_clock);
+                        log_msg("DIAG: seek recovery complete at %.3fs",
+                                ps.video_clock);
+                    }
                 }
-            }
 
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {

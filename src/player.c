@@ -1759,7 +1759,7 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* Suppress frame drops until the first frame is displayed.
      * Adapts automatically to any codec's keyframe recovery time. */
-    ps->seek_recovering = 1;
+    ps->seek_recovering = 3;
     ps->video_ready = 0;
 
     /* ── Reset diagnostics ── */
