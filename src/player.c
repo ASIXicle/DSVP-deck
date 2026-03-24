@@ -2671,6 +2671,16 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
     if (ps->gpu_uniforms.hdr_debug > 1.5f && ps->gpu_uniforms.hdr_debug < 2.5f)
         return;  /* mode 2: PQ bypass, use static peak */
 
+    /* DV Profile 5: skip CPU histogram — I-plane is IPTPQc2, not PQ luma.
+     * Histogram reads garbage, stuck at PEAK_MIN_NITS floor.  Use the
+     * static peak from source_max_pq (set by dovi_populate_uniforms). */
+    if (ps->dovi_metadata_logged == 2) {
+        ps->hdr_smoothed_peak = ps->hdr_static_peak;
+        ps->hdr_prev_frame_peak = ps->hdr_static_peak;
+        ps->gpu_uniforms.hdr_peak_nits = ps->hdr_static_peak;
+        return;
+    }
+
     const uint8_t *data = frame->data[0];
     int stride = frame->linesize[0];
     int w = ps->vid_w;
