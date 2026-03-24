@@ -2074,6 +2074,7 @@ int video_decode_frame(PlayerState *ps) {
             /* ── VAAPI: transfer GPU surface → system memory P010 ── */
             if (ps->vaapi_active) {
                 av_frame_unref(ps->video_frame);
+                ps->video_frame->format = AV_PIX_FMT_P010LE;
                 ret = av_hwframe_transfer_data(ps->video_frame, ps->hw_frame, 0);
                 if (ret < 0) {
                     log_msg("ERROR: av_hwframe_transfer_data failed: %s", av_err2str(ret));
