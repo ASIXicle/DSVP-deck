@@ -26,6 +26,7 @@
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/dovi_meta.h>
 
 /* SDL3 — SDL_MAIN_HANDLED prevents SDL from injecting WinMain */
 #define SDL_MAIN_HANDLED
@@ -97,10 +98,21 @@ typedef struct GPUUniforms {
     float hdr_debug;        /* 0-3: HDR debug viz mode             4 bytes */
     float hdr_target_nits;  /* SDR display peak (T key toggle)     4 bytes */
     float hdr_midtone_gain; /* midtone lift exponent (G key)       4 bytes */
-    float _pad3;            /* \                                    4 bytes */
-    float _pad4;            /*  | std140 alignment to 144 bytes    4 bytes */
-    float _pad5;            /* /                                    4 bytes */
-} GPUUniforms;              /*                                  144 bytes */
+    float is_dovi;          /* 1.0 = DV reshaping active           4 bytes */
+    float dovi_c0_I;        /* reshape: I/Y offset                 4 bytes */
+    float dovi_c0_Ct;       /* reshape: Ct/Cb offset               4 bytes */
+    /* ── 144B boundary (old struct end) ── */
+    float dovi_c0_Cp;       /* reshape: Cp/Cr offset               4 bytes */
+    float dovi_c1_I;        /* reshape: I/Y scale                  4 bytes */
+    float dovi_c1_Ct;       /* reshape: Ct/Cb scale                4 bytes */
+    float dovi_c1_Cp;       /* reshape: Cp/Cr scale                4 bytes */
+    float dovi_ycc_r0[4];   /* ycc→rgb row 0 [m,m,m,offset]      16 bytes */
+    float dovi_ycc_r1[4];   /* ycc→rgb row 1 [m,m,m,offset]      16 bytes */
+    float dovi_ycc_r2[4];   /* ycc→rgb row 2 [m,m,m,offset]      16 bytes */
+    float dovi_out_r0[4];   /* output row 0 [m,m,m,0] (lms→2020) 16 bytes */
+    float dovi_out_r1[4];   /* output row 1 [m,m,m,0]            16 bytes */
+    float dovi_out_r2[4];   /* output row 2 [m,m,m,0]            16 bytes */
+} GPUUniforms;              /*                                  256 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -169,6 +181,7 @@ typedef struct PlayerState {
     float                       hdr_prev_frame_peak;  /* raw peak from previous frame    */
     float                       hdr_static_peak;      /* metadata peak (fallback ceiling) */
     int                         hdr_target_idx;       /* index into SDR target nit table  */
+    int                         dovi_metadata_logged; /* 1 = logged DV RPU for this file  */
 
     /* ── Overlay GPU handles (lifetime: application, resized as needed) ── */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_overlay; /* RGBA + alpha blend */

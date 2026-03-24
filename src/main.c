@@ -528,7 +528,7 @@ int main(int argc, char *argv[]) {
     ps.win_h = DEFAULT_WIN_H;
     ps.hdr_target_idx = 0;  /* default: 203 nits (industry standard) */
     ps.gpu_uniforms.hdr_target_nits = 203.0f;
-    ps.gpu_uniforms.hdr_midtone_gain = 1.0f;  /* default: no lift */
+    ps.gpu_uniforms.hdr_midtone_gain = 1.3f;  /* default: moderate midtone lift */
 
     /* ── Compile shaders and create GPU pipelines ── */
     if (gpu_create_pipelines(&ps) < 0) {
@@ -683,7 +683,7 @@ int main(int argc, char *argv[]) {
                 case SDLK_G:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
                         static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f };
-                        static int gain_idx = 0;
+                        static int gain_idx = 3;
                         gain_idx = (gain_idx + 1) % 4;
                         ps.gpu_uniforms.hdr_midtone_gain = gains[gain_idx];
                         snprintf(ps.aud_osd, sizeof(ps.aud_osd),
