@@ -25,4 +25,6 @@ WORKING.txt
 dsvp.log
 *.zip
 *.tar.gz
-*.patch
+*.patchtest_*.sh
+test_*.sh
+test_logs/
