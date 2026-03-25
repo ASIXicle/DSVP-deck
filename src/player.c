@@ -645,7 +645,7 @@ static int gpu_create_video_textures(PlayerState *ps) {
     int ch = h / 2;  /* chroma height (4:2:0) */
 
     int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
-                    || ps->vaapi_active);  /* P010 from VAAPI is also 16-bit */
+                    || (ps->vaapi_active && !ps->vaapi_nv12));
 
     SDL_GPUTextureFormat fmt = is_10bit
         ? SDL_GPU_TEXTUREFORMAT_R16_UNORM
@@ -779,7 +779,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         is_full_range = (par->color_range == AVCOL_RANGE_JPEG);
     }
 
-    if (ps->vaapi_active) {
+    if (ps->vaapi_active && !ps->vaapi_nv12) {
         /* ── P010 from VAAPI — 10-bit values left-shifted by 6 in uint16 ──
          *
          * P010 stores 10-bit code V as (V << 6) in a uint16.
@@ -805,6 +805,28 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, P010 %s range → shader)",
+                is_bt709 ? "BT.709" : "BT.601",
+                is_full_range ? "full" : "limited");
+
+    } else if (ps->vaapi_active && ps->vaapi_nv12) {
+        /* ── NV12 from VAAPI — 8-bit uint8 samples ──
+         *
+         * R8_UNORM reads uint8 V as V/255.
+         * Same range math as yuv420p passthrough.
+         */
+        if (is_full_range) {
+            ps->gpu_uniforms.rangeY[0]  = 0.0f;
+            ps->gpu_uniforms.rangeY[1]  = 1.0f;
+            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            ps->gpu_uniforms.rangeUV[1] = 1.0f;
+        } else {
+            ps->gpu_uniforms.rangeY[0]  = 16.0f / 255.0f;
+            ps->gpu_uniforms.rangeY[1]  = 255.0f / (235.0f - 16.0f);
+            ps->gpu_uniforms.rangeUV[0] = 16.0f / 255.0f;
+            ps->gpu_uniforms.rangeUV[1] = 255.0f / (240.0f - 16.0f);
+        }
+
+        log_msg("GPU: uniforms set (%s, NV12 %s range → shader)",
                 is_bt709 ? "BT.709" : "BT.601",
                 is_full_range ? "full" : "limited");
 
@@ -1327,8 +1349,9 @@ int player_open(PlayerState *ps, const char *filename) {
          * H.264 4K 60fps plays perfectly with 4-thread software decode.
          *
          * VAAPI decode is bit-exact (same output as software) — no fidelity
-         * compromise. Output is P010LE (10-bit semi-planar), which we
-         * deinterleave on CPU and feed the existing R16_UNORM pipeline.
+         * compromise. Output is P010LE (10-bit) for 10-bit sources or
+         * NV12 (8-bit) for 8-bit sources. Both are semi-planar, which we
+         * deinterleave on CPU and feed the existing R16_UNORM/R8_UNORM pipeline.
          *
          * DSVP_HWDEC=0 disables hardware decode (for testing/comparison).
          */
@@ -1425,11 +1448,21 @@ int player_open(PlayerState *ps, const char *filename) {
         ps->vid_h = ps->video_codec_ctx->height;
 
         if (use_vaapi) {
-            log_msg("VAAPI: active — HEVC hardware decode, P010 output");
-            log_msg("Video: %dx%d, pix_fmt=%s (sw=%s)",
+            /* Determine VAAPI output format from source bit depth.
+             * VAAPI outputs NV12 (8-bit uint8) for 8-bit HEVC,
+             * P010 (10-bit uint16) for 10-bit HEVC. The stream's
+             * codecpar->format is the original pixel format before
+             * hardware acceleration — reliable and available now. */
+            enum AVPixelFormat stream_fmt = vs->codecpar->format;
+            ps->vaapi_nv12 = (stream_fmt != AV_PIX_FMT_YUV420P10LE
+                           && stream_fmt != AV_PIX_FMT_P010LE);
+            log_msg("VAAPI: active — HEVC hardware decode, %s output",
+                    ps->vaapi_nv12 ? "NV12 (8-bit)" : "P010 (10-bit)");
+            log_msg("Video: %dx%d, pix_fmt=%s (sw=%s), stream_fmt=%s",
                 ps->vid_w, ps->vid_h,
                 av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt),
-                av_get_pix_fmt_name(ps->video_codec_ctx->sw_pix_fmt));
+                av_get_pix_fmt_name(ps->video_codec_ctx->sw_pix_fmt),
+                av_get_pix_fmt_name(stream_fmt));
         } else {
             log_msg("Video: %dx%d, pix_fmt=%s, threads=%d",
                 ps->vid_w, ps->vid_h,
@@ -1542,22 +1575,25 @@ int player_open(PlayerState *ps, const char *filename) {
             player_close(ps);
             return -1;
         }
-        /* P010 UV plane: interleaved uint16 pairs → split into U and V.
-         * Each plane: (w/2) × (h/2) × 2 bytes = ~4MB for 4K. */
+        /* Semi-planar UV plane: interleaved sample pairs → split into U and V.
+         * NV12: uint8 pairs (1 byte each), P010: uint16 pairs (2 bytes each). */
         int cw = ps->vid_w / 2;
         int ch = ps->vid_h / 2;
-        ps->p010_u_plane = (uint8_t *)av_malloc((size_t)cw * ch * 2);
-        ps->p010_v_plane = (uint8_t *)av_malloc((size_t)cw * ch * 2);
+        int sample_bytes = ps->vaapi_nv12 ? 1 : 2;
+        ps->p010_u_plane = (uint8_t *)av_malloc((size_t)cw * ch * sample_bytes);
+        ps->p010_v_plane = (uint8_t *)av_malloc((size_t)cw * ch * sample_bytes);
         if (!ps->p010_u_plane || !ps->p010_v_plane) {
-            log_msg("ERROR: Failed to allocate P010 deinterleave buffers");
+            log_msg("ERROR: Failed to allocate deinterleave buffers");
             player_close(ps);
             return -1;
         }
-        log_msg("VAAPI: allocated P010 deinterleave buffers (%dx%d chroma)", cw, ch);
+        log_msg("VAAPI: allocated %s deinterleave buffers (%dx%d chroma)",
+                ps->vaapi_nv12 ? "NV12" : "P010", cw, ch);
     }
 
     /* ── Set up swscale (or skip for GPU passthrough) ──
      *
+     * VAAPI NV12:    bypass swscale. CPU deinterleave UV → R8_UNORM textures.
      * VAAPI P010:    bypass swscale. CPU deinterleave UV → R16_UNORM textures.
      * yuv420p10le:   bypass swscale. Raw 10-bit planes → R16_UNORM textures.
      * yuv420p:       bypass swscale. Raw 8-bit planes → R8_UNORM textures.
@@ -1572,10 +1608,12 @@ int player_open(PlayerState *ps, const char *filename) {
         int is_yuv420p = (src_fmt == AV_PIX_FMT_YUV420P);
 
         if (ps->vaapi_active) {
-            /* ── VAAPI P010 — deinterleave on CPU, range in shader ── */
+            /* ── VAAPI — deinterleave on CPU, range in shader ── */
             ps->sws_ctx    = NULL;
             ps->rgb_buffer = NULL;
-            log_msg("swscale: bypassed (VAAPI P010 → CPU deinterleave → R16_UNORM)");
+            log_msg("swscale: bypassed (VAAPI %s → CPU deinterleave → %s)",
+                    ps->vaapi_nv12 ? "NV12" : "P010",
+                    ps->vaapi_nv12 ? "R8_UNORM" : "R16_UNORM");
 
         } else if (is_10bit) {
             /* ── 10-bit GPU passthrough — no swscale needed ── */
@@ -1874,6 +1912,7 @@ void player_close(PlayerState *ps) {
     ps->eof                = 0;
     ps->quit               = 0;
     ps->vaapi_active       = 0;
+    ps->vaapi_nv12         = 0;
     ps->video_stream_idx   = -1;
     ps->audio_stream_idx   = -1;
     ps->audio_buf_size     = 0;
@@ -2067,14 +2106,13 @@ int video_decode_frame(PlayerState *ps) {
     for (;;) {
         /* Try to receive a decoded frame first (may have buffered frames).
          * VAAPI path: receive into hw_frame (VAAPI surface), then
-         * av_hwframe_transfer_data to get P010 in system memory. */
+         * av_hwframe_transfer_data to get NV12/P010 in system memory. */
         AVFrame *recv_frame = ps->vaapi_active ? ps->hw_frame : ps->video_frame;
         ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
         if (ret == 0) {
-            /* ── VAAPI: transfer GPU surface → system memory P010 ── */
+            /* ── VAAPI: transfer GPU surface → system memory ── */
             if (ps->vaapi_active) {
                 av_frame_unref(ps->video_frame);
-                ps->video_frame->format = AV_PIX_FMT_P010LE;
                 ret = av_hwframe_transfer_data(ps->video_frame, ps->hw_frame, 0);
                 if (ret < 0) {
                     log_msg("ERROR: av_hwframe_transfer_data failed: %s", av_err2str(ret));
@@ -2207,37 +2245,59 @@ void video_display(PlayerState *ps) {
          && !ps->sws_ctx);
 
     if (ps->vaapi_active) {
-        /* ── VAAPI P010 path ──
+        /* ── VAAPI semi-planar path ──
          *
-         * P010 is semi-planar: Y plane (uint16) + interleaved UV plane (UVUV...).
+         * Both NV12 and P010 are semi-planar: Y plane + interleaved UV plane.
+         * NV12: uint8 samples (1 byte each).  P010: uint16 samples (2 bytes each).
          * Deinterleave UV into separate U and V planes on CPU, then upload
-         * all three as R16_UNORM — identical to the yuv420p10le path from
-         * the GPU's perspective.
+         * all three to the matching texture format (R8_UNORM or R16_UNORM).
          *
-         * This is a memory shuffle, not a math operation — every 16-bit
-         * sample value is preserved bit-exact. */
+         * This is a memory shuffle, not a math operation — every sample
+         * value is preserved bit-exact. */
         AVFrame *f = ps->video_frame;
         int uv_stride = f->linesize[1];
 
-        /* Deinterleave UV plane: UVUV... → separate U[], V[] */
-        for (int row = 0; row < ch; row++) {
-            const uint16_t *uv_row = (const uint16_t *)(f->data[1] + row * uv_stride);
-            uint16_t *u_row = (uint16_t *)(ps->p010_u_plane + row * cw * 2);
-            uint16_t *v_row = (uint16_t *)(ps->p010_v_plane + row * cw * 2);
-            for (int x = 0; x < cw; x++) {
-                u_row[x] = uv_row[x * 2];
-                v_row[x] = uv_row[x * 2 + 1];
+        if (ps->vaapi_nv12) {
+            /* NV12: uint8 interleaved UV → separate U[], V[] */
+            for (int row = 0; row < ch; row++) {
+                const uint8_t *uv_row = f->data[1] + row * uv_stride;
+                uint8_t *u_row = ps->p010_u_plane + row * cw;
+                uint8_t *v_row = ps->p010_v_plane + row * cw;
+                for (int x = 0; x < cw; x++) {
+                    u_row[x] = uv_row[x * 2];
+                    v_row[x] = uv_row[x * 2 + 1];
+                }
             }
-        }
 
-        /* Upload Y plane directly from P010 frame */
-        upload_plane(ps->gpu_device, ps->gpu_xfer_y,
-                     f->data[0], f->linesize[0], w * 2, h);
-        /* Upload deinterleaved U and V planes */
-        upload_plane(ps->gpu_device, ps->gpu_xfer_u,
-                     ps->p010_u_plane, cw * 2, cw * 2, ch);
-        upload_plane(ps->gpu_device, ps->gpu_xfer_v,
-                     ps->p010_v_plane, cw * 2, cw * 2, ch);
+            /* Upload Y plane (1 byte/sample) */
+            upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+                         f->data[0], f->linesize[0], w, h);
+            /* Upload deinterleaved U and V planes (1 byte/sample) */
+            upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+                         ps->p010_u_plane, cw, cw, ch);
+            upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+                         ps->p010_v_plane, cw, cw, ch);
+        } else {
+            /* P010: uint16 interleaved UV → separate U[], V[] */
+            for (int row = 0; row < ch; row++) {
+                const uint16_t *uv_row = (const uint16_t *)(f->data[1] + row * uv_stride);
+                uint16_t *u_row = (uint16_t *)(ps->p010_u_plane + row * cw * 2);
+                uint16_t *v_row = (uint16_t *)(ps->p010_v_plane + row * cw * 2);
+                for (int x = 0; x < cw; x++) {
+                    u_row[x] = uv_row[x * 2];
+                    v_row[x] = uv_row[x * 2 + 1];
+                }
+            }
+
+            /* Upload Y plane (2 bytes/sample) */
+            upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+                         f->data[0], f->linesize[0], w * 2, h);
+            /* Upload deinterleaved U and V planes (2 bytes/sample) */
+            upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+                         ps->p010_u_plane, cw * 2, cw * 2, ch);
+            upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+                         ps->p010_v_plane, cw * 2, cw * 2, ch);
+        }
 
     } else if (is_10bit_passthrough) {
         /* 10-bit passthrough — raw frame directly to R16_UNORM textures */
@@ -2655,7 +2715,9 @@ void player_build_debug_info(PlayerState *ps) {
 
         if (ps->vaapi_active) {
             off += snprintf(buf + off, sz - off,
-                "SWS: bypassed (VAAPI P010 → deinterleave → R16_UNORM, %s)\n",
+                "SWS: bypassed (VAAPI %s → deinterleave → %s, %s)\n",
+                ps->vaapi_nv12 ? "NV12" : "P010",
+                ps->vaapi_nv12 ? "R8_UNORM" : "R16_UNORM",
                 is_full_range ? "full" : "limited");
         } else if (is_10bit && !ps->sws_ctx) {
             off += snprintf(buf + off, sz - off,

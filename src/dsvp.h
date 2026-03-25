@@ -119,6 +119,7 @@ typedef struct PlayerState {
     uint8_t            *p010_u_plane;     /* deinterleaved U from P010 UV       */
     uint8_t            *p010_v_plane;     /* deinterleaved V from P010 UV       */
     int                 vaapi_active;     /* 1 = current file uses VAAPI decode */
+    int                 vaapi_nv12;       /* 1 = VAAPI outputs NV12 (8-bit)     */
 
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;
