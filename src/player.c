@@ -2702,7 +2702,17 @@ int decode_thread_func(void *arg) {
             /* Need more packets from the queue */
             AVPacket pkt;
             ret = pq_get(&ps->video_pq, &pkt, 0);
-            if (ret <= 0) break;  /* no packets available */
+            if (ret <= 0) {
+                /* No packets available. If demuxer hit EOF, flush the
+                 * decoder by sending a NULL packet. This triggers drain
+                 * mode: receive_frame will return any buffered frames,
+                 * then AVERROR_EOF when fully drained. */
+                if (ps->eof) {
+                    avcodec_send_packet(ps->video_codec_ctx, NULL);
+                    continue;  /* loop back to receive_frame */
+                }
+                break;  /* not EOF — yield and try again later */
+            }
             avcodec_send_packet(ps->video_codec_ctx, &pkt);
             av_packet_unref(&pkt);
         }
