@@ -1802,10 +1802,10 @@ static int vaapi_zerocopy_validate_vkimage(PlayerState *ps)
     ti.num_levels = 1;
     ti.usage  = SDL_GPU_TEXTUREUSAGE_SAMPLER;
 
-    ti.width = 4; ti.height = 4;
+    ti.width = 16; ti.height = 16;
     SDL_GPUTexture *tex_small = SDL_CreateGPUTexture(ps->gpu_device, &ti);
 
-    ti.width = 16; ti.height = 16;
+    ti.width = 256; ti.height = 256;
     SDL_GPUTexture *tex_large = SDL_CreateGPUTexture(ps->gpu_device, &ti);
 
     if (!tex_small || !tex_large) {
@@ -1852,14 +1852,14 @@ static int vaapi_zerocopy_validate_vkimage(PlayerState *ps)
     if (ok) {
         s_tex_offsets_valid = 1;
         log_msg("ZEROCOPY validate: VkImage at container[+%d][+%d] confirmed "
-                "(4x4=%zu, 16x16=%zu bytes)",
+                "(16x16=%zu, 256x256=%zu bytes)",
                 DSVP_TEX_CONTAINER_TO_ACTIVE, DSVP_TEX_ACTIVE_TO_VKIMAGE,
                 (size_t)req_s.size, (size_t)req_l.size);
         return 0;
     } else {
         log_msg("ZEROCOPY validate: VkImage extraction failed "
-                "(4x4: size=%zu align=%zu bits=0x%x, "
-                "16x16: size=%zu align=%zu bits=0x%x) — readback fallback",
+                "(16x16: size=%zu align=%zu bits=0x%x, "
+                "256x256: size=%zu align=%zu bits=0x%x) — readback fallback",
                 (size_t)req_s.size, (size_t)req_s.alignment, req_s.memoryTypeBits,
                 (size_t)req_l.size, (size_t)req_l.alignment, req_l.memoryTypeBits);
         return -1;
