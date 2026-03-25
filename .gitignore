@@ -4,21 +4,17 @@ build/
 *.exe
 DSVP-portable/
 dsvp/
-
 # Dependencies (downloaded locally, not committed)
 deps/ffmpeg/
-
 # IDE
 .vscode/
 .vscodium/
 *.swp
 *.swo
 *~
-
 # OS
 Thumbs.db
 .DS_Store
-
 # My notes
 WORKING.txt
 *.txt
@@ -27,5 +23,6 @@ dsvp.log
 *.tar.gz
 *.patch
 DSVP_deck-*/
+# Test scripts and logs
 test_*.sh
 test_logs/

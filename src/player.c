@@ -168,7 +168,25 @@ static const char hlsl_yuv_planar_frag[] =
     "    float2 texSizeUV;\n"
     "    float2 chromaOffset;\n"
     "    float frameCount;\n"
-    "    float _pad1;\n"
+    "    float is_hdr;\n"
+    "    float hdr_peak_nits;\n"
+    "    float hdr_gamut;\n"
+    "    float hdr_debug;\n"
+    "    float hdr_target_nits;\n"
+    "    float hdr_midtone_gain;\n"
+    "    float is_dovi;\n"
+    "    float dovi_c0_I;\n"
+    "    float dovi_c0_Ct;\n"
+    "    float dovi_c0_Cp;\n"
+    "    float dovi_c1_I;\n"
+    "    float dovi_c1_Ct;\n"
+    "    float dovi_c1_Cp;\n"
+    "    float4 dovi_ycc_r0;\n"
+    "    float4 dovi_ycc_r1;\n"
+    "    float4 dovi_ycc_r2;\n"
+    "    float4 dovi_out_r0;\n"
+    "    float4 dovi_out_r1;\n"
+    "    float4 dovi_out_r2;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -247,6 +265,33 @@ static const char hlsl_yuv_planar_frag[] =
     "    return (wsum > 0.0) ? result / wsum : 0.0;\n"
     "}\n"
     "\n"
+    "/* PQ EOTF (SMPTE ST 2084 inverse): PQ code values [0,1] → linear\n"
+    " * light [0, 10000] nits. Constants from ITU-R BT.2100. */\n"
+    "float3 pq_eotf(float3 pq) {\n"
+    "    float m1 = 0.1593017578125;\n"      /* 2610/16384 */
+    "    float m2 = 78.84375;\n"              /* 2523/32 * 128 */
+    "    float c1 = 0.8359375;\n"             /* 3424/4096 */
+    "    float c2 = 18.8515625;\n"            /* 2413/128 */
+    "    float c3 = 18.6875;\n"               /* 2392/128 */
+    "    float3 Np = pow(max(pq, 0.0), 1.0 / m2);\n"
+    "    float3 num = max(Np - c1, 0.0);\n"
+    "    float3 den = c2 - c3 * Np;\n"
+    "    return 10000.0 * pow(max(num / den, 0.0), 1.0 / m1);\n"
+    "}\n"
+    "\n"
+    "/* BT.2390 EETF: Hermite spline shoulder rolloff for tone mapping.\n"
+    " * Maps normalized luminance [0,1] through a soft knee at ks,\n"
+    " * compressing highlights to maxLum. Below ks is linear passthrough. */\n"
+    "float bt2390_eetf(float e, float ks, float maxLum) {\n"
+    "    if (e <= ks) return e;\n"
+    "    float t = (e - ks) / (1.0 - ks);\n"
+    "    float t2 = t * t;\n"
+    "    float t3 = t2 * t;\n"
+    "    return (2.0*t3 - 3.0*t2 + 1.0) * ks\n"
+    "         + (t3 - 2.0*t2 + t) * (1.0 - ks)\n"
+    "         + (-2.0*t3 + 3.0*t2) * maxLum;\n"
+    "}\n"
+    "\n"
     "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target0 {\n"
     "    /* Chroma siting: shift UV to actual sample position */\n"
     "    float2 uv_chroma = uv + chromaOffset / texSizeUV;\n"
@@ -260,8 +305,131 @@ static const char hlsl_yuv_planar_frag[] =
     "    cb = (cb - rangeUV.x) * rangeUV.y;\n"
     "    cr = (cr - rangeUV.x) * rangeUV.y;\n"
     "\n"
-    "    float4 yuv = float4(y, cb - 0.5, cr - 0.5, 1.0);\n"
-    "    float3 rgb = mul(colorMatrix, yuv).rgb;\n"
+    "    float3 rgb;\n"
+    "\n"
+    "    if (is_dovi > 0.5) {\n"
+    "        /* ── Dolby Vision decode chain ──\n"
+    "         * Planes contain I/Ct/Cp (IPTPQc2), not standard YCbCr.\n"
+    "         * 1. Reshape: per-component affine (from RPU polynomials)\n"
+    "         * 2. ycc_to_rgb matrix: IPT → PQ-encoded signal\n"
+    "         * 3. PQ EOTF → linear light (nits)\n"
+    "         * 4. Output matrix → BT.2020 linear RGB\n"
+    "         * 5. BT.2390 tone mapping (shared with HDR10 path) */\n"
+    "        float3 ipt = float3(y, cb, cr);\n"
+    "        ipt.x = dovi_c0_I  + dovi_c1_I  * ipt.x;\n"
+    "        ipt.y = dovi_c0_Ct + dovi_c1_Ct * ipt.y;\n"
+    "        ipt.z = dovi_c0_Cp + dovi_c1_Cp * ipt.z;\n"
+    "\n"
+    "        float3 centered = ipt - float3(dovi_ycc_r0.w, dovi_ycc_r1.w, dovi_ycc_r2.w);\n"
+    "        float3 pq_sig;\n"
+    "        pq_sig.r = dot(dovi_ycc_r0.xyz, centered);\n"
+    "        pq_sig.g = dot(dovi_ycc_r1.xyz, centered);\n"
+    "        pq_sig.b = dot(dovi_ycc_r2.xyz, centered);\n"
+    "        pq_sig = saturate(pq_sig);\n"
+    "\n"
+    "        float3 lin = pq_eotf(pq_sig);\n"
+    "        float3 bt2020;\n"
+    "        bt2020.r = dot(dovi_out_r0.xyz, lin);\n"
+    "        bt2020.g = dot(dovi_out_r1.xyz, lin);\n"
+    "        bt2020.b = dot(dovi_out_r2.xyz, lin);\n"
+    "        bt2020 = max(bt2020, 0.0);\n"
+    "\n"
+    "        /* BT.2390 tone mapping — always BT.2020 gamut for DV */\n"
+    "        float3 E = bt2020 / hdr_peak_nits;\n"
+    "        float target = (hdr_debug > 0.5 && hdr_debug < 1.5)\n"
+    "            ? hdr_target_nits + 100.0 : hdr_target_nits;\n"
+    "        float maxLum = target / hdr_peak_nits;\n"
+    "        float ks = max(1.5 * maxLum - 0.5, 0.0);\n"
+    "        float3 lc = float3(0.2627, 0.6780, 0.0593);\n"
+    "        float Y_l = dot(E, lc);\n"
+    "        float Yt = bt2390_eetf(Y_l, ks, maxLum);\n"
+    "        float3 rgb_tm = (Y_l > 0.0) ? E * (Yt / Y_l) : float3(0,0,0);\n"
+    "        rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
+    "\n"
+    "        /* BT.2020→BT.709 gamut matrix */\n"
+    "        float3 r2 = rgb_tm;\n"
+    "        rgb_tm = float3(\n"
+    "             1.6605*r2.r - 0.5877*r2.g - 0.0728*r2.b,\n"
+    "            -0.1246*r2.r + 1.1330*r2.g - 0.0084*r2.b,\n"
+    "            -0.0182*r2.r - 0.1006*r2.g + 1.1187*r2.b);\n"
+    "        rgb_tm = max(rgb_tm, 0.0);\n"
+    "\n"
+    "        if (hdr_midtone_gain > 1.001) {\n"
+    "            float inv = 1.0 / hdr_midtone_gain;\n"
+    "            rgb_tm = float3(pow(rgb_tm.r, inv), pow(rgb_tm.g, inv), pow(rgb_tm.b, inv));\n"
+    "        }\n"
+    "        rgb = float3(\n"
+    "            rgb_tm.r <= 0.0031308 ? 12.92*rgb_tm.r : 1.055*pow(rgb_tm.r, 1.0/2.4) - 0.055,\n"
+    "            rgb_tm.g <= 0.0031308 ? 12.92*rgb_tm.g : 1.055*pow(rgb_tm.g, 1.0/2.4) - 0.055,\n"
+    "            rgb_tm.b <= 0.0031308 ? 12.92*rgb_tm.b : 1.055*pow(rgb_tm.b, 1.0/2.4) - 0.055);\n"
+    "\n"
+    "    } else {\n"
+    "        /* Standard path (SDR + HDR10) */\n"
+    "        float4 yuv = float4(y, cb - 0.5, cr - 0.5, 1.0);\n"
+    "        rgb = mul(colorMatrix, yuv).rgb;\n"
+    "\n"
+    "    /* ── HDR→SDR Tone Mapping (BT.2390 EETF) ──\n"
+    "     * Debug modes (H key): 0=normal, 1=target 300, 2=PQ bypass, 3=luma viz */\n"
+    "    if (is_hdr > 0.5) {\n"
+    "\n"
+    "        /* Mode 2: PQ bypass — raw PQ code values straight to display.\n"
+    "         * Shows what the stream actually contains. If this looks\n"
+    "         * reasonably bright, PQ values are valid and the issue\n"
+    "         * is in tone mapping. If dark, values themselves are wrong. */\n"
+    "        if (hdr_debug > 1.5 && hdr_debug < 2.5) {\n"
+    "            /* rgb already holds PQ code values [0,1] — skip everything */\n"
+    "        }\n"
+    "        /* Mode 3: luminance visualization — EOTF output with sRGB gamma.\n"
+    "         * Grayscale showing actual nit distribution in the frame. */\n"
+    "        else if (hdr_debug > 2.5) {\n"
+    "            float3 lin = pq_eotf(rgb);\n"
+    "            float lum = lin.r * 0.2627 + lin.g * 0.6780 + lin.b * 0.0593;\n"
+    "            float v = lum / hdr_peak_nits;\n"
+    "            v = (v <= 0.0031308) ? 12.92*v : 1.055*pow(v, 1.0/2.4) - 0.055;\n"
+    "            rgb = float3(v, v, v);\n"
+    "        }\n"
+    "        else {\n"
+    "            float3 lin = pq_eotf(rgb);\n"
+    "            float3 E = lin / hdr_peak_nits;\n"
+    "\n"
+    "            /* Target comes from T-key toggle (203/300/400 nits).\n"
+    "             * Debug mode 1: override to target+100 for comparison. */\n"
+    "            float target = (hdr_debug > 0.5 && hdr_debug < 1.5)\n"
+    "                ? hdr_target_nits + 100.0 : hdr_target_nits;\n"
+    "            float maxLum = target / hdr_peak_nits;\n"
+    "            float ks = max(1.5 * maxLum - 0.5, 0.0);\n"
+    "\n"
+    "            float3 lc = (hdr_gamut > 0.5)\n"
+    "                ? float3(0.2627, 0.6780, 0.0593)\n"
+    "                : float3(0.2126, 0.7152, 0.0722);\n"
+    "            float Y = dot(E, lc);\n"
+    "            float Yt = bt2390_eetf(Y, ks, maxLum);\n"
+    "            float3 rgb_tm = (Y > 0.0) ? E * (Yt / Y) : float3(0,0,0);\n"
+    "\n"
+    "            rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
+    "\n"
+    "            if (hdr_gamut > 0.5) {\n"
+    "                float3 r2 = rgb_tm;\n"
+    "                rgb_tm = float3(\n"
+    "                     1.6605*r2.r - 0.5877*r2.g - 0.0728*r2.b,\n"
+    "                    -0.1246*r2.r + 1.1330*r2.g - 0.0084*r2.b,\n"
+    "                    -0.0182*r2.r - 0.1006*r2.g + 1.1187*r2.b);\n"
+    "                rgb_tm = max(rgb_tm, 0.0);\n"
+    "            }\n"
+    "\n"
+    "\n"
+    "            rgb_tm = max(rgb_tm, 0.0);\n"
+    "            if (hdr_midtone_gain > 1.001) {\n"
+    "                float inv = 1.0 / hdr_midtone_gain;\n"
+    "                rgb_tm = float3(pow(rgb_tm.r, inv), pow(rgb_tm.g, inv), pow(rgb_tm.b, inv));\n"
+    "            }\n"
+    "            rgb = float3(\n"
+    "                rgb_tm.r <= 0.0031308 ? 12.92*rgb_tm.r : 1.055*pow(rgb_tm.r, 1.0/2.4) - 0.055,\n"
+    "                rgb_tm.g <= 0.0031308 ? 12.92*rgb_tm.g : 1.055*pow(rgb_tm.g, 1.0/2.4) - 0.055,\n"
+    "                rgb_tm.b <= 0.0031308 ? 12.92*rgb_tm.b : 1.055*pow(rgb_tm.b, 1.0/2.4) - 0.055);\n"
+    "        }\n"
+    "    }\n"
+    "    } /* end else (standard path) */\n"
     "\n"
     "    /* Blue noise dither: ±0.5 LSB in 8-bit (±1/510 in [0,1]).\n"
     "     * 64x64 void-and-cluster texture, tiled via frac(). Temporal\n"
@@ -424,6 +592,7 @@ int gpu_create_pipelines(PlayerState *ps) {
         SDL_ReleaseGPUShader(ps->gpu_device, vert);
         return -1;
     }
+    log_msg("GPU: swapchain format = %d", (int)color_desc.format);
     log_msg("GPU: YUV planar pipeline created");
 
     /* Vertex shader done — safe to release now */
@@ -735,17 +904,24 @@ static void gpu_destroy_video_textures(PlayerState *ps) {
  */
 
 static void gpu_setup_uniforms(PlayerState *ps) {
-    /* Determine colorspace from metadata or resolution heuristic */
-    int is_bt709 = (ps->vid_h >= 720);
+    /* Determine YCbCr matrix from metadata or resolution heuristic.
+     * Three standards: BT.601 (SD), BT.709 (HD), BT.2020 NCL (UHD/HDR).
+     * color_space tag is authoritative; resolution heuristic is fallback. */
+    int colorspace = (ps->vid_h >= 720) ? 709 : 601;
     if (ps->fmt_ctx) {
         AVCodecParameters *par =
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
         if (par->color_space == AVCOL_SPC_BT709)
-            is_bt709 = 1;
+            colorspace = 709;
         else if (par->color_space == AVCOL_SPC_BT470BG ||
                  par->color_space == AVCOL_SPC_SMPTE170M)
-            is_bt709 = 0;
+            colorspace = 601;
+        else if (par->color_space == AVCOL_SPC_BT2020_NCL)
+            colorspace = 2020;
     }
+
+    const char *cs_name = (colorspace == 2020) ? "BT.2020"
+                        : (colorspace == 709)  ? "BT.709" : "BT.601";
 
     /* ── Range parameters ──
      *
@@ -845,8 +1021,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, 10-bit %s range → shader)",
-                is_bt709 ? "BT.709" : "BT.601",
-                is_full_range ? "full" : "limited");
+                cs_name, is_full_range ? "full" : "limited");
 
     } else if (is_8bit_passthrough) {
         /* 8-bit YUV420P passthrough — range correction in shader.
@@ -864,8 +1039,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, 8-bit %s range → shader)",
-                is_bt709 ? "BT.709" : "BT.601",
-                is_full_range ? "full" : "limited");
+                cs_name, is_full_range ? "full" : "limited");
 
     } else {
         /* swscale fallback — outputs full-range YUV420P, identity range */
@@ -875,7 +1049,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         ps->gpu_uniforms.rangeUV[1] = 1.0f;
 
         log_msg("GPU: uniforms set (%s, full range via swscale)",
-                is_bt709 ? "BT.709" : "BT.601");
+                cs_name);
     }
 
     /* Color matrix: row-major (matches HLSL row_major qualifier).
@@ -888,7 +1062,12 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     float *m = ps->gpu_uniforms.colorMatrix;
     memset(m, 0, 16 * sizeof(float));
 
-    if (is_bt709) {
+    if (colorspace == 2020) {
+        /* BT.2020 NCL: Kr=0.2627, Kb=0.0593 */
+        m[ 0] = 1.0f;  m[ 1] =  0.0f;     m[ 2] =  1.4746f;  /* R */
+        m[ 4] = 1.0f;  m[ 5] = -0.1646f;  m[ 6] = -0.5714f;  /* G */
+        m[ 8] = 1.0f;  m[ 9] =  1.8814f;  m[10] =  0.0f;     /* B */
+    } else if (colorspace == 709) {
         /* BT.709: Kr=0.2126, Kb=0.0722 */
         m[ 0] = 1.0f;  m[ 1] =  0.0f;     m[ 2] =  1.5748f;  /* R */
         m[ 4] = 1.0f;  m[ 5] = -0.1873f;  m[ 6] = -0.4681f;  /* G */
@@ -960,7 +1139,209 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     }
 
     ps->gpu_uniforms.frameCount = 0.0f;
-    ps->gpu_uniforms._pad1 = 0.0f;
+
+    /* ── HDR Detection & Metadata ──
+     *
+     * HDR detection priority (per industry consensus — mpv, MPC, VLC):
+     *   1. color_trc == SMPTE2084 (PQ) — catches all HDR10 content
+     *   2. DOVI_CONF in coded_side_data — catches DV P5 where color_trc
+     *      is often UNSPECIFIED
+     *   3. color_trc == ARIB_STD_B67 (HLG) — flagged but not processed yet
+     *
+     * Primaries classification (separate from HDR detection):
+     *   - color_primaries == BT2020 → true BT.2020, needs gamut mapping
+     *   - DV P5 with UNSPECIFIED primaries → base layer is BT.709 PQ
+     *     (RPU would transform to BT.2020, but we don't process RPU)
+     *
+     * Peak luminance priority:
+     *   1. MaxCLL from content light level metadata
+     *   2. max_luminance from mastering display metadata
+     *   3. 1000 nit fallback (standard for most HDR10 content)
+     */
+    int is_hdr = 0;
+    int is_dolby_vision = 0;
+    int has_pq_transfer = 0;
+    float peak_nits = 0.0f;
+    int has_bt2020_primaries = 0;
+
+    if (ps->fmt_ctx) {
+        AVCodecParameters *par =
+            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+
+        /* --- Transfer function check --- */
+        if (par->color_trc == AVCOL_TRC_SMPTE2084) {
+            is_hdr = 1;
+            has_pq_transfer = 1;
+            log_msg("HDR: detected PQ transfer (SMPTE ST 2084)");
+        } else if (par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+            /* HLG — flag for future support, don't activate HDR path yet */
+            log_msg("HDR: detected HLG transfer (not yet processed)");
+        }
+
+        /* --- Dolby Vision fallback (DV P5 often has UNSPECIFIED trc) --- */
+        int dv_profile = -1;
+        const AVPacketSideData *dovi_sd = av_packet_side_data_get(
+            par->coded_side_data, par->nb_coded_side_data,
+            AV_PKT_DATA_DOVI_CONF);
+        if (dovi_sd) {
+            const AVDOVIDecoderConfigurationRecord *cfg =
+                (const AVDOVIDecoderConfigurationRecord *)dovi_sd->data;
+            dv_profile = cfg->dv_profile;
+            is_dolby_vision = 1;
+            if (!is_hdr) {
+                is_hdr = 1;
+                log_msg("HDR: detected Dolby Vision Profile %d (DOVI conf in stream)",
+                        dv_profile);
+            } else {
+                log_msg("HDR: Dolby Vision Profile %d metadata also present",
+                        dv_profile);
+            }
+        }
+
+        /* --- Primaries classification --- */
+        if (par->color_primaries == AVCOL_PRI_BT2020) {
+            has_bt2020_primaries = 1;
+        }
+
+        /* --- Static metadata: peak luminance --- */
+        const AVPacketSideData *cll_sd = av_packet_side_data_get(
+            par->coded_side_data, par->nb_coded_side_data,
+            AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+        if (cll_sd && cll_sd->size >= (int)sizeof(AVContentLightMetadata)) {
+            const AVContentLightMetadata *cll =
+                (const AVContentLightMetadata *)cll_sd->data;
+            if (cll->MaxCLL > 0) {
+                peak_nits = (float)cll->MaxCLL;
+                log_msg("HDR: MaxCLL=%u nits, MaxFALL=%u nits",
+                        cll->MaxCLL, cll->MaxFALL);
+            }
+        }
+
+        if (peak_nits == 0.0f) {
+            const AVPacketSideData *mdm_sd = av_packet_side_data_get(
+                par->coded_side_data, par->nb_coded_side_data,
+                AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            if (mdm_sd && mdm_sd->size >= (int)sizeof(AVMasteringDisplayMetadata)) {
+                const AVMasteringDisplayMetadata *mdm =
+                    (const AVMasteringDisplayMetadata *)mdm_sd->data;
+                if (mdm->has_luminance) {
+                    double max_lum = av_q2d(mdm->max_luminance);
+                    if (max_lum > 0.0) {
+                        peak_nits = (float)max_lum;
+                        log_msg("HDR: mastering display max=%.0f nits, min=%.4f nits",
+                                max_lum, av_q2d(mdm->min_luminance));
+                    }
+                }
+                if (mdm->has_primaries) {
+                    log_msg("HDR: mastering primaries: "
+                            "R(%.4f,%.4f) G(%.4f,%.4f) B(%.4f,%.4f) WP(%.4f,%.4f)",
+                            av_q2d(mdm->display_primaries[0][0]),
+                            av_q2d(mdm->display_primaries[0][1]),
+                            av_q2d(mdm->display_primaries[1][0]),
+                            av_q2d(mdm->display_primaries[1][1]),
+                            av_q2d(mdm->display_primaries[2][0]),
+                            av_q2d(mdm->display_primaries[2][1]),
+                            av_q2d(mdm->white_point[0]),
+                            av_q2d(mdm->white_point[1]));
+                }
+            }
+        }
+
+        /* Fallback: no metadata → 1000 nits (standard HDR10 assumption) */
+        if (is_hdr && peak_nits == 0.0f) {
+            peak_nits = 1000.0f;
+            log_msg("HDR: no luminance metadata — using 1000 nit fallback");
+        }
+
+        /* DV P5 base layer is full-range by spec (IPTPQc2).
+         * Range override applied after HDR detection completes. */
+        if (dv_profile == 5) {
+            log_msg("HDR: DV Profile 5 detected — full-range override pending");
+        }
+    }
+
+    /* Gamut classification for the shader:
+     * - DV P5: output after DV reshaping is BT.2020 (always)
+     * - HDR10 with BT.2020 primaries: needs gamut mapping in tone map.
+     * - DV P5 without explicit BT.2020 primaries: DV decode handles gamut. */
+    float hdr_gamut = 0.0f; /* 0.0 = BT.709 primaries */
+    int is_dovi_active = 0;
+    if (is_hdr && is_dolby_vision && !has_pq_transfer) {
+        /* DV-only (no PQ transfer tag, e.g. Profile 5):
+         * Base layer is IPTPQc2 — needs DV reshaping pipeline.
+         * The DV decode chain outputs BT.2020, so set gamut accordingly.
+         * DV uniforms will be populated from first decoded frame's RPU. */
+        is_dovi_active = 1;
+        hdr_gamut = 1.0f;
+        log_msg("HDR: Dolby Vision Profile 5 — DV reshape pipeline active");
+    } else if (is_hdr && has_bt2020_primaries) {
+        hdr_gamut = 1.0f;   /* 1.0 = BT.2020 primaries */
+    }
+
+    ps->gpu_uniforms.is_hdr        = is_hdr ? 1.0f : 0.0f;
+    ps->gpu_uniforms.hdr_peak_nits = peak_nits;
+    ps->gpu_uniforms.hdr_gamut     = hdr_gamut;
+    ps->gpu_uniforms.hdr_debug     = 0.0f;
+    ps->gpu_uniforms.is_dovi       = is_dovi_active ? 1.0f : 0.0f;
+
+    /* DV P5 range override: container says limited but IPTPQc2 is full-range.
+     * Must happen after normal range setup since it overrides those values. */
+    if (is_dovi_active) {
+        ps->gpu_uniforms.rangeY[0]  = 0.0f;
+        ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
+        ps->gpu_uniforms.rangeUV[0] = 0.0f;
+        ps->gpu_uniforms.rangeUV[1] = 65535.0f / 1023.0f;
+        log_msg("GPU: DV P5 — range overridden to full-range 10-bit");
+    }
+
+    /* Initialize DV uniforms to identity (populated from first frame RPU) */
+    if (is_dovi_active) {
+        /* Identity reshape: out = 0.0 + 1.0 * in */
+        ps->gpu_uniforms.dovi_c0_I  = 0.0f;
+        ps->gpu_uniforms.dovi_c0_Ct = 0.0f;
+        ps->gpu_uniforms.dovi_c0_Cp = 0.0f;
+        ps->gpu_uniforms.dovi_c1_I  = 1.0f;
+        ps->gpu_uniforms.dovi_c1_Ct = 1.0f;
+        ps->gpu_uniforms.dovi_c1_Cp = 1.0f;
+        /* Identity matrices (will be overwritten by first frame) */
+        memset(ps->gpu_uniforms.dovi_ycc_r0, 0, 4 * sizeof(float));
+        memset(ps->gpu_uniforms.dovi_ycc_r1, 0, 4 * sizeof(float));
+        memset(ps->gpu_uniforms.dovi_ycc_r2, 0, 4 * sizeof(float));
+        ps->gpu_uniforms.dovi_ycc_r0[0] = 1.0f;
+        ps->gpu_uniforms.dovi_ycc_r1[1] = 1.0f;
+        ps->gpu_uniforms.dovi_ycc_r2[2] = 1.0f;
+        memset(ps->gpu_uniforms.dovi_out_r0, 0, 4 * sizeof(float));
+        memset(ps->gpu_uniforms.dovi_out_r1, 0, 4 * sizeof(float));
+        memset(ps->gpu_uniforms.dovi_out_r2, 0, 4 * sizeof(float));
+        ps->gpu_uniforms.dovi_out_r0[0] = 1.0f;
+        ps->gpu_uniforms.dovi_out_r1[1] = 1.0f;
+        ps->gpu_uniforms.dovi_out_r2[2] = 1.0f;
+    }
+
+    /* SDR target nits — preserved across file opens (N key cycles).
+     * Only initialize to default if not already set by a previous file. */
+    if (ps->gpu_uniforms.hdr_target_nits < 1.0f)
+        ps->gpu_uniforms.hdr_target_nits = 203.0f;
+
+    /* Save static peak as ceiling for dynamic detection.
+     * Initialize smoothing state — first frame will set the actual peak. */
+    ps->hdr_static_peak      = peak_nits;
+    ps->hdr_smoothed_peak    = 0.0f;   /* 0 = uninitialized, first frame jumps */
+    ps->hdr_prev_frame_peak  = 0.0f;
+    ps->dovi_metadata_logged = 0;
+
+    if (is_hdr) {
+        float target = ps->gpu_uniforms.hdr_target_nits;
+        float maxLum = target / peak_nits;
+        float ks = 1.5f * maxLum - 0.5f;
+        if (ks < 0.0f) ks = 0.0f;
+        log_msg("GPU: HDR→SDR tone mapping active (peak=%.0f nits, target=%.0f nits, gamut=%s%s)",
+                peak_nits, target,
+                has_bt2020_primaries ? "BT.2020" : "BT.709",
+                is_dolby_vision ? ", Dolby Vision" : "");
+        log_msg("HDR: BT.2390 EETF (target=%.0f nits, KS=%.3f, maxLum=%.4f)",
+                target, ks, maxLum);
+    }
 
     static const char *chroma_names[] = {
         "unspecified", "left", "center", "top-left",
@@ -1331,13 +1712,27 @@ int player_open(PlayerState *ps, const char *filename) {
     /* ── Open video decoder ── */
     {
         AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
-        const AVCodec *codec = avcodec_find_decoder(vs->codecpar->codec_id);
+        const AVCodec *codec = NULL;
+
+        /* FFmpeg 8.1's generic 'av1' decoder probes for hardware accel
+         * first and fails catastrophically on systems without AV1 HW
+         * decode (spams "Failed to get pixel format", zero frames output).
+         * Force libdav1d — it's pure software, always works, and is the
+         * reference AV1 decoder. */
+        if (vs->codecpar->codec_id == AV_CODEC_ID_AV1) {
+            codec = avcodec_find_decoder_by_name("libdav1d");
+            if (codec)
+                log_msg("Video codec: libdav1d forced for AV1 (avoiding hw probe)");
+        }
+        if (!codec)
+            codec = avcodec_find_decoder(vs->codecpar->codec_id);
         if (!codec) {
             log_msg("ERROR: Unsupported video codec id=%d", vs->codecpar->codec_id);
             avformat_close_input(&ps->fmt_ctx);
             return -1;
         }
-        log_msg("Video codec: %s (%s)", codec->name, codec->long_name);
+        if (vs->codecpar->codec_id != AV_CODEC_ID_AV1)
+            log_msg("Video codec: %s (%s)", codec->name, codec->long_name);
 
         ps->video_codec_ctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
@@ -1421,6 +1816,7 @@ int player_open(PlayerState *ps, const char *filename) {
             ps->video_codec_ctx->thread_count = tcount;
             ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
         }
+
 
         ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
         if (ret < 0) {
@@ -2217,6 +2613,484 @@ static void upload_plane(
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════
+ * HDR Dynamic Peak Detection (Layer 1 — CPU histogram scan)
+ *
+ * Builds a 256-bin histogram of Y plane values per frame, reads off
+ * the 99.875th percentile, converts to nits via PQ EOTF, and applies
+ * temporal smoothing. Using a percentile instead of max avoids
+ * specular highlights (sun glints, lamp reflections) inflating the
+ * peak, which would cause BT.2390 to over-compress midtones.
+ *
+ * 99.875th percentile (skip top 0.125%) matches the spirit of
+ * libplacebo/mpv's approach (default 99.995, user-tunable).
+ * We use a slightly more aggressive value to better handle older
+ * film content with occasional bright hotspots.
+ *
+ * Layer 2 will move this to a GPU compute shader for zero CPU cost.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* PQ EOTF (SMPTE ST 2084): PQ code value [0,1] → linear nits [0,10000].
+ * Scalar version of the shader's pq_eotf() for CPU-side use. */
+static float pq_eotf_scalar(float pq) {
+    const float m1 = 0.1593017578125f;   /* 2610/16384 */
+    const float m2 = 78.84375f;          /* 2523/32 * 128 */
+    const float c1 = 0.8359375f;         /* 3424/4096 */
+    const float c2 = 18.8515625f;        /* 2413/128 */
+    const float c3 = 18.6875f;           /* 2392/128 */
+
+    float Np  = powf(fmaxf(pq, 0.0f), 1.0f / m2);
+    float num = fmaxf(Np - c1, 0.0f);
+    float den = c2 - c3 * Np;
+    return 10000.0f * powf(fmaxf(num / den, 0.0f), 1.0f / m1);
+}
+
+/* Temporal smoothing parameters.
+ * Fast attack (bright → brighter): adapt quickly so highlights aren't clipped.
+ * Slow decay (bright → darker): prevent flickering from fading highlights.
+ * Scene cut: jump immediately on large changes. */
+/* ── Dolby Vision RPU Metadata Extraction ──
+ *
+ * FFmpeg's HEVC decoder parses DV RPU NALs and attaches parsed metadata
+ * as AV_FRAME_DATA_DOVI_METADATA side data on each decoded frame.
+ * This function extracts and logs that metadata so we can understand
+ * the reshaping curves and color matrices needed for shader implementation.
+ *
+ * DV Profile 5 stores data in IPTPQc2 color space, not standard YCbCr.
+ * The RPU contains per-component piecewise polynomial (or MMR) reshaping
+ * curves that transform from the encoded IPTPQc2 signal back to standard
+ * PQ-encoded BT.2020 RGB, plus color matrices for the conversion chain. */
+static void dovi_log_frame_metadata(PlayerState *ps, const AVFrame *frame)
+{
+    /* Only log once per file open (first frame with DV metadata) */
+    if (ps->dovi_metadata_logged) return;
+
+    /* Check for raw RPU buffer first (always present if DV) */
+    const AVFrameSideData *rpu_sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+    if (rpu_sd) {
+        log_msg("DOVI: raw RPU buffer present (%d bytes)", rpu_sd->size);
+    }
+
+    /* Check for parsed metadata (what we actually need) */
+    const AVFrameSideData *sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+    if (!sd) {
+        if (rpu_sd) {
+            log_msg("DOVI: WARNING — raw RPU present but parsed "
+                    "AV_FRAME_DATA_DOVI_METADATA missing! "
+                    "FFmpeg may not be parsing this profile.");
+        }
+        /* No DV metadata on this frame — not a DV file or decoder
+         * doesn't expose it. Will retry next frame. */
+        return;
+    }
+
+    ps->dovi_metadata_logged = 1;
+    const AVDOVIMetadata *dovi = (const AVDOVIMetadata *)sd->data;
+
+    /* ── RPU Header ── */
+    const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(dovi);
+    log_msg("DOVI RPU header: rpu_type=%u, rpu_format=%u, "
+            "vdr_rpu_profile=%u, vdr_rpu_level=%u",
+            hdr->rpu_type, hdr->rpu_format,
+            hdr->vdr_rpu_profile, hdr->vdr_rpu_level);
+    log_msg("DOVI RPU header: coef_data_type=%u, coef_log2_denom=%u, "
+            "bl_video_full_range=%u, bl_bit_depth=%u, el_bit_depth=%u, "
+            "vdr_bit_depth=%u",
+            hdr->coef_data_type, hdr->coef_log2_denom,
+            hdr->bl_video_full_range_flag, hdr->bl_bit_depth,
+            hdr->el_bit_depth, hdr->vdr_bit_depth);
+    log_msg("DOVI RPU header: disable_residual=%u, "
+            "spatial_resampling=%u, el_spatial_resampling=%u",
+            hdr->disable_residual_flag,
+            hdr->spatial_resampling_filter_flag,
+            hdr->el_spatial_resampling_filter_flag);
+
+    /* ── Data Mapping (reshaping curves) ── */
+    const AVDOVIDataMapping *mapping = av_dovi_get_mapping(dovi);
+    log_msg("DOVI mapping: vdr_rpu_id=%u, mapping_color_space=%u, "
+            "mapping_chroma_format=%u, nlq_method=%d",
+            mapping->vdr_rpu_id, mapping->mapping_color_space,
+            mapping->mapping_chroma_format_idc, mapping->nlq_method_idc);
+
+    double coef_scale = (double)(1LL << hdr->coef_log2_denom);
+    const char *comp_names[] = { "I/Y", "Ct/Cb", "Cp/Cr" };
+
+    for (int c = 0; c < 3; c++) {
+        const AVDOVIReshapingCurve *curve = &mapping->curves[c];
+        log_msg("DOVI reshape [%s]: num_pivots=%u",
+                comp_names[c], curve->num_pivots);
+
+        /* Log pivot values */
+        char pivot_str[256] = "";
+        int pos = 0;
+        for (int i = 0; i < curve->num_pivots && i < AV_DOVI_MAX_PIECES + 1; i++) {
+            pos += snprintf(pivot_str + pos, sizeof(pivot_str) - pos,
+                           "%s%u", i ? "," : "", curve->pivots[i]);
+        }
+        log_msg("DOVI reshape [%s]: pivots=[%s]", comp_names[c], pivot_str);
+
+        /* Log each piece */
+        int num_pieces = curve->num_pivots - 1;
+        for (int p = 0; p < num_pieces && p < AV_DOVI_MAX_PIECES; p++) {
+            if (curve->mapping_idc[p] == AV_DOVI_MAPPING_POLYNOMIAL) {
+                int order = curve->poly_order[p];
+                double c0 = (double)curve->poly_coef[p][0] / coef_scale;
+                double c1 = (double)curve->poly_coef[p][1] / coef_scale;
+                double c2 = (order >= 2)
+                    ? (double)curve->poly_coef[p][2] / coef_scale : 0.0;
+                log_msg("DOVI reshape [%s] piece %d: POLY order=%d "
+                        "range=[%u,%u] coef=[%.6f, %.6f, %.6f]",
+                        comp_names[c], p, order,
+                        curve->pivots[p], curve->pivots[p + 1],
+                        c0, c1, c2);
+            } else if (curve->mapping_idc[p] == AV_DOVI_MAPPING_MMR) {
+                log_msg("DOVI reshape [%s] piece %d: MMR order=%d "
+                        "range=[%u,%u] constant=%.6f",
+                        comp_names[c], p, curve->mmr_order[p],
+                        curve->pivots[p], curve->pivots[p + 1],
+                        (double)curve->mmr_constant[p] / coef_scale);
+                /* Log MMR coefficient matrix for each order */
+                for (int o = 0; o < curve->mmr_order[p] && o < 3; o++) {
+                    log_msg("DOVI reshape [%s] piece %d: MMR[%d] "
+                            "coef=[%.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f]",
+                            comp_names[c], p, o + 1,
+                            (double)curve->mmr_coef[p][o][0] / coef_scale,
+                            (double)curve->mmr_coef[p][o][1] / coef_scale,
+                            (double)curve->mmr_coef[p][o][2] / coef_scale,
+                            (double)curve->mmr_coef[p][o][3] / coef_scale,
+                            (double)curve->mmr_coef[p][o][4] / coef_scale,
+                            (double)curve->mmr_coef[p][o][5] / coef_scale,
+                            (double)curve->mmr_coef[p][o][6] / coef_scale);
+                }
+            }
+        }
+    }
+
+    /* ── NLQ parameters (if present) ── */
+    if (mapping->nlq_method_idc != AV_DOVI_NLQ_NONE) {
+        for (int c = 0; c < 3; c++) {
+            log_msg("DOVI NLQ [%s]: offset=%u, vdr_in_max=%llu, "
+                    "dz_slope=%llu, dz_threshold=%llu",
+                    comp_names[c],
+                    mapping->nlq[c].nlq_offset,
+                    (unsigned long long)mapping->nlq[c].vdr_in_max,
+                    (unsigned long long)mapping->nlq[c].linear_deadzone_slope,
+                    (unsigned long long)mapping->nlq[c].linear_deadzone_threshold);
+        }
+    }
+
+    /* ── Color Metadata ── */
+    const AVDOVIColorMetadata *color = av_dovi_get_color(dovi);
+    log_msg("DOVI color: dm_metadata_id=%u, scene_refresh=%u, "
+            "signal_eotf=%u, signal_bit_depth=%u, signal_color_space=%u, "
+            "signal_full_range=%u",
+            color->dm_metadata_id, color->scene_refresh_flag,
+            color->signal_eotf, color->signal_bit_depth,
+            color->signal_color_space, color->signal_full_range_flag);
+    log_msg("DOVI color: source_min_pq=%u, source_max_pq=%u, "
+            "source_diagonal=%u",
+            color->source_min_pq, color->source_max_pq,
+            color->source_diagonal);
+
+    /* YCC→RGB matrix (applied before PQ linearization) */
+    log_msg("DOVI ycc_to_rgb_matrix:");
+    for (int row = 0; row < 3; row++) {
+        log_msg("  [%.6f  %.6f  %.6f]  offset=%.6f",
+                av_q2d(color->ycc_to_rgb_matrix[row * 3 + 0]),
+                av_q2d(color->ycc_to_rgb_matrix[row * 3 + 1]),
+                av_q2d(color->ycc_to_rgb_matrix[row * 3 + 2]),
+                av_q2d(color->ycc_to_rgb_offset[row]));
+    }
+
+    /* RGB→LMS matrix (applied after PQ linearization) */
+    log_msg("DOVI rgb_to_lms_matrix:");
+    for (int row = 0; row < 3; row++) {
+        log_msg("  [%.6f  %.6f  %.6f]",
+                av_q2d(color->rgb_to_lms_matrix[row * 3 + 0]),
+                av_q2d(color->rgb_to_lms_matrix[row * 3 + 1]),
+                av_q2d(color->rgb_to_lms_matrix[row * 3 + 2]));
+    }
+}
+
+/* ── Dolby Vision Uniform Population ──
+ *
+ * Extracts reshape coefficients and color matrices from the DV RPU
+ * metadata on the first decoded frame and populates the GPU uniforms.
+ *
+ * The DV decode chain in the shader is:
+ *   1. Reshape: affine per-component (poly_coef from RPU)
+ *   2. ycc_to_rgb_matrix: ICtCp → PQ-encoded signal (with offsets)
+ *   3. PQ EOTF → linear light
+ *   4. Output matrix: precomputed (cone_inv × rgb_to_lms) → BT.2020 linear
+ *
+ * The ICtCp "cone" matrix (BT.2020 RGB → LMS, from ITU-R BT.2100):
+ *   [1688/4096  2146/4096   262/4096]
+ *   [ 683/4096  2951/4096   462/4096]
+ *   [  99/4096   309/4096  3688/4096]
+ *
+ * Its inverse (LMS → BT.2020 linear RGB) is precomputed and multiplied
+ * with rgb_to_lms on the CPU to save a shader matrix multiply. */
+
+/* BT.2100 ICtCp inverse cone matrix (LMS → BT.2020 linear RGB) */
+static const double ictcp_lms_to_bt2020[3][3] = {
+    {  3.43661,  -2.50645,   0.06985 },
+    { -0.79133,   1.98360,  -0.19227 },
+    { -0.02595,  -0.09891,   1.12486 },
+};
+
+static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
+{
+    if (ps->gpu_uniforms.is_dovi < 0.5f) return;
+    if (ps->dovi_metadata_logged != 1) return; /* wait for logging pass */
+
+    /* Only populate once — dovi_metadata_logged transitions 1 → 2 */
+    const AVFrameSideData *sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+    if (!sd) return;
+
+    const AVDOVIMetadata *dovi = (const AVDOVIMetadata *)sd->data;
+    const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(dovi);
+    const AVDOVIDataMapping *mapping = av_dovi_get_mapping(dovi);
+    const AVDOVIColorMetadata *color = av_dovi_get_color(dovi);
+
+    double coef_scale = (double)(1LL << hdr->coef_log2_denom);
+
+    /* ── Reshape coefficients (first piece, representative) ──
+     * For DV P5 streaming, all pieces typically have identical coefficients.
+     * Using first piece covers this case. Multi-piece piecewise support
+     * would require uploading pivot arrays + per-piece coefficients. */
+    for (int c = 0; c < 3; c++) {
+        const AVDOVIReshapingCurve *curve = &mapping->curves[c];
+        double c0 = 0.0, c1 = 1.0;
+        if (curve->num_pivots >= 2 &&
+            curve->mapping_idc[0] == AV_DOVI_MAPPING_POLYNOMIAL) {
+            c0 = (double)curve->poly_coef[0][0] / coef_scale;
+            c1 = (double)curve->poly_coef[0][1] / coef_scale;
+        }
+        switch (c) {
+            case 0: ps->gpu_uniforms.dovi_c0_I  = (float)c0;
+                    ps->gpu_uniforms.dovi_c1_I  = (float)c1; break;
+            case 1: ps->gpu_uniforms.dovi_c0_Ct = (float)c0;
+                    ps->gpu_uniforms.dovi_c1_Ct = (float)c1; break;
+            case 2: ps->gpu_uniforms.dovi_c0_Cp = (float)c0;
+                    ps->gpu_uniforms.dovi_c1_Cp = (float)c1; break;
+        }
+    }
+
+    /* ── ycc_to_rgb matrix + offsets → packed as float4 rows ──
+     * Row format: [m0, m1, m2, offset] */
+    for (int row = 0; row < 3; row++) {
+        float *dst;
+        switch (row) {
+            case 0: dst = ps->gpu_uniforms.dovi_ycc_r0; break;
+            case 1: dst = ps->gpu_uniforms.dovi_ycc_r1; break;
+            default: dst = ps->gpu_uniforms.dovi_ycc_r2; break;
+        }
+        dst[0] = (float)av_q2d(color->ycc_to_rgb_matrix[row * 3 + 0]);
+        dst[1] = (float)av_q2d(color->ycc_to_rgb_matrix[row * 3 + 1]);
+        dst[2] = (float)av_q2d(color->ycc_to_rgb_matrix[row * 3 + 2]);
+        dst[3] = (float)av_q2d(color->ycc_to_rgb_offset[row]);
+    }
+
+    /* ── Output matrix: precompute cone_inv × rgb_to_lms ──
+     * Saves one 3×3 matmul per pixel in the shader. */
+    double lms[3][3];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            lms[r][c] = av_q2d(color->rgb_to_lms_matrix[r * 3 + c]);
+
+    for (int i = 0; i < 3; i++) {
+        float *dst;
+        switch (i) {
+            case 0: dst = ps->gpu_uniforms.dovi_out_r0; break;
+            case 1: dst = ps->gpu_uniforms.dovi_out_r1; break;
+            default: dst = ps->gpu_uniforms.dovi_out_r2; break;
+        }
+        for (int j = 0; j < 3; j++) {
+            double sum = 0.0;
+            for (int k = 0; k < 3; k++)
+                sum += ictcp_lms_to_bt2020[i][k] * lms[k][j];
+            dst[j] = (float)sum;
+        }
+        dst[3] = 0.0f;
+    }
+
+    /* ── Peak nits from DV source_max_pq ──
+     * More accurate than the 1000 nit fallback — DV RPU knows the actual
+     * mastering peak. PQ code in 12-bit domain [0, 4095]. */
+    if (color->source_max_pq > 0) {
+        float pq_norm = (float)color->source_max_pq / 4095.0f;
+        float dv_peak = pq_eotf_scalar(pq_norm);
+        if (dv_peak > 100.0f) {
+            ps->gpu_uniforms.hdr_peak_nits = dv_peak;
+            ps->hdr_static_peak = dv_peak;
+            log_msg("DOVI: source_max_pq=%u → peak=%.0f nits (overriding fallback)",
+                    color->source_max_pq, dv_peak);
+        }
+    }
+
+    /* Log the computed output matrix for debugging */
+    log_msg("DOVI: uniforms populated — reshape c0=[%.4f,%.4f,%.4f] c1=[%.4f,%.4f,%.4f]",
+            ps->gpu_uniforms.dovi_c0_I, ps->gpu_uniforms.dovi_c0_Ct,
+            ps->gpu_uniforms.dovi_c0_Cp,
+            ps->gpu_uniforms.dovi_c1_I, ps->gpu_uniforms.dovi_c1_Ct,
+            ps->gpu_uniforms.dovi_c1_Cp);
+    log_msg("DOVI: output matrix (cone_inv × rgb_to_lms):");
+    log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r0[0],
+            ps->gpu_uniforms.dovi_out_r0[1], ps->gpu_uniforms.dovi_out_r0[2]);
+    log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r1[0],
+            ps->gpu_uniforms.dovi_out_r1[1], ps->gpu_uniforms.dovi_out_r1[2]);
+    log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r2[0],
+            ps->gpu_uniforms.dovi_out_r2[1], ps->gpu_uniforms.dovi_out_r2[2]);
+
+    /* Mark as populated — don't re-extract on subsequent frames */
+    ps->dovi_metadata_logged = 2;
+}
+
+#define PEAK_ATTACK_RATE    0.3f     /* rise towards new peak per frame   */
+#define PEAK_DECAY_RATE     0.01f    /* decay towards new peak per frame  */
+#define PEAK_SCENE_CUT_THR  0.5f     /* 50% change = scene cut, jump      */
+#define PEAK_MIN_NITS       100.0f   /* floor to prevent near-zero peaks   */
+#define PEAK_PERCENTILE     99.875f  /* skip top 0.125% (specular hotspots) */
+
+/* Scan the Y plane, build histogram, extract percentile peak,
+ * convert to nits, smooth, and update the uniform.
+ * Called once per frame from video_display() for HDR content only. */
+static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
+                                   int is_10bit)
+{
+    /* Skip if not HDR or in PQ bypass debug mode */
+    if (ps->gpu_uniforms.is_hdr < 0.5f) return;
+    if (ps->gpu_uniforms.hdr_debug > 1.5f && ps->gpu_uniforms.hdr_debug < 2.5f)
+        return;  /* mode 2: PQ bypass, use static peak */
+
+    /* DV Profile 5: skip CPU histogram — I-plane is IPTPQc2, not PQ luma.
+     * Histogram reads garbage, stuck at PEAK_MIN_NITS floor.  Use the
+     * static peak from source_max_pq (set by dovi_populate_uniforms). */
+    if (ps->dovi_metadata_logged == 2) {
+        ps->hdr_smoothed_peak = ps->hdr_static_peak;
+        ps->hdr_prev_frame_peak = ps->hdr_static_peak;
+        ps->gpu_uniforms.hdr_peak_nits = ps->hdr_static_peak;
+        return;
+    }
+
+    const uint8_t *data = frame->data[0];
+    int stride = frame->linesize[0];
+    int w = ps->vid_w;
+    int h = ps->vid_h;
+
+    /* ── Build 256-bin histogram of Y plane ──
+     * Subsample 4× in each dimension to reduce work.
+     * For 10-bit: bin = uint16 >> 8 (top 8 bits → 256 bins).
+     * For 8-bit:  bin = uint8 value directly. */
+    int histogram[256];
+    memset(histogram, 0, sizeof(histogram));
+    int total_samples = 0;
+
+    if (is_10bit) {
+        for (int y = 0; y < h; y += 4) {
+            const uint16_t *row = (const uint16_t *)(data + y * stride);
+            for (int x = 0; x < w; x += 4) {
+                histogram[row[x] >> 8]++;
+                total_samples++;
+            }
+        }
+    } else {
+        for (int y = 0; y < h; y += 4) {
+            const uint8_t *row = data + y * stride;
+            for (int x = 0; x < w; x += 4) {
+                histogram[row[x]]++;
+                total_samples++;
+            }
+        }
+    }
+
+    /* ── Find the 99.875th percentile bin ──
+     * Walk from the top bin downward, accumulating counts until
+     * we've passed (100 - PEAK_PERCENTILE)% of total samples. */
+    int skip_count = (int)((100.0f - PEAK_PERCENTILE) / 100.0f * total_samples);
+    if (skip_count < 1) skip_count = 1;
+
+    int accumulated = 0;
+    int percentile_bin = 255;
+    for (int i = 255; i >= 0; i--) {
+        accumulated += histogram[i];
+        if (accumulated >= skip_count) {
+            percentile_bin = i;
+            break;
+        }
+    }
+
+    /* ── Convert bin to normalized value [0,1] ──
+     * Use bin center: (bin + 0.5) / 256 for 10-bit (maps back to uint16 space).
+     * For 8-bit: (bin + 0.5) / 256 ≈ bin / 255 (close enough). */
+    float raw_max_norm;
+    if (is_10bit) {
+        /* Bin represents top 8 bits of uint16. Reconstruct midpoint. */
+        raw_max_norm = ((float)percentile_bin + 0.5f) * 256.0f / 65535.0f;
+    } else {
+        raw_max_norm = ((float)percentile_bin + 0.5f) / 256.0f;
+    }
+
+    /* ── Apply range expansion (same math as shader) ──
+     * Convert from texture-space to PQ code [0,1] */
+    float pq_code = (raw_max_norm - ps->gpu_uniforms.rangeY[0])
+                  * ps->gpu_uniforms.rangeY[1];
+    if (pq_code < 0.0f) pq_code = 0.0f;
+    if (pq_code > 1.0f) pq_code = 1.0f;
+
+    /* ── PQ → linear nits ── */
+    float raw_peak_nits = pq_eotf_scalar(pq_code);
+
+    /* ── Temporal smoothing ── */
+    float smoothed = ps->hdr_smoothed_peak;
+    float prev     = ps->hdr_prev_frame_peak;
+
+    if (smoothed < 1.0f) {
+        /* First frame — initialize directly */
+        smoothed = raw_peak_nits;
+    } else {
+        /* Scene cut detection: large change from previous frame → jump */
+        float change = fabsf(raw_peak_nits - prev) / fmaxf(prev, 1.0f);
+        if (change > PEAK_SCENE_CUT_THR) {
+            smoothed = raw_peak_nits;
+        } else if (raw_peak_nits > smoothed) {
+            /* Attack: scene getting brighter — rise quickly */
+            smoothed += PEAK_ATTACK_RATE * (raw_peak_nits - smoothed);
+        } else {
+            /* Decay: scene getting darker — fade slowly */
+            smoothed += PEAK_DECAY_RATE * (raw_peak_nits - smoothed);
+        }
+    }
+
+    /* Clamp: floor at PEAK_MIN_NITS, ceiling at static metadata peak */
+    if (smoothed < PEAK_MIN_NITS) smoothed = PEAK_MIN_NITS;
+    if (ps->hdr_static_peak > 0.0f && smoothed > ps->hdr_static_peak)
+        smoothed = ps->hdr_static_peak;
+
+    /* Update state */
+    ps->hdr_smoothed_peak   = smoothed;
+    ps->hdr_prev_frame_peak = raw_peak_nits;
+
+    /* Feed dynamic peak to the tone mapper */
+    ps->gpu_uniforms.hdr_peak_nits = smoothed;
+
+    /* Periodic log (every 120 frames ≈ 5s at 24fps) */
+    if (ps->diag_frames_displayed % 120 == 0) {
+        float target = ps->gpu_uniforms.hdr_target_nits;
+        float maxLum = target / smoothed;
+        float ks = 1.5f * maxLum - 0.5f;
+        if (ks < 0.0f) ks = 0.0f;
+        log_msg("HDR peak: raw=%.0f nits, smoothed=%.0f nits "
+                "(p%.1f, target=%.0f, static=%.0f, KS=%.3f, maxLum=%.4f)",
+                raw_peak_nits, smoothed, PEAK_PERCENTILE,
+                target, ps->hdr_static_peak, ks, maxLum);
+    }
+}
+
+
 /* Display the current video frame: upload to GPU → shader draw.
  *
  * This is the hot path. Called once per new frame from main.c.
@@ -2317,6 +3191,26 @@ void video_display(PlayerState *ps) {
             ps->rgb_frame->linesize);
         src_frame = ps->rgb_frame;
         bpp = 1;
+    }
+
+    /* ── Dolby Vision RPU metadata extraction ──
+     * Extract and log reshaping curves from first DV frame.
+     * Uses original decoded frame (side data not on swscale output). */
+    dovi_log_frame_metadata(ps, ps->video_frame);
+    dovi_populate_uniforms(ps, ps->video_frame);
+
+    /* ── HDR dynamic peak detection (CPU scan) ──
+     * Scan luma plane to find actual scene peak before uploading.
+     * Updates hdr_peak_nits uniform with temporally smoothed value.
+     *
+     * For VAAPI: video_frame has the hw-transferred data (P010 or NV12).
+     * P010 Y plane is uint16 (10-bit), NV12 Y plane is uint8 (8-bit).
+     * For software decode: src_frame has the data, is_10bit_passthrough
+     * indicates whether it's 10-bit YUV420P10LE. */
+    {
+        AVFrame *peak_frame = ps->vaapi_active ? ps->video_frame : src_frame;
+        int peak_is_10bit = ps->vaapi_active ? !ps->vaapi_nv12 : is_10bit_passthrough;
+        hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit);
     }
 
     /* ── Upload plane data to GPU transfer buffers ──
@@ -2637,6 +3531,14 @@ void player_build_media_info(PlayerState *ps) {
             } else {
                 off += snprintf(buf + off, sz - off, "Color TRC: %s (assumed)\n",
                     is_hd ? "bt709" : "bt601");
+            }
+
+            /* HDR info from uniforms (already detected at open time) */
+            if (ps->gpu_uniforms.is_hdr > 0.0f) {
+                off += snprintf(buf + off, sz - off,
+                    "HDR: Yes (peak %.0f nits, %s gamut)\n",
+                    ps->gpu_uniforms.hdr_peak_nits,
+                    ps->gpu_uniforms.hdr_gamut > 0.5f ? "BT.2020" : "BT.709");
             }
         }
     }

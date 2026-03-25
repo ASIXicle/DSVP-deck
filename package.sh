@@ -103,6 +103,33 @@ exec "$DIR/dsvp" "$@"
 LAUNCHER
     chmod +x "$OUTDIR/dsvp.sh"
     echo "      Created launcher: dsvp.sh"
+
+    # Create README
+    cat > "$OUTDIR/README.txt" << 'README'
+DSVP — Dead Simple Video Player
+
+Run:
+  ./dsvp.sh                        Open DSVP (press O to open a file)
+  ./dsvp.sh /path/to/movie.mkv    Open a file directly
+
+Do NOT run ./dsvp directly — the launcher script sets up the bundled libraries.
+
+Controls:
+  O          Open file
+  Q          Quit / close file
+  Space      Pause / resume
+  F          Toggle fullscreen
+  S          Cycle subtitle tracks
+  A          Cycle audio tracks
+  Left/Right Seek ±5 seconds
+  Up/Down    Volume
+  B/N        Previous / next file in folder
+  D          Debug overlay
+  I          Media info overlay
+
+More info: https://github.com/ASIXicle/DSVP
+README
+    echo "      Created README.txt"
 fi
 
 if [ "$(uname)" = "Darwin" ]; then
@@ -129,6 +156,33 @@ exec "$DIR/dsvp" "$@"
 LAUNCHER
     chmod +x "$OUTDIR/dsvp.sh"
     echo "      Created launcher: dsvp.sh"
+
+    # Create README
+    cat > "$OUTDIR/README.txt" << 'README'
+DSVP — Dead Simple Video Player
+
+Run:
+  ./dsvp.sh                        Open DSVP (press O to open a file)
+  ./dsvp.sh /path/to/movie.mkv    Open a file directly
+
+Do NOT run ./dsvp directly — the launcher script sets up the bundled libraries.
+
+Controls:
+  O          Open file
+  Q          Quit / close file
+  Space      Pause / resume
+  F          Toggle fullscreen
+  S          Cycle subtitle tracks
+  A          Cycle audio tracks
+  Left/Right Seek ±5 seconds
+  Up/Down    Volume
+  B/N        Previous / next file in folder
+  D          Debug overlay
+  I          Media info overlay
+
+More info: https://github.com/ASIXicle/DSVP
+README
+    echo "      Created README.txt"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────
