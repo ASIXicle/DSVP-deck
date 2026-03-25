@@ -193,7 +193,10 @@ int audio_open(PlayerState *ps) {
     ps->audio_buf_index = 0;
 
     SDL_SetAudioStreamGain(ps->audio_stream, ps->volume);
-    SDL_ResumeAudioStreamDevice(ps->audio_stream);
+    /* Audio device starts paused. Resume is deferred until the first
+     * video frame is displayed (seek_recovering gate in main.c).
+     * This prevents audio from running ahead during VAAPI DPB warmup
+     * or any other initial decode latency. */
 
     log_msg("Audio opened: %d Hz, %d ch (SDL3 stream)",
         spec.freq, spec.channels);
