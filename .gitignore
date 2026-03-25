@@ -26,3 +26,4 @@ DSVP_deck-*/
 # Test scripts and logs
 test_*.sh
 test_logs/
+deps/SDL3_shadercross-3.0.0-windows-mingw-x64/
