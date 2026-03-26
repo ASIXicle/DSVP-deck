@@ -3837,8 +3837,8 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 }
 
 #define PEAK_ATTACK_RATE    0.3f     /* rise towards new peak per frame   */
-#define PEAK_DECAY_RATE     0.01f    /* decay towards new peak per frame  */
-#define PEAK_SCENE_CUT_THR  0.5f     /* 50% change = scene cut, jump      */
+#define PEAK_DECAY_RATE     0.03f    /* decay towards new peak per frame  */
+#define PEAK_SCENE_CUT_THR  0.5f     /* 50% increase = scene cut, jump up */
 #define PEAK_MIN_NITS       100.0f   /* floor to prevent near-zero peaks   */
 #define PEAK_PERCENTILE     99.875f  /* skip top 0.125% (specular hotspots) */
 
@@ -3951,9 +3951,12 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
         /* First frame — initialize directly */
         smoothed = raw_peak_nits;
     } else {
-        /* Scene cut detection: large change from previous frame → jump */
-        float change = fabsf(raw_peak_nits - prev) / fmaxf(prev, 1.0f);
+        /* Scene cut detection: large *increase* from previous frame → jump up.
+         * Downward changes always use smooth decay to prevent strobe flicker
+         * when dark frames temporarily depress the peak. */
+        float change = (raw_peak_nits - prev) / fmaxf(prev, 1.0f);
         if (change > PEAK_SCENE_CUT_THR) {
+            /* Bright scene cut — jump to avoid highlight clipping */
             smoothed = raw_peak_nits;
         } else if (raw_peak_nits > smoothed) {
             /* Attack: scene getting brighter — rise quickly */
