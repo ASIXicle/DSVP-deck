@@ -27,3 +27,4 @@ DSVP_deck-*/
 test_*.sh
 test_logs/
 deps/SDL3_shadercross-3.0.0-windows-mingw-x64/
+tests/
