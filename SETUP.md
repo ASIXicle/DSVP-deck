@@ -49,6 +49,9 @@ sudo pacman -S --noconfirm \
 
 sudo pacman -S --noconfirm \
     libva libva-utils
+    
+sudo pacman -S --noconfirm \
+    dav1d
 ```
 
 Verify everything is in place:
@@ -82,7 +85,8 @@ cd ffmpeg-8.1
     --disable-muxers \
     --enable-shared \
     --disable-static \
-    --enable-vaapi
+    --enable-vaapi \
+    --enable-libdav1d
 ```
 
 Check the configure output for `vaapi: yes`. If it says `no`, the `libva` headers aren't installed — go back to Phase 1.
