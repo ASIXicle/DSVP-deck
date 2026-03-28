@@ -727,14 +727,14 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_G:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
-                        static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f };
+                        static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f, 1.35f, 1.4f };
                         static int gain_idx = 3;
-                        gain_idx = (gain_idx + 1) % 4;
+                        gain_idx = (gain_idx + 1) % 6;
                         ps.gpu_uniforms.hdr_midtone_gain = gains[gain_idx];
                         snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "Midtone gain: %.1f", gains[gain_idx]);
+                                 "Midtone gain: %.2f", gains[gain_idx]);
                         ps.aud_osd_until = get_time_sec() + 2.0;
-                        log_msg("HDR: midtone gain changed to %.1f",
+                        log_msg("HDR: midtone gain changed to %.2f",
                                 gains[gain_idx]);
                     }
                     break;
