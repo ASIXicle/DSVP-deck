@@ -916,16 +916,16 @@ void overlay_render_browser(PlayerState *ps) {
             }
 
             /* Entry text */
-            uint8_t r, g, b;
+            int cr, cg, cb;
             if (ps->browser_is_dir[i]) {
-                r = 120; g = 180; b = 240;  /* blue for directories */
+                cr = 120; cg = 180; cb = 240;  /* blue for directories */
             } else {
-                r = 200; g = 200; b = 210;  /* light gray for files */
+                cr = 200; cg = 200; cb = 210;  /* light gray for files */
             }
-            if (selected) { r += 30; g += 30; b += 30; }  /* brighten */
-            if (r > 255) r = 255;
-            if (g > 255) g = 255;
-            if (b > 255) b = 255;
+            if (selected) { cr += 30; cg += 30; cb += 30; }  /* brighten */
+            if (cr > 255) cr = 255;
+            if (cg > 255) cg = 255;
+            if (cb > 255) cb = 255;
 
             /* Truncate long names */
             int max_chars = (w - 2 * margin - 8 * S)
@@ -939,7 +939,7 @@ void overlay_render_browser(PlayerState *ps) {
             }
 
             draw_text(s_pixels, w, h, margin + 4 * S, row_y,
-                      display, font_scale, r, g, b);
+                      display, font_scale, cr, cg, cb);
         }
 
         /* Scroll indicator: down arrow */
@@ -982,7 +982,8 @@ void overlay_render_browser(PlayerState *ps) {
     gpu_overlay_upload(ps, s_pixels, w, h);
     ps->overlay_active = 1;
 }
- * ═══════════════════════════════════════════════════════════════════
+
+/* =====================================================================
  *
  * Composites all active overlays into a single RGBA pixel buffer,
  * uploads to the GPU overlay texture. Skips entirely when nothing

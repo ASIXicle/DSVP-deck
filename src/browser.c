@@ -408,17 +408,15 @@ int browser_enter(PlayerState *ps) {
         char newpath[1024];
         snprintf(newpath, sizeof(newpath), "%s/",
                  ps->browser_entries[ps->browser_sel]);
-        strncpy(ps->browser_path, newpath, sizeof(ps->browser_path) - 1);
-        ps->browser_path[sizeof(ps->browser_path) - 1] = '\0';
+        snprintf(ps->browser_path, sizeof(ps->browser_path), "%s", newpath);
         browser_scan(ps);
         browser_save_path(ps);
         return 0;
     } else {
         /* File selected */
-        strncpy(ps->browser_selected_file,
-                ps->browser_entries[ps->browser_sel],
-                sizeof(ps->browser_selected_file) - 1);
-        ps->browser_selected_file[sizeof(ps->browser_selected_file) - 1] = '\0';
+        snprintf(ps->browser_selected_file,
+                sizeof(ps->browser_selected_file), "%s",
+                ps->browser_entries[ps->browser_sel]);
         return 1;
     }
 }

@@ -631,7 +631,7 @@ int main(int argc, char *argv[]) {
 #endif
         if (sep) {
             *(sep + 1) = '\0';
-            strncpy(ps.browser_path, dir, sizeof(ps.browser_path) - 1);
+            snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
             browser_scan(&ps);
             browser_save_path(&ps);
         }
@@ -704,8 +704,7 @@ int main(int argc, char *argv[]) {
 #endif
                             if (sep) {
                                 *(sep + 1) = '\0';
-                                strncpy(ps.browser_path, dir,
-                                        sizeof(ps.browser_path) - 1);
+                                snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
                                 browser_scan(&ps);
                                 browser_save_path(&ps);
                             }
@@ -734,8 +733,7 @@ int main(int argc, char *argv[]) {
                             playlist_scan(&ps);
                             /* Sync browser to opened file's directory */
                             char bdir[1024];
-                            strncpy(bdir, path, sizeof(bdir) - 1);
-                            bdir[sizeof(bdir) - 1] = '\0';
+                            snprintf(bdir, sizeof(bdir), "%s", path);
                             char *bsep = strrchr(bdir, '/');
 #ifdef _WIN32
                             char *bsep2 = strrchr(bdir, '\\');
@@ -743,8 +741,7 @@ int main(int argc, char *argv[]) {
 #endif
                             if (bsep) {
                                 *(bsep + 1) = '\0';
-                                strncpy(ps.browser_path, bdir,
-                                        sizeof(ps.browser_path) - 1);
+                                snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", bdir);
                                 browser_scan(&ps);
                                 browser_save_path(&ps);
                             }
@@ -1132,8 +1129,7 @@ int main(int argc, char *argv[]) {
 #endif
                             if (sep) {
                                 *(sep + 1) = '\0';
-                                strncpy(ps.browser_path, dir,
-                                        sizeof(ps.browser_path) - 1);
+                                snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
                                 browser_scan(&ps);
                                 browser_save_path(&ps);
                             }
@@ -1458,8 +1454,7 @@ int main(int argc, char *argv[]) {
 #endif
                         if (sep) {
                             *(sep + 1) = '\0';
-                            strncpy(ps.browser_path, dir,
-                                    sizeof(ps.browser_path) - 1);
+                            snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
                             browser_scan(&ps);
                             browser_save_path(&ps);
                         }
