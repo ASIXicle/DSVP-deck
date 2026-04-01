@@ -466,10 +466,13 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Initialize built-in file browser ──
-     * Always active — shown whenever no file is playing.
-     * If a file was opened from the command line, seed the
-     * browser path to that file's parent directory. */
+     * Game Mode: browser is the default screen (gamepad-navigable).
+     * Desktop Mode: classic idle screen with keyboard shortcuts shown.
+     *   Browser is still available via O-key → navigate, or when
+     *   returning from playback. */
     browser_init(&ps);
+    if (!ps.game_mode)
+        ps.browser_active = 0;  /* Desktop: show idle screen first */
     if (ps.playing && ps.filepath[0]) {
         /* Set browser to directory of the opened file */
         char dir[1024];
@@ -552,6 +555,7 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         player_close(&ps);
+                        ps.browser_active = 1; /* show browser to pick next file */
                         ps.quit = 0; /* return to browser, not exit */
                     } else {
                         ps.quit = 1;
@@ -969,6 +973,7 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         player_close(&ps);
+                        ps.browser_active = 1;
                         ps.quit = 0;
                     } else if (ps.browser_active && !browser_at_root(&ps)) {
                         browser_back(&ps);
@@ -1348,6 +1353,7 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         player_close(&ps);
+                        ps.browser_active = 1;
                         ps.quit = 0;
                     }
                 }

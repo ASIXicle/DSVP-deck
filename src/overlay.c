@@ -977,8 +977,8 @@ void overlay_render_browser(PlayerState *ps) {
                   0, 0, 0, 140);
 
         const char *hint;
-        if (ps->gamepad_active)
-            hint = "A:Open  B:Back  D-pad:Navigate";
+        if (ps->game_mode)
+            hint = "A:Open  B:Back  D-pad:Navigate  Start:Controls";
         else
             hint = "Enter:Open  Backspace:Back  O:Dialog  Arrows:Navigate";
 
@@ -1018,65 +1018,58 @@ static void draw_controls_overlay(uint8_t *buf, int bw, int bh, PlayerState *ps)
               220, 200, 120);
     y += FONT_H * title_scale + 12 * S;
 
-    /* Two-column layout: Gamepad | Keyboard */
-    int col2_x = bw / 2 + margin;
-
-    /* Column headers */
-    draw_text(buf, bw, bh, margin, y, "GAMEPAD", font_scale, 160, 180, 220);
-    draw_text(buf, bw, bh, col2_x, y, "KEYBOARD", font_scale, 160, 180, 220);
-    y += line_h + 4 * S;
-
     /* Separator line */
     fill_rect(buf, bw, bh, margin, y, bw - 2 * margin, 1 * S, 80, 80, 90, 180);
     y += 6 * S;
 
-    /* Control mappings */
+    /* Game Mode: gamepad only. Desktop Mode: keyboard only. */
     static const char *pad_lines[] = {
-        "A         Select / Open",
-        "B         Back / Stop",
-        "X         Pause / Resume",
-        "Y         Cycle Subtitles",
-        "LB / RB   Seek  -/+ 5s",
-        "LT / RT   Analog Seek 0-64x",
-        "D-Pad U/D Volume (play)",
-        "D-Pad U/D Navigate (browse)",
-        "D-Pad L/R Page Up/Down (browse)",
-        "D-Pad L/R Prev/Next File (play)",
-        "R3        Cycle Audio Track",
-        "Start     This Help Screen",
-        "Select    Debug Overlay",
+        "A           Select / Open",
+        "B           Back / Stop",
+        "X           Pause / Resume",
+        "Y           Cycle Subtitles",
+        "LB / RB     Seek -/+ 5s",
+        "LT / RT     Analog Seek 0-64x",
+        "D-Pad U/D   Volume (playback)",
+        "D-Pad U/D   Navigate (browser)",
+        "D-Pad L/R   Page Up/Down (browser)",
+        "D-Pad L/R   Prev/Next File (playback)",
+        "R3          Cycle Audio Track",
+        "Start       Controls (this screen)",
+        "Select      Debug Overlay",
         NULL
     };
     static const char *key_lines[] = {
-        "Enter     Select / Open",
-        "Q / Esc   Back / Quit",
-        "Space     Pause / Resume",
-        "S         Cycle Subtitles",
+        "Enter       Select / Open",
+        "Q           Back / Quit",
+        "Space       Pause / Resume",
+        "S           Cycle Subtitles",
         "Left/Right  Seek -/+ 5s",
-        "A-key     Cycle Audio Track",
-        "Up / Down Volume",
-        "O         Open File Dialog",
-        "D         Debug Overlay",
-        "H         HDR Debug Modes",
-        "T         Cycle SDR Target",
-        "G         Cycle Midtone Gain",
-        "V         Toggle VSync/Mailbox",
+        "A-key       Cycle Audio Track",
+        "Up / Down   Volume",
+        "O           Open File Dialog",
+        "B / N       Prev / Next File",
+        "D           Debug Overlay",
+        "H           HDR Debug Modes",
+        "T           Cycle SDR Target Nits",
+        "G           Cycle Midtone Gain",
+        "V           Toggle VSync / Mailbox",
         NULL
     };
 
+    const char **lines = ps->game_mode ? pad_lines : key_lines;
+
     uint8_t cr = 200, cg = 200, cb = 200;
-    for (int i = 0; pad_lines[i] || key_lines[i]; i++) {
-        if (pad_lines[i])
-            draw_text(buf, bw, bh, margin, y, pad_lines[i], font_scale, cr, cg, cb);
-        if (key_lines[i])
-            draw_text(buf, bw, bh, col2_x, y, key_lines[i], font_scale, cr, cg, cb);
+    for (int i = 0; lines[i]; i++) {
+        draw_text(buf, bw, bh, margin, y, lines[i], font_scale, cr, cg, cb);
         y += line_h;
     }
 
     y += 8 * S;
-    draw_text(buf, bw, bh, margin, y,
-              "Press Start or Menu to close",
-              font_scale, 120, 120, 140);
+    const char *dismiss = ps->game_mode
+        ? "Press Start to close"
+        : "Press Start or Esc to close";
+    draw_text(buf, bw, bh, margin, y, dismiss, font_scale, 120, 120, 140);
 }
 
 /* =====================================================================
