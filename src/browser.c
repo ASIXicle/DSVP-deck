@@ -14,14 +14,9 @@
 
 #include "dsvp.h"
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
-  #include <dirent.h>
-  #include <sys/stat.h>
-  #include <errno.h>
-#endif
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Forward declarations for helpers shared with main.c (video_extensions)
@@ -36,13 +31,6 @@ extern int is_media_file(const char *name);
  * ═══════════════════════════════════════════════════════════════════ */
 
 static void get_config_dir(char *out, int size) {
-#ifdef _WIN32
-    const char *appdata = getenv("APPDATA");
-    if (appdata)
-        snprintf(out, size, "%s\\dsvp", appdata);
-    else
-        snprintf(out, size, ".");
-#else
     const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && xdg[0])
         snprintf(out, size, "%s/dsvp", xdg);
@@ -50,15 +38,11 @@ static void get_config_dir(char *out, int size) {
         const char *home = getenv("HOME");
         snprintf(out, size, "%s/.config/dsvp", home ? home : "/tmp");
     }
-#endif
 }
 
 static void ensure_config_dir(void) {
     char dir[512];
     get_config_dir(dir, sizeof(dir));
-#ifdef _WIN32
-    CreateDirectoryA(dir, NULL);
-#else
     /* mkdir -p equivalent: create parent then child */
     char parent[512];
     snprintf(parent, sizeof(parent), "%s", dir);
@@ -68,7 +52,6 @@ static void ensure_config_dir(void) {
         mkdir(parent, 0755);  /* ~/.config — may already exist */
     }
     mkdir(dir, 0755);  /* ~/.config/dsvp — may already exist */
-#endif
 }
 
 void browser_save_path(PlayerState *ps) {
@@ -78,11 +61,7 @@ void browser_save_path(PlayerState *ps) {
     char filepath[600];
     char dir[512];
     get_config_dir(dir, sizeof(dir));
-#ifdef _WIN32
-    snprintf(filepath, sizeof(filepath), "%s\\last_path", dir);
-#else
     snprintf(filepath, sizeof(filepath), "%s/last_path", dir);
-#endif
 
     FILE *f = fopen(filepath, "w");
     if (f) {
@@ -95,11 +74,7 @@ static void browser_load_path(PlayerState *ps) {
     char filepath[600];
     char dir[512];
     get_config_dir(dir, sizeof(dir));
-#ifdef _WIN32
-    snprintf(filepath, sizeof(filepath), "%s\\last_path", dir);
-#else
     snprintf(filepath, sizeof(filepath), "%s/last_path", dir);
-#endif
 
     FILE *f = fopen(filepath, "r");
     if (f) {
@@ -114,30 +89,16 @@ static void browser_load_path(PlayerState *ps) {
 
     /* Validate the saved path still exists */
     if (ps->browser_path[0]) {
-#ifdef _WIN32
-        DWORD attr = GetFileAttributesA(ps->browser_path);
-        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
-            ps->browser_path[0] = '\0';
-#else
         struct stat st;
         if (stat(ps->browser_path, &st) != 0 || !S_ISDIR(st.st_mode))
             ps->browser_path[0] = '\0';
-#endif
     }
 
     /* Default to home directory */
     if (!ps->browser_path[0]) {
-#ifdef _WIN32
-        const char *home = getenv("USERPROFILE");
-        if (home)
-            snprintf(ps->browser_path, sizeof(ps->browser_path), "%s\\", home);
-        else
-            snprintf(ps->browser_path, sizeof(ps->browser_path), "C:\\");
-#else
         const char *home = getenv("HOME");
         snprintf(ps->browser_path, sizeof(ps->browser_path), "%s/",
                  home ? home : "/");
-#endif
     }
 }
 
@@ -176,11 +137,7 @@ static int cmp_browse_entries(const void *a, const void *b) {
     if (ea->is_dir != eb->is_dir)
         return eb->is_dir - ea->is_dir;
     /* Alphabetical (case-insensitive) */
-#ifdef _WIN32
-    return _stricmp(ea->name, eb->name);
-#else
     return strcasecmp(ea->name, eb->name);
-#endif
 }
 
 void browser_scan(PlayerState *ps) {
@@ -193,41 +150,6 @@ void browser_scan(PlayerState *ps) {
     if (!entries) return;
     int count = 0;
 
-#ifdef _WIN32
-    /* Windows directory scan */
-    char pattern[2048];
-    snprintf(pattern, sizeof(pattern), "%s*", ps->browser_path);
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(pattern, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        free(entries);
-        return;
-    }
-    do {
-        if (fd.cFileName[0] == '.') continue;  /* skip hidden + . + .. */
-
-        int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-        /* Show directories and media files only */
-        if (!is_dir && !is_media_file(fd.cFileName)) continue;
-
-        if (count >= capacity) {
-            capacity *= 2;
-            BrowseEntry *tmp = realloc(entries, capacity * sizeof(BrowseEntry));
-            if (!tmp) break;
-            entries = tmp;
-        }
-
-        char fullpath[2048];
-        snprintf(fullpath, sizeof(fullpath), "%s%s", ps->browser_path, fd.cFileName);
-
-        entries[count].name = strdup(fd.cFileName);
-        entries[count].path = strdup(fullpath);
-        entries[count].is_dir = is_dir;
-        count++;
-    } while (FindNextFileA(hFind, &fd));
-    FindClose(hFind);
-#else
     /* POSIX directory scan */
     DIR *d = opendir(ps->browser_path);
     if (!d) {
@@ -327,7 +249,6 @@ void browser_scan(PlayerState *ps) {
             closedir(md);
         }
     }
-#endif
 
     /* Sort: directories first, then alphabetical */
     qsort(entries, count, sizeof(BrowseEntry), cmp_browse_entries);
@@ -440,15 +361,11 @@ void browser_back(PlayerState *ps) {
     size_t len = strlen(path);
 
     /* Remove trailing separator */
-    if (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\'))
+    if (len > 1 && path[len - 1] == '/')
         path[--len] = '\0';
 
     /* Find previous separator */
     char *sep = strrchr(path, '/');
-#ifdef _WIN32
-    char *sep2 = strrchr(path, '\\');
-    if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
 
     if (sep && sep != path) {
         *(sep + 1) = '\0';  /* keep trailing slash */
@@ -456,15 +373,6 @@ void browser_back(PlayerState *ps) {
         /* At root "/" */
         path[1] = '\0';
     }
-#ifdef _WIN32
-    else {
-        /* At drive root like "C:" */
-        if (len >= 2 && path[1] == ':') {
-            path[2] = '\\';
-            path[3] = '\0';
-        }
-    }
-#endif
 
     browser_scan(ps);
     browser_save_path(ps);
@@ -472,13 +380,8 @@ void browser_back(PlayerState *ps) {
 
 int browser_at_root(PlayerState *ps) {
     const char *p = ps->browser_path;
-#ifdef _WIN32
-    if (strlen(p) <= 3 && p[1] == ':') return 1;
-    const char *home = getenv("USERPROFILE");
-#else
     if (strcmp(p, "/") == 0) return 1;
     const char *home = getenv("HOME");
-#endif
     if (home) {
         char cur[1024], hbuf[1024];
         snprintf(cur, sizeof(cur), "%s", p);

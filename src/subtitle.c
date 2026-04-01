@@ -29,16 +29,6 @@ static const SDL_Color COLOR_OUTLINE = { 0,   0,   0, 255 };
 
 static const char *find_system_font(void) {
     static const char *candidates[] = {
-#ifdef _WIN32
-        "C:\\Windows\\Fonts\\verdana.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\tahoma.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-#elif defined(__APPLE__)
-        "/System/Library/Fonts/Supplemental/Verdana.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial.ttf",
-#else
         "/usr/share/fonts/truetype/msttcorefonts/Verdana.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
@@ -49,7 +39,6 @@ static const char *find_system_font(void) {
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
-#endif
         NULL
     };
 
@@ -65,21 +54,11 @@ static const char *find_system_font(void) {
 
 static const char *find_cjk_font(void) {
     static const char *candidates[] = {
-#ifdef _WIN32
-        "C:\\Windows\\Fonts\\msgothic.ttc",
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\msjh.ttc",
-        "C:\\Windows\\Fonts\\yugothm.ttc",
-#elif defined(__APPLE__)
-        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-#else
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/OTF/NotoSansCJK-Regular.ttc",
-#endif
         NULL
     };
 

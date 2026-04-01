@@ -38,15 +38,13 @@
 /* SDL3 shadercross — runtime HLSL→SPIRV→native compilation */
 #include <SDL3_shadercross/SDL_shadercross.h>
 
-/* ── VAAPI zero-copy interop (Linux only) ─────────────────────────── */
-#ifndef _WIN32
-  #include <vulkan/vulkan.h>
-  #include <va/va.h>
-  #include <va/va_drm.h>
-  #include <va/va_drmcommon.h>  /* VADRMPRIMESurfaceDescriptor */
-  #include <libavutil/hwcontext_vaapi.h> /* AVVAAPIDeviceContext */
-  #include <unistd.h>  /* dup(), close() for DMA-BUF fd management */
-#endif
+/* ── VAAPI zero-copy interop ──────────────────────────────────────── */
+#include <vulkan/vulkan.h>
+#include <va/va.h>
+#include <va/va_drm.h>
+#include <va/va_drmcommon.h>  /* VADRMPRIMESurfaceDescriptor */
+#include <libavutil/hwcontext_vaapi.h> /* AVVAAPIDeviceContext */
+#include <unistd.h>  /* dup(), close() for DMA-BUF fd management */
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
@@ -159,7 +157,6 @@ typedef struct PlayerState {
     int                 vaapi_nv12;       /* 1 = VAAPI outputs NV12 (8-bit)     */
 
     /* ── VAAPI zero-copy interop (Linux, HEVC 10-bit P010) ── */
-#ifndef _WIN32
     int                 vaapi_zerocopy;   /* 1 = DMA-BUF→Vulkan path active     */
     VkDevice            vk_device;        /* extracted from SDL_GPU              */
     VkQueue             vk_queue;         /* graphics queue                      */
@@ -168,7 +165,6 @@ typedef struct PlayerState {
     VkCommandBuffer     vk_cmd_buf;       /* reused each frame                   */
     VADisplay           va_display;       /* VAAPI display for surface export    */
     int                 vk_tex_image_offset; /* offset: SDL_GPUTexture → VkImage */
-#endif
 
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;

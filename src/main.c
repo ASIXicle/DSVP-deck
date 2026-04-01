@@ -17,81 +17,16 @@
 
 #include "dsvp.h"
 #include "dsvp_icon.h"
-#ifndef _WIN32
-  #include <dirent.h>
-#endif
-
-/* Platform-specific file dialog */
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-  #include <commdlg.h>
-  #include <shellapi.h>   /* CommandLineToArgvW */
-
-/* Convert UTF-16 wide string to UTF-8.  Caller must free() the result. */
-static char *win_wide_to_utf8(const wchar_t *wstr) {
-    if (!wstr) return NULL;
-    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
-    if (len <= 0) return NULL;
-    char *out = malloc(len);
-    if (!out) return NULL;
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, out, len, NULL, NULL);
-    return out;
-}
-
-/* Convert UTF-8 string to UTF-16 wide.  Caller must free() the result. */
-static wchar_t *win_utf8_to_wide(const char *str) {
-    if (!str) return NULL;
-    int len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
-    if (len <= 0) return NULL;
-    wchar_t *out = malloc(len * sizeof(wchar_t));
-    if (!out) return NULL;
-    MultiByteToWideChar(CP_UTF8, 0, str, -1, out, len);
-    return out;
-}
-#endif
+#include <dirent.h>
 
 /* ═══════════════════════════════════════════════════════════════════
- * File Open Dialog
+ * File Open Dialog (Desktop Mode — zenity/kdialog/yad)
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Returns 1 if a file was selected (path written to `out`), 0 if cancelled. */
 static int open_file_dialog(char *out, int out_size) {
-#ifdef _WIN32
-    /* Native Win32 file dialog — wide (Unicode) version */
-    OPENFILENAMEW ofn;
-    wchar_t file[1024] = {0};
-
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize  = sizeof(ofn);
-    ofn.hwndOwner    = NULL;
-    ofn.lpstrFile    = file;
-    ofn.nMaxFile     = sizeof(file) / sizeof(file[0]);
-    ofn.lpstrFilter  = L"Video Files\0"
-                       L"*.mkv;*.mp4;*.avi;*.mov;*.wmv;*.flv;*.webm;*.m4v;*.ts;*.mpg;*.mpeg\0"
-                       L"Audio Files\0"
-                       L"*.mp3;*.flac;*.wav;*.aac;*.ogg;*.opus;*.m4a;*.wma\0"
-                       L"All Files\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-
-    if (GetOpenFileNameW(&ofn)) {
-        char *utf8 = win_wide_to_utf8(file);
-        if (utf8) {
-            snprintf(out, out_size, "%s", utf8);
-            free(utf8);
-            return 1;
-        }
-    }
-    return 0;
-
-#else
-    /* Linux/macOS: try multiple dialog backends */
     FILE *fp = NULL;
 
-    #ifdef __APPLE__
-    fp = popen("osascript -e 'POSIX path of (choose file of type {\"public.movie\", \"public.audio\"})'", "r");
-    #else
     /* Try zenity, then kdialog, then yad */
     const char *commands[] = {
         "zenity --file-selection --title='Open Media File' "
@@ -122,9 +57,6 @@ static int open_file_dialog(char *out, int out_size) {
         log_msg("  Tip: you can also pass a file path on the command line: ./dsvp video.mp4");
         return 0;
     }
-    #endif
-
-    if (!fp) return 0;
 
     if (fgets(out, out_size, fp)) {
         /* Remove trailing newline */
@@ -135,7 +67,6 @@ static int open_file_dialog(char *out, int out_size) {
     }
     pclose(fp);
     return 0;
-#endif
 }
 
 
@@ -158,11 +89,7 @@ int is_media_file(const char *name) {
     const char *dot = strrchr(name, '.');
     if (!dot) return 0;
     for (int i = 0; video_extensions[i]; i++) {
-#ifdef _WIN32
-        if (_stricmp(dot, video_extensions[i]) == 0) return 1;
-#else
         if (strcasecmp(dot, video_extensions[i]) == 0) return 1;
-#endif
     }
     return 0;
 }
@@ -170,11 +97,7 @@ int is_media_file(const char *name) {
 static int cmp_strings(const void *a, const void *b) {
     const char *sa = *(const char **)a;
     const char *sb = *(const char **)b;
-#ifdef _WIN32
-    return _stricmp(sa, sb);
-#else
     return strcasecmp(sa, sb);
-#endif
 }
 
 static void playlist_free(PlayerState *ps) {
@@ -200,10 +123,6 @@ static void playlist_scan(PlayerState *ps) {
 
     /* Find last separator */
     char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-    char *sep2 = strrchr(dir, '\\');
-    if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
     if (sep) {
         snprintf(base, sizeof(base), "%s", sep + 1);
         *(sep + 1) = '\0';  /* dir now ends with separator */
@@ -218,47 +137,7 @@ static void playlist_scan(PlayerState *ps) {
     if (!files) return;
     int count = 0;
 
-#ifdef _WIN32
-    /* Windows: FindFirstFileW/FindNextFileW for Unicode filenames */
-    {
-        char pattern[2048];
-        snprintf(pattern, sizeof(pattern), "%s*", dir);
-        wchar_t *wpattern = win_utf8_to_wide(pattern);
-        if (!wpattern) { free(files); return; }
-
-        WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW(wpattern, &fd);
-        free(wpattern);
-        if (hFind == INVALID_HANDLE_VALUE) {
-            log_msg("playlist_scan: cannot open directory: %s", dir);
-            free(files);
-            return;
-        }
-
-        do {
-            if (fd.cFileName[0] == L'.') continue;  /* skip hidden */
-            char *name = win_wide_to_utf8(fd.cFileName);
-            if (!name) continue;
-            if (!is_media_file(name)) { free(name); continue; }
-
-            char fullpath[2048];
-            snprintf(fullpath, sizeof(fullpath), "%s%s", dir, name);
-            free(name);
-
-            if (count >= capacity) {
-                capacity *= 2;
-                char **tmp = realloc(files, capacity * sizeof(char *));
-                if (!tmp) break;
-                files = tmp;
-            }
-            files[count] = strdup(fullpath);
-            if (!files[count]) break;
-            count++;
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
-#else
-    /* POSIX: opendir/readdir (UTF-8 native on Linux/macOS) */
+    /* POSIX: opendir/readdir */
     {
         DIR *d = opendir(dir);
         if (!d) {
@@ -287,7 +166,6 @@ static void playlist_scan(PlayerState *ps) {
         }
         closedir(d);
     }
-#endif
 
     if (count == 0) {
         free(files);
@@ -304,11 +182,7 @@ static void playlist_scan(PlayerState *ps) {
     ps->playlist_index = -1;
     for (int i = 0; i < count; i++) {
         /* Compare against full filepath */
-#ifdef _WIN32
-        if (_stricmp(files[i], ps->filepath) == 0) {
-#else
         if (strcmp(files[i], ps->filepath) == 0) {
-#endif
             ps->playlist_index = i;
             break;
         }
@@ -386,30 +260,15 @@ static void gpu_draw_idle(PlayerState *ps) {
 
 int main(int argc, char *argv[]) {
     /* ── Initialize logging (before anything else) ── */
-    (void)argv;  /* replaced by CommandLineToArgvW for Unicode support */
     log_init();
     log_msg("Starting DSVP v" DSVP_VERSION " (argc=%d)", argc);
     log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),
             LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR);
 
-    /* ── Get UTF-8 filepath from command line ──
-     * On Windows, argv[] is in the system ANSI codepage, which corrupts
-     * non-ASCII characters (accents, CJK, fullwidth punctuation).
-     * Use GetCommandLineW → CommandLineToArgvW → UTF-8 conversion. */
+    /* ── Get filepath from command line ── */
     char *open_path = NULL;
-#ifdef _WIN32
-    {
-        int wargc = 0;
-        LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-        if (wargv && wargc > 1) {
-            open_path = win_wide_to_utf8(wargv[1]);
-        }
-        if (wargv) LocalFree(wargv);
-    }
-#else
     if (argc > 1)
         open_path = strdup(argv[1]);
-#endif
 
     /* ── Initialize SDL ── */
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
@@ -468,13 +327,8 @@ int main(int argc, char *argv[]) {
      * content (19.2MB/frame), this made real-time playback impossible.
      * Vulkan's memory model handles transfer buffer cycling without
      * fence stalls, giving ~1-2ms per frame on the same content.*/
-    /* D3D12 has transfer buffer fence stalls (30-180ms/frame).
-     * Force Vulkan on Windows/Linux, Metal on macOS. */
-#ifdef __APPLE__
-    SDL_SetHint(SDL_HINT_GPU_DRIVER, "metal");
-#else
+    /* Force Vulkan — D3D12 has transfer buffer fence stalls (30-180ms/frame). */
     SDL_SetHint(SDL_HINT_GPU_DRIVER, "vulkan");
-#endif
 
 #ifdef DSVP_DEBUG
     bool gpu_debug = true;
@@ -482,8 +336,7 @@ int main(int argc, char *argv[]) {
     bool gpu_debug = false;
 #endif
 
-#if defined(__linux__) && !defined(__APPLE__)
-    /* ── Linux: Request DMA-BUF import extensions for VAAPI zero-copy ──
+    /* ── Request DMA-BUF import extensions for VAAPI zero-copy ──
      *
      * SDL_CreateGPUDeviceWithProperties lets us pass SDL_GPUVulkanOptions
      * to request additional Vulkan device extensions at creation time.
@@ -522,13 +375,6 @@ int main(int argc, char *argv[]) {
         gpu_device = SDL_CreateGPUDevice(
             SDL_ShaderCross_GetSPIRVShaderFormats(), gpu_debug, NULL);
     }
-#else
-    SDL_GPUDevice *gpu_device = SDL_CreateGPUDevice(
-        SDL_ShaderCross_GetSPIRVShaderFormats(),
-        gpu_debug,
-        NULL    /* preferred driver — vulkan (set by hint above) */
-    );
-#endif
     if (!gpu_device) {
         fprintf(stderr, "[DSVP] Cannot create GPU device: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
@@ -621,10 +467,6 @@ int main(int argc, char *argv[]) {
         char dir[1024];
         snprintf(dir, sizeof(dir), "%s", ps.filepath);
         char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-        char *sep2 = strrchr(dir, '\\');
-        if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
         if (sep) {
             *(sep + 1) = '\0';
             snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
@@ -693,10 +535,6 @@ int main(int argc, char *argv[]) {
                             char dir[1024];
                             snprintf(dir, sizeof(dir), "%s", ps.filepath);
                             char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-                            char *sep2 = strrchr(dir, '\\');
-                            if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
                             if (sep) {
                                 *(sep + 1) = '\0';
                                 snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
@@ -730,10 +568,6 @@ int main(int argc, char *argv[]) {
                             char bdir[1024];
                             snprintf(bdir, sizeof(bdir), "%s", path);
                             char *bsep = strrchr(bdir, '/');
-#ifdef _WIN32
-                            char *bsep2 = strrchr(bdir, '\\');
-                            if (bsep2 && (!bsep || bsep2 > bsep)) bsep = bsep2;
-#endif
                             if (bsep) {
                                 *(bsep + 1) = '\0';
                                 snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", bdir);
@@ -1117,10 +951,6 @@ int main(int argc, char *argv[]) {
                             char dir[1024];
                             snprintf(dir, sizeof(dir), "%s", ps.filepath);
                             char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-                            char *sep2 = strrchr(dir, '\\');
-                            if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
                             if (sep) {
                                 *(sep + 1) = '\0';
                                 snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
@@ -1493,10 +1323,6 @@ int main(int argc, char *argv[]) {
                             char dir[1024];
                             snprintf(dir, sizeof(dir), "%s", ps.filepath);
                             char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-                            char *sep2 = strrchr(dir, '\\');
-                            if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
                             if (sep) {
                                 *(sep + 1) = '\0';
                                 snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);

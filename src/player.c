@@ -901,7 +901,6 @@ static int gpu_create_video_textures(PlayerState *ps) {
     /* UV interleaved texture for zero-copy (R16G16_UNORM, half res).
      * Only created when VAAPI zero-copy is active for P010 content.
      * The shader reads .r = U, .g = V from this single texture. */
-#ifndef _WIN32
     if (ps->vaapi_zerocopy && is_10bit) {
         SDL_GPUTextureCreateInfo uv_info;
         SDL_zero(uv_info);
@@ -919,8 +918,6 @@ static int gpu_create_video_textures(PlayerState *ps) {
         } else {
             log_msg("GPU: zero-copy UV texture created (R16G16_UNORM %dx%d)", cw, ch);
         }
-    }
-#endif
 
     /* Transfer buffers (CPU→GPU staging) */
     SDL_GPUTransferBufferCreateInfo xfer_info;
@@ -1736,7 +1733,6 @@ static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
  *   VK_EXT_external_memory_dma_buf, VK_EXT_image_drm_format_modifier.
  */
 
-#ifndef _WIN32
 
 /* ── SDL_GPU Internal Struct Offsets (SDL3 3.4.2, x86_64 Linux) ── */
 
@@ -2303,7 +2299,6 @@ fail_close_fds:
     return -1;
 }
 
-#endif /* _WIN32 */
 
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3015,9 +3010,7 @@ void player_close(PlayerState *ps) {
     gpu_destroy_video_textures(ps);
 
     /* ── VAAPI zero-copy cleanup ── */
-#ifndef _WIN32
     vaapi_zerocopy_cleanup(ps);
-#endif
 
     /* Reset state */
     ps->playing            = 0;
@@ -3341,7 +3334,6 @@ int decode_thread_func(void *arg) {
             int ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
             if (ret == 0) {
                 if (ps->vaapi_active) {
-#ifndef _WIN32
                     if (ps->vaapi_zerocopy) {
                         /* Zero-copy: keep raw VAAPI surface in decoded_frame.
                          * No GPU→CPU readback. data[3] = VASurfaceID.
@@ -3350,7 +3342,6 @@ int decode_thread_func(void *arg) {
                         av_frame_unref(ps->decoded_frame);
                         av_frame_move_ref(ps->decoded_frame, ps->hw_frame);
                     } else
-#endif
                     {
                         /* Readback path: GPU→CPU transfer (35-42ms at 4K) */
                         av_frame_unref(ps->decoded_frame);
@@ -4017,12 +4008,8 @@ void video_display(PlayerState *ps) {
     if (!ps->gpu_tex_y || !ps->video_frame) return;
     /* In zero-copy mode, video_frame is a raw VAAPI surface: data[3] = VASurfaceID,
      * data[0] may be NULL. In readback mode, data[0] has CPU pixel data. */
-#ifndef _WIN32
     if (!ps->vaapi_zerocopy && !ps->video_frame->data[0]) return;
     if (ps->vaapi_zerocopy && !ps->video_frame->data[3]) return;
-#else
-    if (!ps->video_frame->data[0]) return;
-#endif
     if (ps->seeking) return;
 
     int zerocopy_ok = 0;  /* 1 = zero-copy upload succeeded this frame */
@@ -4045,7 +4032,6 @@ void video_display(PlayerState *ps) {
          && !ps->sws_ctx);
 
     if (ps->vaapi_active) {
-#ifndef _WIN32
         if (ps->vaapi_zerocopy && ps->gpu_tex_uv) {
             /* ── VAAPI zero-copy path ──
              *
@@ -4066,7 +4052,6 @@ void video_display(PlayerState *ps) {
             }
         }
         if (!zerocopy_ok)
-#endif
         {
         /* ── VAAPI semi-planar path ──
          *
@@ -4163,14 +4148,12 @@ void video_display(PlayerState *ps) {
 #ifdef DSVP_PROFILE
         double t_before_peak = get_time_sec();
 #endif
-#ifndef _WIN32
         if (zerocopy_ok) {
             /* Zero-copy: no CPU pixel data for luma histogram.
              * Use static metadata peak (from container or DV RPU).
              * DV P5 already uses static peak regardless. */
             ps->gpu_uniforms.hdr_peak_nits = ps->hdr_static_peak;
         } else
-#endif
         {
             hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit);
         }
@@ -4308,13 +4291,9 @@ void video_display(PlayerState *ps) {
 
         SDL_GPUTextureSamplerBinding bindings[4] = {
             { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
-#ifndef _WIN32
             { .texture = (zerocopy_ok && ps->gpu_tex_uv)
                          ? ps->gpu_tex_uv : ps->gpu_tex_u,
                                             .sampler = ps->gpu_sampler },
-#else
-            { .texture = ps->gpu_tex_u,     .sampler = ps->gpu_sampler },
-#endif
             { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
             { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
         };
@@ -4428,13 +4407,9 @@ void video_reblit(PlayerState *ps) {
 
         SDL_GPUTextureSamplerBinding bindings[4] = {
             { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
-#ifndef _WIN32
             { .texture = (ps->vaapi_zerocopy && ps->gpu_tex_uv)
                          ? ps->gpu_tex_uv : ps->gpu_tex_u,
                                             .sampler = ps->gpu_sampler },
-#else
-            { .texture = ps->gpu_tex_u,     .sampler = ps->gpu_sampler },
-#endif
             { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
             { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
         };
