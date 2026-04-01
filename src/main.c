@@ -20,57 +20,6 @@
 #include <dirent.h>
 
 /* ═══════════════════════════════════════════════════════════════════
- * File Open Dialog (Desktop Mode — zenity/kdialog/yad)
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Returns 1 if a file was selected (path written to `out`), 0 if cancelled. */
-static int open_file_dialog(char *out, int out_size) {
-    FILE *fp = NULL;
-
-    /* Try zenity, then kdialog, then yad */
-    const char *commands[] = {
-        "zenity --file-selection --title='Open Media File' "
-            "--file-filter='Media files|*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma' "
-            "--file-filter='All files|*' 2>/dev/null",
-        "kdialog --getopenfilename . "
-            "'Media files (*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma)' 2>/dev/null",
-        "yad --file-selection --title='Open Media File' 2>/dev/null",
-        NULL
-    };
-    const char *names[] = { "zenity", "kdialog", "yad" };
-
-    for (int i = 0; commands[i]; i++) {
-        /* Check if the tool exists before trying it */
-        char which_cmd[64];
-        snprintf(which_cmd, sizeof(which_cmd), "which %s >/dev/null 2>&1", names[i]);
-        if (system(which_cmd) == 0) {
-            log_msg("File dialog: using %s", names[i]);
-            fp = popen(commands[i], "r");
-            break;
-        }
-    }
-
-    if (!fp) {
-        log_msg("ERROR: No file dialog available. Install zenity, kdialog, or yad.");
-        log_msg("  Debian/Ubuntu: sudo apt install zenity");
-        log_msg("  Fedora: sudo dnf install zenity");
-        log_msg("  Tip: you can also pass a file path on the command line: ./dsvp video.mp4");
-        return 0;
-    }
-
-    if (fgets(out, out_size, fp)) {
-        /* Remove trailing newline */
-        size_t len = strlen(out);
-        if (len > 0 && out[len - 1] == '\n') out[len - 1] = '\0';
-        pclose(fp);
-        return (strlen(out) > 0) ? 1 : 0;
-    }
-    pclose(fp);
-    return 0;
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
  * Folder Playlist — prev/next file navigation
  * ═══════════════════════════════════════════════════════════════════
  *
@@ -563,38 +512,14 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_O: {
-                    char path[1024] = {0};
-                    log_msg("File open dialog requested");
-                    /* Pause audio while dialog blocks the render loop */
-                    int was_playing = ps.playing && !ps.paused;
-                    if (was_playing && ps.audio_stream)
-                        SDL_PauseAudioStreamDevice(ps.audio_stream);
-                    if (open_file_dialog(path, sizeof(path))) {
-                        log_msg("Opening file: %s", path);
-                        if (ps.playing) player_close(&ps);
-                        ps.quit = 0;
-                        if (player_open(&ps, path) != 0) {
-                            log_msg("ERROR: Failed to open: %s", path);
-                        } else {
-                            playlist_scan(&ps);
-                            /* Sync browser to opened file's directory */
-                            char bdir[1024];
-                            snprintf(bdir, sizeof(bdir), "%s", path);
-                            char *bsep = strrchr(bdir, '/');
-                            if (bsep) {
-                                *(bsep + 1) = '\0';
-                                snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", bdir);
-                                browser_scan(&ps);
-                                browser_save_path(&ps);
-                            }
-                        }
-                    } else {
-                        log_msg("File dialog cancelled");
-                        /* Resume audio and resync frame timer */
-                        if (was_playing && ps.audio_stream) {
-                            ps.frame_timer = get_time_sec();
-                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                        }
+                    /* Open integrated file browser (replaces external dialog).
+                     * If playing, close first so we return to browser. */
+                    log_msg("File browser requested (O key)");
+                    if (ps.playing) player_close(&ps);
+                    ps.show_controls = 0;
+                    if (!ps.browser_active) {
+                        browser_init(&ps);
+                        ps.browser_active = 1;
                     }
                     break;
                 }
@@ -932,11 +857,11 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     } else if (!ps.playing) {
-                        /* Fallback: open file dialog */
-                        SDL_Event fake = {0};
-                        fake.type = SDL_EVENT_KEY_DOWN;
-                        fake.key.key = SDLK_O;
-                        SDL_PushEvent(&fake);
+                        /* Activate integrated file browser */
+                        if (!ps.browser_active) {
+                            browser_init(&ps);
+                            ps.browser_active = 1;
+                        }
                     } else {
                         /* Playing: show seek bar */
                         ps.show_seekbar = 1;

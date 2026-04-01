@@ -783,7 +783,6 @@ void overlay_render_idle(PlayerState *ps) {
         { "B / N",      "Prev / Next File",    "D-Pad L/R" },
         { "D",          "Debug Overlay",       "Select"    },
         { "F",          "Toggle Fullscreen",   ""          },
-        { "V",          "VSync / Mailbox",     ""          },
         { NULL, NULL, NULL }
     };
 
