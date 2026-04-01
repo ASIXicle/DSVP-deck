@@ -226,6 +226,7 @@ typedef struct PlayerState {
     int                         overlay_dirty;         /* 1 = need re-upload */
 
     /* ── Timing / A/V sync ── */
+    double              io_deadline;      /* abort FFmpeg I/O after this time */
     double              audio_clock;      /* current audio PTS in secs (audio thread internal) */
     double              audio_clock_sync; /* latency-corrected snapshot for main thread A/V sync */
     double              av_bias;          /* adaptive A/V offset (EMA of av_diff) */
@@ -270,6 +271,7 @@ typedef struct PlayerState {
     double              volume;           /* 0.0 — 1.0                  */
     int                 fullscreen;
     int                 eof;              /* demuxer hit end of file    */
+    int                 io_error;         /* demux thread hit I/O error (NFS loss etc.) */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
     int                 present_mailbox;  /* 0 = VSYNC (FIFO), 1 = MAILBOX (triple-buf) */
 

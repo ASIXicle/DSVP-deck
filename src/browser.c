@@ -27,6 +27,65 @@ extern const char *video_extensions[];
 extern int is_media_file(const char *name);
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Non-blocking path accessibility check
+ *
+ * stat() on a stale NFS mount blocks for 30-60+ seconds in the kernel.
+ * We can't cancel it, so we run it in a detached thread and wait on
+ * a semaphore with a short timeout. If the thread completes in time,
+ * we get the result. If not, we abandon the thread (small leak, once)
+ * and fall back to a safe local path.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char    *path;
+    SDL_Semaphore *sem;
+    int            result;  /* 1 = accessible directory, 0 = not */
+} PathCheckArgs;
+
+static int path_check_thread(void *arg) {
+    PathCheckArgs *a = (PathCheckArgs *)arg;
+    struct stat st;
+    a->result = (stat(a->path, &st) == 0 && S_ISDIR(st.st_mode));
+    SDL_PostSemaphore(a->sem);
+    return 0;
+}
+
+/* Returns 1 if path is an accessible directory, 0 if not or timeout.
+ * timeout_ms: max time to wait (e.g. 2000 for 2 seconds). */
+static int path_accessible(const char *path, int timeout_ms) {
+    /* Fast path: local paths (starting with /home) rarely stall */
+    SDL_Semaphore *sem = SDL_CreateSemaphore(0);
+    if (!sem) {
+        /* Fallback: blocking stat (old behavior) */
+        struct stat st;
+        return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+    }
+
+    PathCheckArgs args = { .path = path, .sem = sem, .result = 0 };
+    SDL_Thread *t = SDL_CreateThread(path_check_thread, "pathchk", &args);
+    if (!t) {
+        SDL_DestroySemaphore(sem);
+        struct stat st;
+        return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+    }
+
+    int ok = SDL_WaitSemaphoreTimeout(sem, timeout_ms);
+    SDL_DestroySemaphore(sem);
+
+    if (ok) {
+        /* Thread completed in time */
+        SDL_WaitThread(t, NULL);
+        return args.result;
+    } else {
+        /* Timeout — thread is stuck in kernel stat().
+         * Detach it; small leak, but only happens with stale NFS. */
+        SDL_DetachThread(t);
+        log_msg("browser: path check timed out (%dms): %s", timeout_ms, path);
+        return 0;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Path Persistence — ~/.config/dsvp/last_path
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -87,10 +146,9 @@ static void browser_load_path(PlayerState *ps) {
         fclose(f);
     }
 
-    /* Validate the saved path still exists */
+    /* Validate the saved path still exists (2s timeout for stale NFS) */
     if (ps->browser_path[0]) {
-        struct stat st;
-        if (stat(ps->browser_path, &st) != 0 || !S_ISDIR(st.st_mode))
+        if (!path_accessible(ps->browser_path, 2000))
             ps->browser_path[0] = '\0';
     }
 
@@ -144,6 +202,17 @@ void browser_scan(PlayerState *ps) {
     browser_free_entries(ps);
 
     if (!ps->browser_path[0]) return;
+
+    /* Check path is reachable (2s timeout for stale NFS).
+     * Fall back to $HOME if the current path is stuck. */
+    if (!path_accessible(ps->browser_path, 2000)) {
+        log_msg("browser: path inaccessible, falling back to HOME: %s",
+                ps->browser_path);
+        const char *home = getenv("HOME");
+        snprintf(ps->browser_path, sizeof(ps->browser_path), "%s/",
+                 home ? home : "/");
+        /* HOME itself should never stall, but don't recurse — just proceed */
+    }
 
     int capacity = 128;
     BrowseEntry *entries = malloc(capacity * sizeof(BrowseEntry));

@@ -2306,23 +2306,49 @@ fail_close_fds:
  * Open / Close
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* FFmpeg interrupt callback — allows aborting blocked I/O.
+ * Called periodically by FFmpeg during av_read_frame, av_seek_frame,
+ * and avformat_open_input. Returns 1 to abort, 0 to continue.
+ * Without this, reads from stale NFS mounts block indefinitely. */
+static int io_interrupt_cb(void *opaque) {
+    PlayerState *ps = (PlayerState *)opaque;
+    if (ps->quit) return 1;
+    if (ps->io_deadline > 0.0 && get_time_sec() > ps->io_deadline) {
+        log_msg("I/O timeout — aborting blocked read");
+        return 1;
+    }
+    return 0;
+}
+
 /* Open a media file: probe format, find best streams, init decoders,
  * set up scaling context, create GPU textures, start demux thread. */
 int player_open(PlayerState *ps, const char *filename) {
     int ret;
 
     strncpy(ps->filepath, filename, sizeof(ps->filepath) - 1);
+    ps->io_error = 0;
     log_msg("player_open: %s", filename);
 
     /* ── Open container ── */
-    ps->fmt_ctx = NULL;
+    ps->fmt_ctx = avformat_alloc_context();
+    if (!ps->fmt_ctx) {
+        log_msg("ERROR: avformat_alloc_context failed");
+        return -1;
+    }
+    ps->fmt_ctx->interrupt_callback.callback = io_interrupt_cb;
+    ps->fmt_ctx->interrupt_callback.opaque   = ps;
+
+    ps->io_deadline = get_time_sec() + 10.0;
     ret = avformat_open_input(&ps->fmt_ctx, filename, NULL, NULL);
+    ps->io_deadline = 0.0;
     if (ret < 0) {
         log_msg("ERROR: avformat_open_input failed: %s", av_err2str(ret));
         return -1;
     }
 
+    ps->io_deadline = get_time_sec() + 10.0;
     ret = avformat_find_stream_info(ps->fmt_ctx, NULL);
+    ps->io_deadline = 0.0;
     if (ret < 0) {
         log_msg("ERROR: avformat_find_stream_info failed: %s", av_err2str(ret));
         avformat_close_input(&ps->fmt_ctx);
@@ -3086,7 +3112,9 @@ int demux_thread_func(void *arg) {
             if (ps->audio_stream)
                 SDL_PauseAudioStreamDevice(ps->audio_stream);
 
+            ps->io_deadline = get_time_sec() + 10.0;
             int ret = av_seek_frame(ps->fmt_ctx, -1, target, ps->seek_flags);
+            ps->io_deadline = 0.0;
             if (ret < 0) {
                 log_msg("ERROR: Seek failed: %s", av_err2str(ret));
             } else {
@@ -3164,7 +3192,9 @@ int demux_thread_func(void *arg) {
         }
 
         /* ── Read next packet ── */
+        ps->io_deadline = get_time_sec() + 10.0;
         int ret = av_read_frame(ps->fmt_ctx, pkt);
+        ps->io_deadline = 0.0;
         if (ret < 0) {
             if (ret == AVERROR_EOF || avio_feof(ps->fmt_ctx->pb)) {
                 if (!ps->eof) log_msg("Demux: reached end of file");
@@ -3172,8 +3202,13 @@ int demux_thread_func(void *arg) {
                 SDL_Delay(100);
                 continue;
             }
-            log_msg("ERROR: av_read_frame failed: %s", av_err2str(ret));
-            break; /* real error */
+            if (ret == AVERROR_EXIT) {
+                log_msg("Demux: I/O aborted (network loss or timeout)");
+            } else {
+                log_msg("ERROR: av_read_frame failed: %s", av_err2str(ret));
+            }
+            ps->io_error = 1;
+            break; /* real error — exit demux loop, player_close will clean up */
         }
 
         /* Route packet to the correct queue */

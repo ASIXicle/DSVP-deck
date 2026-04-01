@@ -1303,6 +1303,15 @@ int main(int argc, char *argv[]) {
             } else {
                 SDL_UnlockMutex(ps.decode_mutex);
 
+                /* I/O error (stale NFS, network loss) — close and return to browser */
+                if (ps.io_error) {
+                    log_msg("I/O error detected — closing playback, returning to browser");
+                    player_close(&ps);
+                    ps.browser_active = 1;
+                    ps.quit = 0;
+                    continue;
+                }
+
                 /* EOF detection: decode thread drained, no packets left */
                 if (!frame_avail && ps.eof && ps.decode_eof
                         && ps.video_pq.nb_packets == 0
