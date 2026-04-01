@@ -147,14 +147,14 @@ static int open_file_dialog(char *out, int out_size) {
  * sorts alphabetically, and allows navigating to adjacent entries.
  */
 
-static const char *video_extensions[] = {
+const char *video_extensions[] = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
     ".ts", ".m2ts", ".mpg", ".mpeg", ".3gp",
     ".mp3", ".flac", ".wav", ".aac", ".ogg", ".opus", ".m4a", ".wma",
     NULL
 };
 
-static int is_media_file(const char *name) {
+int is_media_file(const char *name) {
     const char *dot = strrchr(name, '.');
     if (!dot) return 0;
     for (int i = 0; video_extensions[i]; i++) {
@@ -340,8 +340,11 @@ static void gpu_draw_idle(PlayerState *ps) {
     ps->sc_w = phys_w;
     ps->sc_h = phys_h;
 
-    /* Render idle screen text to overlay pixel buffer */
-    overlay_render_idle(ps);
+    /* Render browser or idle screen to overlay pixel buffer */
+    if (ps->browser_active)
+        overlay_render_browser(ps);
+    else
+        overlay_render_idle(ps);
 
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
     if (!cmd) return;
@@ -611,6 +614,29 @@ int main(int argc, char *argv[]) {
         SDL_free(gamepads);
     }
 
+    /* ── Initialize built-in file browser ──
+     * Always active — shown whenever no file is playing.
+     * If a file was opened from the command line, seed the
+     * browser path to that file's parent directory. */
+    browser_init(&ps);
+    if (ps.playing && ps.filepath[0]) {
+        /* Set browser to directory of the opened file */
+        char dir[1024];
+        strncpy(dir, ps.filepath, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        char *sep = strrchr(dir, '/');
+#ifdef _WIN32
+        char *sep2 = strrchr(dir, '\\');
+        if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+        if (sep) {
+            *(sep + 1) = '\0';
+            strncpy(ps.browser_path, dir, sizeof(ps.browser_path) - 1);
+            browser_scan(&ps);
+            browser_save_path(&ps);
+        }
+    }
+
     /* ── Main loop ── */
     while (!ps.quit) {
         SDL_Event ev;
@@ -623,12 +649,69 @@ int main(int argc, char *argv[]) {
                 break;
 
             case SDL_EVENT_KEY_DOWN:
+                /* ── Browser navigation (when shown and no file playing) ── */
+                if (ps.browser_active && !ps.playing) {
+                    int browser_consumed = 1;
+                    switch (ev.key.key) {
+                    case SDLK_UP:
+                        browser_navigate(&ps, -1);
+                        break;
+                    case SDLK_DOWN:
+                        browser_navigate(&ps, 1);
+                        break;
+                    case SDLK_LEFT:
+                        browser_page(&ps, -1);
+                        break;
+                    case SDLK_RIGHT:
+                        browser_page(&ps, 1);
+                        break;
+                    case SDLK_RETURN:
+                    case SDLK_KP_ENTER:
+                        if (browser_enter(&ps)) {
+                            log_msg("Browser: opening %s",
+                                    ps.browser_selected_file);
+                            if (player_open(&ps, ps.browser_selected_file) != 0) {
+                                log_msg("ERROR: Failed to open: %s",
+                                        ps.browser_selected_file);
+                            } else {
+                                playlist_scan(&ps);
+                            }
+                        }
+                        break;
+                    case SDLK_BACKSPACE:
+                        if (!browser_at_root(&ps))
+                            browser_back(&ps);
+                        break;
+                    default:
+                        browser_consumed = 0;
+                        break;
+                    }
+                    if (browser_consumed) break;
+                }
                 switch (ev.key.key) {
 
                 case SDLK_Q:
                     if (ps.playing) {
+                        /* Update browser to current file's directory */
+                        if (ps.filepath[0]) {
+                            char dir[1024];
+                            strncpy(dir, ps.filepath, sizeof(dir) - 1);
+                            dir[sizeof(dir) - 1] = '\0';
+                            char *sep = strrchr(dir, '/');
+#ifdef _WIN32
+                            char *sep2 = strrchr(dir, '\\');
+                            if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+                            if (sep) {
+                                *(sep + 1) = '\0';
+                                strncpy(ps.browser_path, dir,
+                                        sizeof(ps.browser_path) - 1);
+                                browser_scan(&ps);
+                                browser_save_path(&ps);
+                            }
+                        }
                         player_close(&ps);
-                        ps.quit = 0; /* don't exit, return to idle */
+                        ps.quit = 0; /* return to browser, not exit */
                     } else {
                         ps.quit = 1;
                     }
@@ -649,6 +732,22 @@ int main(int argc, char *argv[]) {
                             log_msg("ERROR: Failed to open: %s", path);
                         } else {
                             playlist_scan(&ps);
+                            /* Sync browser to opened file's directory */
+                            char bdir[1024];
+                            strncpy(bdir, path, sizeof(bdir) - 1);
+                            bdir[sizeof(bdir) - 1] = '\0';
+                            char *bsep = strrchr(bdir, '/');
+#ifdef _WIN32
+                            char *bsep2 = strrchr(bdir, '\\');
+                            if (bsep2 && (!bsep || bsep2 > bsep)) bsep = bsep2;
+#endif
+                            if (bsep) {
+                                *(bsep + 1) = '\0';
+                                strncpy(ps.browser_path, bdir,
+                                        sizeof(ps.browser_path) - 1);
+                                browser_scan(&ps);
+                                browser_save_path(&ps);
+                            }
                         }
                     } else {
                         log_msg("File dialog cancelled");
@@ -980,8 +1079,20 @@ int main(int argc, char *argv[]) {
                 switch (ev.gbutton.button) {
 
                 case SDL_GAMEPAD_BUTTON_SOUTH:  /* A — Select / Play */
-                    if (!ps.playing) {
-                        /* Idle: open file (same as Start/O) */
+                    if (!ps.playing && ps.browser_active) {
+                        /* Browser: select entry */
+                        if (browser_enter(&ps)) {
+                            log_msg("Browser: opening %s",
+                                    ps.browser_selected_file);
+                            if (player_open(&ps, ps.browser_selected_file) != 0) {
+                                log_msg("ERROR: Failed to open: %s",
+                                        ps.browser_selected_file);
+                            } else {
+                                playlist_scan(&ps);
+                            }
+                        }
+                    } else if (!ps.playing) {
+                        /* Fallback: open file dialog */
                         SDL_Event fake = {0};
                         fake.type = SDL_EVENT_KEY_DOWN;
                         fake.key.key = SDLK_O;
@@ -1009,8 +1120,28 @@ int main(int argc, char *argv[]) {
 
                 case SDL_GAMEPAD_BUTTON_EAST:   /* B — Back / Stop */
                     if (ps.playing) {
+                        /* Update browser to current file's directory */
+                        if (ps.filepath[0]) {
+                            char dir[1024];
+                            strncpy(dir, ps.filepath, sizeof(dir) - 1);
+                            dir[sizeof(dir) - 1] = '\0';
+                            char *sep = strrchr(dir, '/');
+#ifdef _WIN32
+                            char *sep2 = strrchr(dir, '\\');
+                            if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+                            if (sep) {
+                                *(sep + 1) = '\0';
+                                strncpy(ps.browser_path, dir,
+                                        sizeof(ps.browser_path) - 1);
+                                browser_scan(&ps);
+                                browser_save_path(&ps);
+                            }
+                        }
                         player_close(&ps);
                         ps.quit = 0;
+                    } else if (ps.browser_active && !browser_at_root(&ps)) {
+                        browser_back(&ps);
                     } else {
                         ps.quit = 1;
                     }
@@ -1033,7 +1164,9 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDL_GAMEPAD_BUTTON_DPAD_UP:    /* D-pad: nav/volume */
-                    if (ps.playing) {
+                    if (!ps.playing && ps.browser_active) {
+                        browser_navigate(&ps, -1);
+                    } else if (ps.playing) {
                         ps.volume += VOLUME_STEP;
                         if (ps.volume > 1.0) ps.volume = 1.0;
                         if (ps.audio_stream)
@@ -1044,7 +1177,9 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
-                    if (ps.playing) {
+                    if (!ps.playing && ps.browser_active) {
+                        browser_navigate(&ps, 1);
+                    } else if (ps.playing) {
                         ps.volume -= VOLUME_STEP;
                         if (ps.volume < 0.0) ps.volume = 0.0;
                         if (ps.audio_stream)
@@ -1054,21 +1189,29 @@ int main(int argc, char *argv[]) {
                     }
                     break;
 
-                case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  /* Prev file */
+                case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  /* Prev file / Page up */
                 {
-                    SDL_Event fake = {0};
-                    fake.type = SDL_EVENT_KEY_DOWN;
-                    fake.key.key = SDLK_B;
-                    SDL_PushEvent(&fake);
+                    if (!ps.playing && ps.browser_active) {
+                        browser_page(&ps, -1);
+                    } else {
+                        SDL_Event fake = {0};
+                        fake.type = SDL_EVENT_KEY_DOWN;
+                        fake.key.key = SDLK_B;
+                        SDL_PushEvent(&fake);
+                    }
                     break;
                 }
 
-                case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: /* Next file */
+                case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: /* Next file / Page down */
                 {
-                    SDL_Event fake = {0};
-                    fake.type = SDL_EVENT_KEY_DOWN;
-                    fake.key.key = SDLK_N;
-                    SDL_PushEvent(&fake);
+                    if (!ps.playing && ps.browser_active) {
+                        browser_page(&ps, 1);
+                    } else {
+                        SDL_Event fake = {0};
+                        fake.type = SDL_EVENT_KEY_DOWN;
+                        fake.key.key = SDLK_N;
+                        SDL_PushEvent(&fake);
+                    }
                     break;
                 }
 
@@ -1302,7 +1445,25 @@ int main(int argc, char *argv[]) {
                 if (!frame_avail && ps.eof && ps.decode_eof
                         && ps.video_pq.nb_packets == 0
                         && ps.audio_pq.nb_packets == 0) {
-                    log_msg("Playback finished, returning to idle");
+                    log_msg("Playback finished, returning to browser");
+                    /* Sync browser to current file's directory */
+                    if (ps.filepath[0]) {
+                        char dir[1024];
+                        strncpy(dir, ps.filepath, sizeof(dir) - 1);
+                        dir[sizeof(dir) - 1] = '\0';
+                        char *sep = strrchr(dir, '/');
+#ifdef _WIN32
+                        char *sep2 = strrchr(dir, '\\');
+                        if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+                        if (sep) {
+                            *(sep + 1) = '\0';
+                            strncpy(ps.browser_path, dir,
+                                    sizeof(ps.browser_path) - 1);
+                            browser_scan(&ps);
+                            browser_save_path(&ps);
+                        }
+                    }
                     player_close(&ps);
                     ps.quit = 0;
                 }
@@ -1440,7 +1601,7 @@ int main(int argc, char *argv[]) {
                 video_reblit(&ps);
             }
         } else {
-            /* No media loaded — draw idle screen */
+            /* No media loaded — draw browser (or idle if browser inactive) */
             gpu_draw_idle(&ps);
             SDL_ShowCursor();
         }
@@ -1455,6 +1616,7 @@ int main(int argc, char *argv[]) {
     log_msg("Shutting down");
     if (ps.playing) player_close(&ps);
     if (ps.gamepad) SDL_CloseGamepad(ps.gamepad);
+    browser_free_entries(&ps);
     playlist_free(&ps);
     sub_close_font();
     gpu_destroy_pipelines(&ps);

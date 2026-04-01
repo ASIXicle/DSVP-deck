@@ -811,7 +811,177 @@ void overlay_render_idle(PlayerState *ps) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * Master Render — called once per frame from main.c
+ * File Browser Screen — Game Mode d-pad/keyboard navigable
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Renders the built-in file browser: current path at top, scrollable
+ * file list with highlight bar, and input hints at bottom.
+ * Uses the same bitmap font and dark background as the idle screen.
+ */
+
+void overlay_render_browser(PlayerState *ps) {
+    int w = (ps->sc_w > 0) ? ps->sc_w : ps->win_w;
+    int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
+    if (w <= 0 || h <= 0) return;
+
+    s_ui_scale = ps->fullscreen ? 2 : 1;
+
+    if (gpu_overlay_ensure(ps, w, h) < 0) {
+        ps->overlay_active = 0;
+        return;
+    }
+
+    size_t buf_size = (size_t)w * h * 4;
+    if (s_pix_w != w || s_pix_h != h) {
+        free(s_pixels);
+        s_pixels = malloc(buf_size);
+        if (!s_pixels) { ps->overlay_active = 0; return; }
+        s_pix_w = w;
+        s_pix_h = h;
+    }
+    memset(s_pixels, 0, buf_size);
+
+    int S = s_ui_scale;
+    int margin = 16 * S;
+    int font_scale = 2 * S;
+    int line_h = (FONT_H + FONT_LINE) * font_scale;
+    int y = margin;
+
+    /* ── Title bar: "DSVP" small + current path ── */
+    {
+        int title_scale = 3 * S;
+        draw_text(s_pixels, w, h, margin, y, "DSVP", title_scale,
+                  180, 190, 210);
+        y += FONT_H * title_scale + 8 * S;
+    }
+
+    /* Current directory path in accent color */
+    {
+        /* Truncate path display if too wide */
+        const char *disp_path = ps->browser_path;
+        int max_chars = (w - 2 * margin) / ((FONT_W + FONT_GAP) * font_scale);
+        char trunc_path[256];
+        int plen = (int)strlen(disp_path);
+        if (plen > max_chars && max_chars > 6) {
+            snprintf(trunc_path, sizeof(trunc_path), "...%s",
+                     disp_path + plen - (max_chars - 3));
+            disp_path = trunc_path;
+        }
+        draw_text(s_pixels, w, h, margin, y, disp_path, font_scale,
+                  180, 200, 240);
+        y += line_h + 4 * S;
+    }
+
+    /* Separator line */
+    fill_rect(s_pixels, w, h, margin, y, w - 2 * margin, 1 * S,
+              80, 80, 90, 200);
+    y += 6 * S;
+
+    /* ── File list ── */
+    int list_top = y;
+    int hint_h = line_h + margin;  /* space reserved for bottom hints */
+    int avail_h = h - list_top - hint_h;
+    int max_visible = avail_h / line_h;
+    if (max_visible < 1) max_visible = 1;
+    if (max_visible > BROWSER_MAX_VISIBLE) max_visible = BROWSER_MAX_VISIBLE;
+
+    if (ps->browser_count == 0) {
+        draw_text(s_pixels, w, h, margin + 8 * S, y, "(empty directory)",
+                  font_scale, 100, 100, 110);
+    } else {
+        /* Ensure scroll keeps selection visible */
+        if (ps->browser_sel < ps->browser_scroll)
+            ps->browser_scroll = ps->browser_sel;
+        if (ps->browser_sel >= ps->browser_scroll + max_visible)
+            ps->browser_scroll = ps->browser_sel - max_visible + 1;
+
+        int end = ps->browser_scroll + max_visible;
+        if (end > ps->browser_count) end = ps->browser_count;
+
+        /* Scroll indicator: up arrow */
+        if (ps->browser_scroll > 0) {
+            draw_text(s_pixels, w, h, w - margin - (FONT_W + FONT_GAP) * font_scale,
+                      list_top, "^", font_scale, 140, 140, 160);
+        }
+
+        for (int i = ps->browser_scroll; i < end; i++) {
+            int row_y = list_top + (i - ps->browser_scroll) * line_h;
+            int selected = (i == ps->browser_sel);
+
+            /* Highlight bar for selected item */
+            if (selected) {
+                fill_rect(s_pixels, w, h, margin - 4 * S, row_y - 1 * S,
+                          w - 2 * margin + 8 * S, line_h,
+                          50, 60, 80, 180);
+            }
+
+            /* Entry text */
+            uint8_t r, g, b;
+            if (ps->browser_is_dir[i]) {
+                r = 120; g = 180; b = 240;  /* blue for directories */
+            } else {
+                r = 200; g = 200; b = 210;  /* light gray for files */
+            }
+            if (selected) { r += 30; g += 30; b += 30; }  /* brighten */
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+
+            /* Truncate long names */
+            int max_chars = (w - 2 * margin - 8 * S)
+                            / ((FONT_W + FONT_GAP) * font_scale);
+            char display[300];
+            if ((int)strlen(ps->browser_names[i]) > max_chars && max_chars > 5) {
+                snprintf(display, sizeof(display), "%.*s...",
+                         max_chars - 3, ps->browser_names[i]);
+            } else {
+                snprintf(display, sizeof(display), "%s", ps->browser_names[i]);
+            }
+
+            draw_text(s_pixels, w, h, margin + 4 * S, row_y,
+                      display, font_scale, r, g, b);
+        }
+
+        /* Scroll indicator: down arrow */
+        if (end < ps->browser_count) {
+            int arrow_y = list_top + (end - ps->browser_scroll) * line_h;
+            if (arrow_y + line_h < h - hint_h)
+                draw_text(s_pixels, w, h,
+                          w - margin - (FONT_W + FONT_GAP) * font_scale,
+                          arrow_y, "v", font_scale, 140, 140, 160);
+        }
+
+        /* Entry count */
+        {
+            char countstr[64];
+            snprintf(countstr, sizeof(countstr), "%d/%d",
+                     ps->browser_sel + 1, ps->browser_count);
+            int cw = text_width(countstr, font_scale);
+            draw_text(s_pixels, w, h, w - margin - cw,
+                      list_top - line_h - 2 * S,
+                      countstr, font_scale, 100, 100, 110);
+        }
+    }
+
+    /* ── Bottom hint bar ── */
+    {
+        int hint_y = h - hint_h + 4 * S;
+        fill_rect(s_pixels, w, h, 0, hint_y - 4 * S, w, hint_h,
+                  0, 0, 0, 140);
+
+        const char *hint;
+        if (ps->gamepad_active)
+            hint = "A:Open  B:Back  Start:Dialog  D-pad:Navigate";
+        else
+            hint = "Enter:Open  Backspace:Back  O:Dialog  Arrows:Navigate";
+
+        draw_text(s_pixels, w, h, margin, hint_y, hint, font_scale,
+                  140, 150, 170);
+    }
+
+    gpu_overlay_upload(ps, s_pixels, w, h);
+    ps->overlay_active = 1;
+}
  * ═══════════════════════════════════════════════════════════════════
  *
  * Composites all active overlays into a single RGBA pixel buffer,

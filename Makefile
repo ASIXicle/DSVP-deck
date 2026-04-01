@@ -37,7 +37,7 @@ endif
 CFLAGS  = $(BASE_CFLAGS) $(SC_CFLAGS)
 LDFLAGS = $(BASE_LDFLAGS) $(SC_LDFLAGS)
 
-SRCS    = main.c player.c audio.c subtitle.c overlay.c log.c
+SRCS    = main.c player.c audio.c subtitle.c overlay.c browser.c log.c
 OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
 
 # Windows: append .exe, locate SDL3 DLLs via pkg-config, compile .rc for icon

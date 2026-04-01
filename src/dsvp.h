@@ -67,6 +67,10 @@
 #define DEFAULT_WIN_W       960
 #define DEFAULT_WIN_H       540
 
+/* Built-in file browser */
+#define BROWSER_MAX_VISIBLE 20   /* max visible entries in file list  */
+#define BROWSER_PATH_MAX    1024
+
 /* ── Packet Queue ───────────────────────────────────────────────────
  *
  * Thread-safe FIFO queue for AVPackets. The demux thread pushes packets,
@@ -278,6 +282,17 @@ typedef struct PlayerState {
     int                 gamepad_active;    /* 1 = gamepad connected, show pad hints  */
     float               trigger_seek_speed; /* analog seek multiplier (0.0 = idle)   */
 
+    /* ── Built-in file browser (steamdeck branch) ── */
+    int                 browser_active;       /* 1 = browser is shown (replaces idle)  */
+    char                browser_path[BROWSER_PATH_MAX]; /* current directory            */
+    char              **browser_entries;       /* full paths of entries                  */
+    char              **browser_names;         /* display names (with [DIR] prefix)     */
+    int                *browser_is_dir;        /* 1 = directory entry                   */
+    int                 browser_count;         /* total entries in current dir           */
+    int                 browser_sel;           /* selected index                        */
+    int                 browser_scroll;        /* first visible index (scroll offset)   */
+    char                browser_selected_file[BROWSER_PATH_MAX]; /* result of Enter     */
+
     /* ── Window geometry ── */
     int                 win_w, win_h;     /* current window size        */
     int                 vid_w, vid_h;     /* video native resolution    */
@@ -429,6 +444,19 @@ void  sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h);
 
 void  overlay_render(PlayerState *ps);
 void  overlay_render_idle(PlayerState *ps);
+void  overlay_render_browser(PlayerState *ps);
+
+/* ── Browser API (browser.c) ────────────────────────────────────── */
+
+void  browser_init(PlayerState *ps);
+void  browser_scan(PlayerState *ps);
+void  browser_free_entries(PlayerState *ps);
+void  browser_navigate(PlayerState *ps, int delta);
+void  browser_page(PlayerState *ps, int delta);
+int   browser_enter(PlayerState *ps);    /* returns 1 if file selected */
+void  browser_back(PlayerState *ps);
+int   browser_at_root(PlayerState *ps);
+void  browser_save_path(PlayerState *ps);
 
 /* ── Logging API (log.c) ───────────────────────────────────────────── */
 
