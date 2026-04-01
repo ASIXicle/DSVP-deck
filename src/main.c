@@ -1126,6 +1126,8 @@ int main(int argc, char *argv[]) {
                 double seek_delta = ps.trigger_seek_speed * 0.25;
                 player_seek(&ps, seek_delta);
                 last_trigger_seek = tnow;
+                ps.show_seekbar = 1;                          /* ADD */
+                ps.seekbar_hide_time = get_time_sec() + 3.0;  /* ADD */
             }
         }
 
