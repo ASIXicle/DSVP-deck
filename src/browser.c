@@ -46,7 +46,7 @@ static int path_check_thread(void *arg) {
     PathCheckArgs *a = (PathCheckArgs *)arg;
     struct stat st;
     a->result = (stat(a->path, &st) == 0 && S_ISDIR(st.st_mode));
-    SDL_PostSemaphore(a->sem);
+    SDL_SignalSemaphore(a->sem);
     return 0;
 }
 
