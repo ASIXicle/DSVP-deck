@@ -918,6 +918,7 @@ static int gpu_create_video_textures(PlayerState *ps) {
         } else {
             log_msg("GPU: zero-copy UV texture created (R16G16_UNORM %dx%d)", cw, ch);
         }
+    }
 
     /* Transfer buffers (CPU→GPU staging) */
     SDL_GPUTransferBufferCreateInfo xfer_info;
