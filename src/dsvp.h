@@ -281,6 +281,11 @@ typedef struct PlayerState {
     double              dpad_held_since;   /* wall time when d-pad was pressed        */
     double              dpad_last_repeat;  /* wall time of last repeat fire           */
 
+    /* ── Game Mode detection ── */
+    int                 game_mode;         /* 1 = Gamescope (Game Mode), 0 = Desktop */
+    int                 ui_scale;          /* font scale: 3 in Game Mode, 1 Desktop  */
+    int                 show_controls;     /* 1 = controls overlay visible (Start)   */
+
     /* ── Built-in file browser (steamdeck branch) ── */
     int                 browser_active;       /* 1 = browser is shown (replaces idle)  */
     char                browser_path[BROWSER_PATH_MAX]; /* current directory            */

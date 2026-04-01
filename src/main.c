@@ -421,6 +421,14 @@ int main(int argc, char *argv[]) {
     ps.gpu_uniforms.hdr_target_nits = 203.0f;
     ps.gpu_uniforms.hdr_midtone_gain = 1.3f;  /* default: moderate midtone lift */
 
+    /* ── Detect Game Mode vs Desktop Mode ──
+     * Gamescope (SteamOS Game Mode compositor) sets GAMESCOPE_WAYLAND_DISPLAY.
+     * When present: larger UI scale, gamepad-first UX, 16:10 fill.
+     * When absent: Desktop Mode — normal scale, keyboard/mouse UX. */
+    ps.game_mode = (getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL);
+    ps.ui_scale  = ps.game_mode ? 3 : 1;
+    log_msg("Mode: %s (ui_scale=%d)", ps.game_mode ? "Game Mode" : "Desktop", ps.ui_scale);
+
     /* ── Compile shaders and create GPU pipelines ── */
     if (gpu_create_pipelines(&ps) < 0) {
         fprintf(stderr, "[DSVP] GPU pipeline creation failed\n");
@@ -506,6 +514,7 @@ int main(int argc, char *argv[]) {
                     case SDLK_RETURN:
                     case SDLK_KP_ENTER:
                         if (browser_enter(&ps)) {
+                            ps.show_controls = 0;
                             log_msg("Browser: opening %s",
                                     ps.browser_selected_file);
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
@@ -908,6 +917,7 @@ int main(int argc, char *argv[]) {
                     if (!ps.playing && ps.browser_active) {
                         /* Browser: select entry */
                         if (browser_enter(&ps)) {
+                            ps.show_controls = 0;
                             log_msg("Browser: opening %s",
                                     ps.browser_selected_file);
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
@@ -1041,7 +1051,8 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                case SDL_GAMEPAD_BUTTON_START:  /* Menu — no-op in Game Mode */
+                case SDL_GAMEPAD_BUTTON_START:  /* Menu — toggle controls overlay */
+                    ps.show_controls = !ps.show_controls;
                     break;
 
                 case SDL_GAMEPAD_BUTTON_BACK:   /* Select — Debug overlay */
@@ -1069,24 +1080,30 @@ int main(int argc, char *argv[]) {
             /* ── Gamepad analog triggers — continuous seek ──
              *
              * LT/RT axis ranges 0 (released) to 32767 (full pull).
-             * Map to seek speed: 0 = idle, 32767 = 32× playback speed.
-             * Dead zone at 10% to avoid drift from resting triggers.
+             * Quadratic power curve: gentle at light pull, fast at deep pull.
+             *   25% pull → 4×, 50% → 16×, 75% → 36×, 100% → 64×.
+             * Dead zone at 15% to avoid drift from resting triggers.
              * Applied each frame in the render section below. */
             case SDL_EVENT_GAMEPAD_AXIS_MOTION:
             {
-                float dead_zone = 3276.7f;  /* ~10% of 32767 */
+                float dead_zone = 4915.0f;  /* ~15% of 32767 */
+                float max_range = 32767.0f - dead_zone;
                 if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
                     float val = (float)ev.gaxis.value;
-                    if (val < dead_zone)
+                    if (val < dead_zone) {
                         ps.trigger_seek_speed = 0.0f;
-                    else
-                        ps.trigger_seek_speed = -(val / 32767.0f) * 32.0f;
+                    } else {
+                        float norm = (val - dead_zone) / max_range;
+                        ps.trigger_seek_speed = -(norm * norm) * 64.0f;
+                    }
                 } else if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
                     float val = (float)ev.gaxis.value;
-                    if (val < dead_zone)
+                    if (val < dead_zone) {
                         ps.trigger_seek_speed = 0.0f;
-                    else
-                        ps.trigger_seek_speed = (val / 32767.0f) * 32.0f;
+                    } else {
+                        float norm = (val - dead_zone) / max_range;
+                        ps.trigger_seek_speed = (norm * norm) * 64.0f;
+                    }
                 }
                 break;
             }
@@ -1095,7 +1112,7 @@ int main(int argc, char *argv[]) {
 
         /* ── Analog trigger seek (gamepad) ──
          * Applies a proportional seek each tick while a trigger is held.
-         * Speed scales 0–32× based on trigger pull depth.
+         * Speed scales 0–64× via quadratic power curve.
          * Throttled to ~4 seeks/sec to avoid flooding the demuxer. */
         if (ps.playing && !ps.paused && ps.trigger_seek_speed != 0.0f) {
             static double last_trigger_seek = 0.0;

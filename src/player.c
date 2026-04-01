@@ -3448,7 +3448,18 @@ void player_update_display_rect(PlayerState *ps) {
     double win_aspect   = (double)ps->win_w / ps->win_h;
 
     int disp_w, disp_h;
-    if (video_aspect > win_aspect) {
+
+    /* Game Mode 16:10 fill: crop-to-fill instead of letterbox.
+     * On the Deck's 1280×800 screen, 16:9 content would normally
+     * get 80px of black bars. Fill mode fits to height and crops
+     * ~5% per side — negligible loss, much better screen use.
+     * Only activates when aspect ratios are close (within 15%). */
+    if (ps->game_mode && video_aspect > win_aspect &&
+            video_aspect / win_aspect < 1.15) {
+        /* Fill to height, allow horizontal overflow (crop) */
+        disp_h = ps->win_h;
+        disp_w = (int)(ps->win_h * video_aspect);
+    } else if (video_aspect > win_aspect) {
         /* Video is wider than window — pillarbox (bars top/bottom) */
         disp_w = ps->win_w;
         disp_h = (int)(ps->win_w / video_aspect);

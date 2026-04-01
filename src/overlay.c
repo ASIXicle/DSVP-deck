@@ -143,6 +143,9 @@ static const uint8_t font_5x7[95][7] = {
  * Buffer is cleared to transparent at the start of each frame.
  */
 
+/* Forward declaration — defined after overlay_render_browser */
+static void draw_controls_overlay(uint8_t *buf, int bw, int bh, PlayerState *ps);
+
 /* Fill a rectangle with a solid RGBA color. No blending — just overwrites. */
 static void fill_rect(uint8_t *buf, int bw, int bh,
                       int rx, int ry, int rw, int rh,
@@ -697,7 +700,7 @@ void overlay_render_idle(PlayerState *ps) {
     int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0) return;
 
-    s_ui_scale = ps->fullscreen ? 2 : 1;
+    s_ui_scale = ps->game_mode ? 3 : (ps->fullscreen ? 2 : 1);
 
     if (gpu_overlay_ensure(ps, w, h) < 0) {
         ps->overlay_active = 0;
@@ -805,6 +808,10 @@ void overlay_render_idle(PlayerState *ps) {
                   keys[i][1], key_scale, 130, 130, 140);
     }
 
+    /* Controls overlay (Start button) — drawn on top */
+    if (ps->show_controls)
+        draw_controls_overlay(s_pixels, w, h, ps);
+
     gpu_overlay_upload(ps, s_pixels, w, h);
     ps->overlay_active = 1;
 }
@@ -824,7 +831,7 @@ void overlay_render_browser(PlayerState *ps) {
     int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0) return;
 
-    s_ui_scale = ps->fullscreen ? 2 : 1;
+    s_ui_scale = ps->game_mode ? 3 : (ps->fullscreen ? 2 : 1);
 
     if (gpu_overlay_ensure(ps, w, h) < 0) {
         ps->overlay_active = 0;
@@ -979,8 +986,97 @@ void overlay_render_browser(PlayerState *ps) {
                   140, 150, 170);
     }
 
+    /* Controls overlay (Start button) — drawn on top */
+    if (ps->show_controls)
+        draw_controls_overlay(s_pixels, w, h, ps);
+
     gpu_overlay_upload(ps, s_pixels, w, h);
     ps->overlay_active = 1;
+}
+
+/* =====================================================================
+ * Controls Overlay — Start button help screen
+ *
+ * Semi-transparent panel showing all gamepad + keyboard mappings.
+ * Toggled by Start/Menu button. Drawn on top of everything.
+ * ===================================================================== */
+
+static void draw_controls_overlay(uint8_t *buf, int bw, int bh, PlayerState *ps) {
+    int S = s_ui_scale;
+    int font_scale = 2 * S;
+    int line_h = (FONT_H + FONT_LINE) * font_scale;
+    int margin = 20 * S;
+
+    /* Semi-transparent dark background */
+    fill_rect(buf, bw, bh, 0, 0, bw, bh, 16, 16, 20, 210);
+
+    int y = margin;
+
+    /* Title */
+    int title_scale = 3 * S;
+    draw_text(buf, bw, bh, margin, y, "DSVP CONTROLS", title_scale,
+              220, 200, 120);
+    y += FONT_H * title_scale + 12 * S;
+
+    /* Two-column layout: Gamepad | Keyboard */
+    int col2_x = bw / 2 + margin;
+
+    /* Column headers */
+    draw_text(buf, bw, bh, margin, y, "GAMEPAD", font_scale, 160, 180, 220);
+    draw_text(buf, bw, bh, col2_x, y, "KEYBOARD", font_scale, 160, 180, 220);
+    y += line_h + 4 * S;
+
+    /* Separator line */
+    fill_rect(buf, bw, bh, margin, y, bw - 2 * margin, 1 * S, 80, 80, 90, 180);
+    y += 6 * S;
+
+    /* Control mappings */
+    static const char *pad_lines[] = {
+        "A         Select / Open",
+        "B         Back / Stop",
+        "X         Pause / Resume",
+        "Y         Cycle Subtitles",
+        "LB / RB   Seek  -/+ 5s",
+        "LT / RT   Analog Seek 0-64x",
+        "D-Pad U/D Volume (play)",
+        "D-Pad U/D Navigate (browse)",
+        "D-Pad L/R Page Up/Down (browse)",
+        "D-Pad L/R Prev/Next File (play)",
+        "R3        Cycle Audio Track",
+        "Start     This Help Screen",
+        "Select    Debug Overlay",
+        NULL
+    };
+    static const char *key_lines[] = {
+        "Enter     Select / Open",
+        "Q / Esc   Back / Quit",
+        "Space     Pause / Resume",
+        "S         Cycle Subtitles",
+        "Left/Right  Seek -/+ 5s",
+        "A-key     Cycle Audio Track",
+        "Up / Down Volume",
+        "O         Open File Dialog",
+        "D         Debug Overlay",
+        "H         HDR Debug Modes",
+        "T         Cycle SDR Target",
+        "G         Cycle Midtone Gain",
+        "V         Toggle VSync/Mailbox",
+        NULL
+    };
+
+    uint8_t cr = 200, cg = 200, cb = 200;
+    for (int i = 0; pad_lines[i] || key_lines[i]; i++) {
+        if (pad_lines[i])
+            draw_text(buf, bw, bh, margin, y, pad_lines[i], font_scale, cr, cg, cb);
+        if (key_lines[i])
+            draw_text(buf, bw, bh, col2_x, y, key_lines[i], font_scale, cr, cg, cb);
+        y += line_h;
+    }
+
+    y += 8 * S;
+    draw_text(buf, bw, bh, margin, y,
+              "Press Start or Menu to close",
+              font_scale, 120, 120, 140);
 }
 
 /* =====================================================================
@@ -1001,7 +1097,7 @@ void overlay_render(PlayerState *ps) {
         return;
     }
 
-    s_ui_scale = ps->fullscreen ? 2 : 1;
+    s_ui_scale = ps->game_mode ? 3 : (ps->fullscreen ? 2 : 1);
 
     double now = get_time_sec();
 
@@ -1030,9 +1126,10 @@ void overlay_render(PlayerState *ps) {
         ps->sub_osd[0] = '\0';
 
     int need_osd = (osd_text != NULL);
+    int need_controls = ps->show_controls;
 
     if (!need_seekbar && !need_debug && !need_info &&
-        !need_pause && !need_osd && !need_sub) {
+        !need_pause && !need_osd && !need_sub && !need_controls) {
         ps->overlay_active = 0;
         return;
     }
@@ -1078,6 +1175,9 @@ void overlay_render(PlayerState *ps) {
 
     if (need_sub)
         draw_subtitles(s_pixels, w, h, ps);
+
+    if (need_controls)
+        draw_controls_overlay(s_pixels, w, h, ps);
 
     /* ── Upload to GPU ── */
     gpu_overlay_upload(ps, s_pixels, w, h);
