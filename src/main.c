@@ -1402,13 +1402,35 @@ int main(int argc, char *argv[]) {
                 ps.diag_frames_displayed++;
                 ps.last_frame_wall = now;
 
-                /* Resume from seek: first displayed frame post-seek */
+                /* Resume from seek: first displayed frame post-seek.
+                 *
+                 * CRITICAL: re-sync audio clocks to video_clock here.
+                 * av_seek_frame lands on a keyframe that may be seconds
+                 * away from the seek target. The demux thread pre-sets
+                 * both clocks to the target, but the first decoded frame
+                 * overwrites video_clock to the actual keyframe PTS.
+                 * Without this re-sync:
+                 *   Forward seek: video_clock > audio_clock → A/V sync
+                 *     computes multi-second delay, freezing the main loop.
+                 *   Backward seek: video_clock < audio_clock → massive
+                 *     negative drift, burst of frame drops.
+                 */
                 if (ps.seek_recovering) {
                     ps.seek_recovering = 0;
                     ps.frame_timer = get_time_sec();
 
-                    if (ps.audio_stream && !ps.paused)
-                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    /* Re-sync clocks to the actual first-frame PTS */
+                    ps.audio_clock      = ps.video_clock;
+                    ps.audio_clock_sync = ps.video_clock;
+                    ps.av_bias          = 0.0;
+                    ps.av_bias_samples  = 0;
+
+                    /* Flush stale audio and resume */
+                    if (ps.audio_stream) {
+                        SDL_ClearAudioStream(ps.audio_stream);
+                        if (!ps.paused)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    }
 
                     log_msg("DIAG: seek recovery complete at %.3fs",
                             ps.video_clock);
