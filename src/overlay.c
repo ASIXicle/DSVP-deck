@@ -378,9 +378,10 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
 
     /* Prev button: left-pointing triangle */
     {
-        uint8_t br = has_prev ? 200 : 80;
-        uint8_t bg = has_prev ? 200 : 80;
-        uint8_t bb = has_prev ? 200 : 80;
+        int prev_focus = (ps->transport_active && ps->transport_focus == 0);
+        uint8_t br = prev_focus ? 100 : (has_prev ? 200 : 80);
+        uint8_t bg = prev_focus ? 200 : (has_prev ? 200 : 80);
+        uint8_t bb = prev_focus ? 255 : (has_prev ? 200 : 80);
         for (int row = 0; row < btn_sz; row++) {
             int half = btn_sz / 2;
             int dist = (row < half) ? (half - row) : (row - half + 1);
@@ -395,9 +396,10 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     /* Next button: right-pointing triangle */
     int btn2_x = btn_x + btn_sz + btn_gap;
     {
-        uint8_t br = has_next ? 200 : 80;
-        uint8_t bg = has_next ? 200 : 80;
-        uint8_t bb = has_next ? 200 : 80;
+        int next_focus = (ps->transport_active && ps->transport_focus == 2);
+        uint8_t br = next_focus ? 100 : (has_next ? 200 : 80);
+        uint8_t bg = next_focus ? 200 : (has_next ? 200 : 80);
+        uint8_t bb = next_focus ? 255 : (has_next ? 200 : 80);
         for (int row = 0; row < btn_sz; row++) {
             int half = btn_sz / 2;
             int dist = (row < half) ? (half - row) : (row - half + 1);
@@ -452,6 +454,13 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     ps->seekbar_track_w = track_w;
 
     if (track_w > 20) {
+                /* Transport focus highlight on scrubber */
+        if (ps->transport_active && ps->transport_focus == 1) {
+            int hl = 2 * sc;  /* highlight border thickness */
+            fill_rect(buf, bw, bh, track_x - hl, track_y - hl,
+                      track_w + 2 * hl, track_h + 2 * hl,
+                      100, 200, 255, 200);
+        }
         fill_rect(buf, bw, bh, track_x, track_y, track_w, track_h, 80, 80, 80, 200);
 
         /* Progress fill */
@@ -1096,6 +1105,8 @@ void overlay_render(PlayerState *ps) {
 
     /* ── Determine which overlays are needed ── */
     int need_seekbar = ps->show_seekbar;
+    int need_transport = ps->transport_active;
+    if (need_transport) need_seekbar = 1;  /* force seekbar when transport active */
     int need_debug   = ps->show_debug;
     int need_info    = ps->show_info;
     int need_pause   = ps->paused;
@@ -1117,7 +1128,7 @@ void overlay_render(PlayerState *ps) {
     int need_controls = ps->show_controls;
 
     if (!need_seekbar && !need_debug && !need_info &&
-        !need_pause && !need_osd && !need_sub && !need_controls) {
+        !need_pause && !need_osd && !need_sub && !need_controls && !need_transport) {
         ps->overlay_active = 0;
         return;
     }

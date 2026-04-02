@@ -863,6 +863,21 @@ int main(int argc, char *argv[]) {
                             ps.browser_active = 1;
                         }
                     } else {
+                    } else if (ps.transport_active) {
+                        /* Transport: activate focused element */
+                        if (ps.transport_focus == 0) {
+                            SDL_Event fake = {0};
+                            fake.type = SDL_EVENT_KEY_DOWN;
+                            fake.key.key = SDLK_B;
+                            SDL_PushEvent(&fake);
+                        } else if (ps.transport_focus == 2) {
+                            SDL_Event fake = {0};
+                            fake.type = SDL_EVENT_KEY_DOWN;
+                            fake.key.key = SDLK_N;
+                            SDL_PushEvent(&fake);
+                        }
+                        /* focus==1 (scrubber): no-op */
+                    } else {
                         /* Playing: show seek bar */
                         ps.show_seekbar = 1;
                         ps.seekbar_hide_time = get_time_sec() + 3.0;
@@ -884,7 +899,10 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDL_GAMEPAD_BUTTON_EAST:   /* B — Back / Stop */
-                    if (ps.playing) {
+                    if (ps.playing && ps.transport_active) {
+                        ps.transport_active = 0;
+                        ps.seekbar_hide_time = get_time_sec() + 3.0;
+                    } else if (ps.playing) {
                         /* Update browser to current file's directory */
                         if (ps.filepath[0]) {
                             char dir[1024];
@@ -898,6 +916,7 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         player_close(&ps);
+                        ps.transport_active = 0;
                         ps.browser_active = 1;
                         ps.quit = 0;
                     } else if (ps.browser_active && !browser_at_root(&ps)) {
@@ -921,6 +940,19 @@ int main(int argc, char *argv[]) {
 
                 case SDL_GAMEPAD_BUTTON_RIGHT_STICK:    /* R3 — Cycle audio */
                     audio_cycle(&ps);
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_LEFT_STICK:  /* L3 — Transport mode */
+                    if (ps.playing) {
+                        ps.transport_active = !ps.transport_active;
+                        if (ps.transport_active) {
+                            ps.transport_focus = 1;  /* start on scrubber */
+                            ps.show_seekbar = 1;
+                            ps.seekbar_hide_time = 1e18; /* don't auto-hide */
+                        } else {
+                            ps.seekbar_hide_time = get_time_sec() + 3.0;
+                        }
+                    }
                     break;
 
                 case SDL_GAMEPAD_BUTTON_DPAD_UP:    /* D-pad: nav/volume */
@@ -1018,7 +1050,21 @@ int main(int argc, char *argv[]) {
             {
                 float dead_zone = 4915.0f;  /* ~15% of 32767 */
                 float max_range = 32767.0f - dead_zone;
-                if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+                if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX && ps.transport_active) {
+                    static int stick_zone = 0; /* -1=left, 0=center, 1=right */
+                    float threshold = 19660.0f;  /* ~60% of 32767 */
+                    int new_zone = 0;
+                    if (ev.gaxis.value < -threshold) new_zone = -1;
+                    else if (ev.gaxis.value > threshold) new_zone = 1;
+
+                    if (new_zone != stick_zone) {
+                        if (new_zone == -1 && ps.transport_focus > 0)
+                            ps.transport_focus--;
+                        else if (new_zone == 1 && ps.transport_focus < 2)
+                            ps.transport_focus++;
+                        stick_zone = new_zone;
+                    }
+                } else if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
                     float val = (float)ev.gaxis.value;
                     if (val < dead_zone) {
                         ps.trigger_seek_speed = 0.0f;

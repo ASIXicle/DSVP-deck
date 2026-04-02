@@ -54,6 +54,7 @@
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
 #define AUDIO_BUF_SIZE      192000  /* max decoded audio buffer bytes   */
 #define SEEK_STEP_SEC       5.0     /* arrow key seek increment         */
+#define SEEK_LARGE_SEC     30.0    /* transport mode large seek increment  */
 #define VOLUME_STEP         0.05    /* arrow key volume increment       */
 
 #define MAX_SUB_STREAMS     16      /* max subtitle tracks to catalog   */
@@ -282,6 +283,8 @@ typedef struct PlayerState {
     int                 dpad_held_dir;     /* -1=up, 1=down, 0=none (browser repeat) */
     double              dpad_held_since;   /* wall time when d-pad was pressed        */
     double              dpad_last_repeat;  /* wall time of last repeat fire           */
+    int                 transport_active;   /* 1 = transport control mode (L3)    */
+    int                 transport_focus;    /* 0=prev, 1=scrubber, 2=next         */
 
     /* ── Game Mode detection ── */
     int                 game_mode;         /* 1 = Gamescope (Game Mode), 0 = Desktop */
