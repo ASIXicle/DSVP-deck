@@ -6,7 +6,9 @@ A reference-quality video player purpose-built for the Steam Deck. Plug-and-play
 
 DSVP sits between VLC and mpv: better quality than VLC (modern FFmpeg, Lanczos scaling, temporal dithering, BT.2390 tone mapping), simpler than mpv (zero config, gamepad-native, best quality out of the box). It plays anything FFmpeg supports.
 
-There are portable Windows & Debian builds on the [main branch](https://github.com/ASIXicle/DSVP/tree/main). Steam Deck builds are on this branch — download the latest tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck).
+There are portable Windows & Debian builds on the [main branch](https://github.com/ASIXicle/DSVP/tree/main). Steam Deck builds are on this branch — download the latest tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/tag/v0.2.0-beta-steamdeck). 
+
+HDR is Coming Soon. Two weeks, tops. Maybe three.
 
 File Explorer:
 
@@ -58,6 +60,7 @@ File Explorer:
 | A-key          | R3               | Cycle audio tracks                      |
 | D              | Back/Select      | Debug overlay                           |
 | —              | Start            | Controls overlay (toggle)               |
+| —              | L3               | Transport control mode (toggle)         |
 | H              | —                | Cycle HDR debug views                   |
 | T              | —                | Cycle SDR target nits (203 / 300 / 400) |
 | G              | —                | Cycle midtone gain (1.0–1.4)            |
