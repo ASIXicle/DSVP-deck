@@ -862,7 +862,6 @@ int main(int argc, char *argv[]) {
                             browser_init(&ps);
                             ps.browser_active = 1;
                         }
-                    } else {
                     } else if (ps.transport_active) {
                         /* Transport: activate focused element */
                         if (ps.transport_focus == 0) {
