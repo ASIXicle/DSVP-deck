@@ -1292,6 +1292,14 @@ int main(int argc, char *argv[]) {
                 ps.frame_timer += delay;
                 new_frame = 1;
 
+                /* Cap: never let frame_timer get more than 100ms ahead
+                 * of wall time.  Post-seek rapid frame consumption
+                 * (catch-up drops with delay≈0) can accumulate
+                 * frame_timer seconds ahead, causing a prolonged
+                 * stall when the burst ends. */
+                if (ps.frame_timer > now + 0.1)
+                    ps.frame_timer = now + 0.1;
+
                 /* Drop frame if video is genuinely behind audio.
                  *
                  * At 1:1 (content fps ≈ display refresh), drops are
@@ -1424,6 +1432,7 @@ int main(int argc, char *argv[]) {
                     ps.audio_clock_sync = ps.video_clock;
                     ps.av_bias          = 0.0;
                     ps.av_bias_samples  = 0;
+                    ps.frame_last_pts   = ps.video_clock;
 
                     /* Flush stale audio and resume */
                     if (ps.audio_stream) {
