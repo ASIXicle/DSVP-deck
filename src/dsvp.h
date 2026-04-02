@@ -285,6 +285,9 @@ typedef struct PlayerState {
     double              dpad_last_repeat;  /* wall time of last repeat fire           */
     int                 transport_active;   /* 1 = transport control mode (L3)    */
     int                 transport_focus;    /* 0=prev, 1=scrubber, 2=next         */
+    int                 transport_seek_dir;  /* -1=left held, 0=idle, 1=right held */
+    double              transport_seek_start; /* wall time when stick entered zone  */
+    double              transport_seek_last;  /* wall time of last repeat fire 
 
     /* ── Game Mode detection ── */
     int                 game_mode;         /* 1 = Gamescope (Game Mode), 0 = Desktop */

@@ -1058,11 +1058,20 @@ int main(int argc, char *argv[]) {
 
                     if (new_zone != stick_x_zone) {
                         if (ps.transport_focus == 1) {
-                            /* Scrubber focused: L/R seeks ±30s */
-                            if (new_zone == -1)
+                            /* Scrubber: edge-trigger first seek, start hold timer */
+                            if (new_zone == -1) {
                                 player_seek(&ps, -30.0);
-                            else if (new_zone == 1)
+                                ps.transport_seek_dir = -1;
+                                ps.transport_seek_start = get_time_sec();
+                                ps.transport_seek_last = ps.transport_seek_start;
+                            } else if (new_zone == 1) {
                                 player_seek(&ps, 30.0);
+                                ps.transport_seek_dir = 1;
+                                ps.transport_seek_start = get_time_sec();
+                                ps.transport_seek_last = ps.transport_seek_start;
+                            } else {
+                                ps.transport_seek_dir = 0;
+                            }
                         } else {
                             /* Prev/Next focused: L/R navigates focus */
                             if (new_zone == -1 && ps.transport_focus > 0)
@@ -1122,6 +1131,21 @@ int main(int argc, char *argv[]) {
                 last_trigger_seek = tnow;
                 ps.show_seekbar = 1;                          /* ADD */
                 ps.seekbar_hide_time = get_time_sec() + 3.0;  /* ADD */
+            }
+        }
+        
+        /* ── Transport stick-hold seek (accelerating) ──
+         * 400ms initial delay, then repeats every 200ms.
+         * Seek amount ramps: 30s base, +15s per second held.
+         * Caps at 180s per tick (~5x speed at 10s hold). */
+        if (ps.transport_active && ps.transport_seek_dir != 0) {
+            double tnow = get_time_sec();
+            double held = tnow - ps.transport_seek_start;
+            if (held >= 0.40 && tnow - ps.transport_seek_last >= 0.20) {
+                double amount = 30.0 + 15.0 * held;
+                if (amount > 180.0) amount = 180.0;
+                player_seek(&ps, ps.transport_seek_dir * amount);
+                ps.transport_seek_last = tnow;
             }
         }
 
