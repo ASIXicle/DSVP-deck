@@ -98,6 +98,10 @@ static int path_accessible(const char *path, int timeout_ms) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 static void try_automount_removable(void) {
+    static int attempted = 0;
+    if (attempted) return;
+    attempted = 1;
+
     DIR *d = opendir("/dev/disk/by-id/");
     if (!d) {
         log_msg("browser: automount: /dev/disk/by-id/ not available");
@@ -146,7 +150,7 @@ static void try_automount_removable(void) {
         log_msg("browser: automount: mounting %s", real);
         char cmd[600];
         snprintf(cmd, sizeof(cmd),
-                 "udisksctl mount -b %s --no-interaction 2>&1", real);
+                 "udisksctl mount -b %s --no-user-interaction 2>&1", real);
         FILE *fp = popen(cmd, "r");
         if (fp) {
             char buf[256];
