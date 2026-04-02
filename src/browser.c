@@ -86,6 +86,83 @@ static int path_accessible(const char *path, int timeout_ms) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * USB / SD Card Auto-Mount
+ *
+ * SteamOS Game Mode only automounts drives formatted as Steam
+ * Library volumes (ext4). Regular USB drives with NTFS/exFAT/ext4
+ * that users plug in for media files are not mounted automatically.
+ *
+ * udisksctl is on every SteamOS install and needs no root. It mounts
+ * to /run/media/deck/<label>, which the mount injection code in
+ * browser_scan() already picks up.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static void try_automount_removable(void) {
+    DIR *d = opendir("/dev/disk/by-id/");
+    if (!d) {
+        log_msg("browser: automount: /dev/disk/by-id/ not available");
+        return;
+    }
+
+    /* Read /proc/mounts once to build list of already-mounted devices */
+    char mounted_devs[4096] = "";
+    FILE *pm = fopen("/proc/mounts", "r");
+    if (pm) {
+        char line[512];
+        while (fgets(line, sizeof(line), pm)) {
+            if (strncmp(line, "/dev/", 5) == 0) {
+                char *sp = strchr(line, ' ');
+                if (sp) {
+                    size_t cur = strlen(mounted_devs);
+                    snprintf(mounted_devs + cur,
+                             sizeof(mounted_devs) - cur,
+                             "%.*s|", (int)(sp - line), line);
+                }
+            }
+        }
+        fclose(pm);
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        /* Only USB and MMC partition entries */
+        if (!strstr(ent->d_name, "usb") && !strstr(ent->d_name, "mmc"))
+            continue;
+        if (!strstr(ent->d_name, "part"))
+            continue;  /* skip whole-disk entries */
+
+        /* Resolve symlink → actual device path */
+        char link[512];
+        snprintf(link, sizeof(link), "/dev/disk/by-id/%s", ent->d_name);
+        char real[512];
+        if (!realpath(link, real)) continue;
+
+        /* Already mounted? */
+        char needle[520];
+        snprintf(needle, sizeof(needle), "%s|", real);
+        if (strstr(mounted_devs, needle)) continue;
+
+        /* Mount via udisksctl — no root, handles NTFS/exFAT/ext4 */
+        log_msg("browser: automount: mounting %s", real);
+        char cmd[600];
+        snprintf(cmd, sizeof(cmd),
+                 "udisksctl mount -b %s --no-interaction 2>&1", real);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), fp)) {
+                size_t blen = strlen(buf);
+                if (blen > 0 && buf[blen - 1] == '\n')
+                    buf[blen - 1] = '\0';
+                log_msg("browser:   %s", buf);
+            }
+            pclose(fp);
+        }
+    }
+    closedir(d);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Path Persistence — ~/.config/dsvp/last_path
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -257,9 +334,11 @@ void browser_scan(PlayerState *ps) {
     }
     closedir(d);
 
-    /* ── Inject mount points when browsing near root ──
-     * Scan /run/media/ for SD card and NFS mounts so the user
-     * can navigate to external storage without typing paths. */
+    /* ── Auto-mount removable drives, then inject mount points ──
+     * First try to mount any unmounted USB/SD devices (SteamOS Game
+     * Mode doesn't automount media drives). Then scan /run/media/
+     * for all mounts so the user can navigate to external storage. */
+    try_automount_removable();
     {
         int mounts_injected = 0;
         const char *mount_bases[] = { "/run/media/", NULL };
@@ -275,7 +354,7 @@ void browser_scan(PlayerState *ps) {
 
             DIR *md = opendir(mount_bases[mi]);
             if (!md) {
-                log_msg("browser:   opendir failed (does not exist or no permission)");
+                log_msg("browser:   opendir failed");
                 continue;
             }
             struct dirent *me;
@@ -292,10 +371,7 @@ void browser_scan(PlayerState *ps) {
 
                 /* Recurse one level into user dirs under /run/media/user/ */
                 DIR *ud = opendir(mpath);
-                if (!ud) {
-                    log_msg("browser:     opendir failed");
-                    continue;
-                }
+                if (!ud) continue;
                 struct dirent *ue;
                 while ((ue = readdir(ud)) != NULL) {
                     if (ue->d_name[0] == '.') continue;
@@ -312,10 +388,7 @@ void browser_scan(PlayerState *ps) {
                     int dup = 0;
                     for (int i = 0; i < count; i++)
                         if (strcmp(entries[i].path, upath) == 0) { dup = 1; break; }
-                    if (dup) {
-                        log_msg("browser:     (duplicate, skipped)");
-                        continue;
-                    }
+                    if (dup) continue;
 
                     if (count >= capacity) {
                         capacity *= 2;
@@ -324,8 +397,8 @@ void browser_scan(PlayerState *ps) {
                         entries = tmp;
                     }
 
-                    char label[6 + 256];
-                    snprintf(label, sizeof(label), "[SD] %s", ue->d_name);
+                    char label[8 + 256];
+                    snprintf(label, sizeof(label), "[USB] %s", ue->d_name);
                     entries[count].name = strdup(label);
                     entries[count].path = strdup(upath);
                     entries[count].is_dir = 1;
