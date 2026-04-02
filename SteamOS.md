@@ -6,7 +6,7 @@ Tested: 4K 60fps VAAPI hardware decode + zero-copy, Vulkan, zero sustained drops
 
 ## Quick Start
 
-**1. Download** the latest Steam Deck tarball from the [steamdeck Release](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck).
+**1. Download** the latest Steam Deck tarball from the [steamdeck Release](https://github.com/ASIXicle/DSVP/releases/tag/v0.2.0-beta-steamdeck).
 
 **2. Extract and install.** Switch to Desktop Mode, open Konsole, and run:
 
