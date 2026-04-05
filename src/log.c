@@ -1,7 +1,6 @@
 /*
  * DSVP — Dead Simple Video Player
  * log.c — Crash-safe file logger
- * Words
  * Writes to dsvp.log in the same directory as the executable.
  * Every write is flushed immediately so the log survives hard crashes.
  * Also mirrors output to stderr (visible in the console window).

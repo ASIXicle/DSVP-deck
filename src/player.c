@@ -2328,6 +2328,7 @@ int player_open(PlayerState *ps, const char *filename) {
 
     strncpy(ps->filepath, filename, sizeof(ps->filepath) - 1);
     ps->io_error = 0;
+    ps->filepath[sizeof(ps->filepath) - 1] = '\0';
     log_msg("player_open: %s", filename);
 
     /* ── Open container ── */

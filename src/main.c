@@ -34,6 +34,10 @@ const char *video_extensions[] = {
     NULL
 };
 
+/* HDR midtone gain index — file-scope so it can be reset on file open.
+ * Index 3 = 1.3f, matching the default gpu_uniforms.hdr_midtone_gain. */
+static int s_gain_idx = 3;
+
 int is_media_file(const char *name) {
     const char *dot = strrchr(name, '.');
     if (!dot) return 0;
@@ -393,6 +397,7 @@ int main(int argc, char *argv[]) {
         if (player_open(&ps, open_path) != 0) {
             log_msg("ERROR: Failed to open: %s", open_path);
         } else {
+            s_gain_idx = 3;
             playlist_scan(&ps);
         }
         free(open_path);
@@ -516,6 +521,7 @@ int main(int argc, char *argv[]) {
                      * If playing, close first so we return to browser. */
                     log_msg("File browser requested (O key)");
                     if (ps.playing) player_close(&ps);
+                    s_gain_idx = 3;
                     ps.show_controls = 0;
                     if (!ps.browser_active) {
                         browser_init(&ps);
@@ -572,7 +578,8 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     break;
-                                    case SDLK_H:
+
+                case SDLK_H:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
                         int mode = (int)ps.gpu_uniforms.hdr_debug;
                         mode = (mode + 1) % 4;
@@ -606,14 +613,13 @@ int main(int argc, char *argv[]) {
                 case SDLK_G:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
                         static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f, 1.35f, 1.4f };
-                        static int gain_idx = 3;
-                        gain_idx = (gain_idx + 1) % 6;
-                        ps.gpu_uniforms.hdr_midtone_gain = gains[gain_idx];
+                        s_gain_idx = (s_gain_idx + 1) % 6;
+                        ps.gpu_uniforms.hdr_midtone_gain = gains[s_gain_idx];
                         snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "Midtone gain: %.2f", gains[gain_idx]);
+                                 "Midtone gain: %.2f", gains[s_gain_idx]);
                         ps.aud_osd_until = get_time_sec() + 2.0;
                         log_msg("HDR: midtone gain changed to %.2f",
-                                gains[gain_idx]);
+                                gains[s_gain_idx]);
                     }
                     break;
 
@@ -708,6 +714,7 @@ int main(int argc, char *argv[]) {
                                     saved_files[saved_index]);
 
                             if (player_open(&ps, saved_files[saved_index]) == 0) {
+                                s_gain_idx = 3;
                                 ps.playlist_files = saved_files;
                                 ps.playlist_count = saved_count;
                                 ps.playlist_index = saved_index;
@@ -1569,6 +1576,7 @@ int main(int argc, char *argv[]) {
     if (ps.gamepad) SDL_CloseGamepad(ps.gamepad);
     browser_free_entries(&ps);
     playlist_free(&ps);
+    overlay_cleanup();
     sub_close_font();
     gpu_destroy_pipelines(&ps);
     SDL_ReleaseWindowFromGPUDevice(gpu_device, window);

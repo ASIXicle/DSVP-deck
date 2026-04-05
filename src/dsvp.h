@@ -458,6 +458,7 @@ void  sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h);
 void  overlay_render(PlayerState *ps);
 void  overlay_render_idle(PlayerState *ps);
 void  overlay_render_browser(PlayerState *ps);
+void  overlay_cleanup(void);
 
 /* ── Browser API (browser.c) ────────────────────────────────────── */
 

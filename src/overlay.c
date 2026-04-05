@@ -134,6 +134,15 @@ static const uint8_t font_5x7[95][7] = {
 };
 
 
+/* Dirty-row tracking: only clear rows that were painted last frame.
+ * At 1080p the full memset is 8.3MB/frame; at 4K it's 33MB/frame.
+ * When only the seek bar is visible, clearing ~60 rows saves >95%. */
+static int       s_dirty_y0 = 0;  /* first dirty row (inclusive) */
+static int       s_dirty_y1 = 0;  /* last dirty row (exclusive)  */
+static int       s_frame_y0 = 0;  /* current frame accumulator   */
+static int       s_frame_y1 = 0;
+
+
 /* ═══════════════════════════════════════════════════════════════════
  * Pixel Drawing Primitives
  * ═══════════════════════════════════════════════════════════════════
@@ -154,6 +163,9 @@ static void fill_rect(uint8_t *buf, int bw, int bh,
     int y1 = (ry < 0) ? 0 : ry;
     int x2 = (rx + rw > bw) ? bw : rx + rw;
     int y2 = (ry + rh > bh) ? bh : ry + rh;
+
+    if (y1 < s_frame_y0) s_frame_y0 = y1;
+    if (y2 > s_frame_y1) s_frame_y1 = y2;
 
     int stride = bw * 4;
     for (int py = y1; py < y2; py++) {
@@ -176,6 +188,10 @@ static void draw_char(uint8_t *buf, int bw, int bh,
                       uint8_t r, uint8_t g, uint8_t b) {
     if (ch < FONT_FIRST || ch > FONT_LAST) return;
     const uint8_t *glyph = font_5x7[ch - FONT_FIRST];
+
+    int y_end = y + FONT_H * scale;
+    if (y < s_frame_y0) s_frame_y0 = (y < 0) ? 0 : y;
+    if (y_end > s_frame_y1) s_frame_y1 = (y_end > bh) ? bh : y_end;
 
     int stride = bw * 4;
     for (int row = 0; row < FONT_H; row++) {
@@ -262,6 +278,12 @@ static void blit_surface(uint8_t *buf, int bw, int bh,
     SDL_Surface *rgba = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
     if (!rgba) return;
 
+    int y0 = (dst_y < 0) ? 0 : dst_y;
+    int y1 = dst_y + rgba->h;
+    if (y1 > bh) y1 = bh;
+    if (y0 < s_frame_y0) s_frame_y0 = y0;
+    if (y1 > s_frame_y1) s_frame_y1 = y1;
+
     int stride = bw * 4;
     for (int sy = 0; sy < rgba->h; sy++) {
         int dy = dst_y + sy;
@@ -301,6 +323,13 @@ static void blit_rgba_scaled(uint8_t *buf, int bw, int bh,
                               const uint8_t *src, int sw, int sh,
                               int dst_x, int dst_y, int dst_w, int dst_h) {
     if (!src || sw <= 0 || sh <= 0 || dst_w <= 0 || dst_h <= 0) return;
+
+    int y0 = (dst_y < 0) ? 0 : dst_y;
+    int y1 = dst_y + dst_h;
+    if (y1 > bh) y1 = bh;
+    if (y0 < s_frame_y0) s_frame_y0 = y0;
+    if (y1 > s_frame_y1) s_frame_y1 = y1;
+
     int stride = bw * 4;
     for (int dy = 0; dy < dst_h; dy++) {
         int py = dst_y + dy;
@@ -725,6 +754,8 @@ void overlay_render_idle(PlayerState *ps) {
         s_pix_h = h;
     }
     memset(s_pixels, 0, buf_size);
+    s_dirty_y0 = 0;
+    s_dirty_y1 = h;
 
     /* ── Title: "DSVP" in large bitmap font ── */
     int S = s_ui_scale;
@@ -1147,9 +1178,20 @@ void overlay_render(PlayerState *ps) {
         if (!s_pixels) { ps->overlay_active = 0; return; }
         s_pix_w = w;
         s_pix_h = h;
+        /* Full clear on resize — no valid dirty tracking yet */
+        memset(s_pixels, 0, buf_size);
+        s_dirty_y0 = 0;
+        s_dirty_y1 = 0;
+    } else if (s_dirty_y0 < s_dirty_y1) {
+        /* Clear only the rows that were painted last frame */
+        int stride = w * 4;
+        memset(s_pixels + s_dirty_y0 * stride, 0,
+               (s_dirty_y1 - s_dirty_y0) * stride);
     }
-    /* Clear to fully transparent */
-    memset(s_pixels, 0, buf_size);
+
+    /* Reset per-frame dirty accumulator */
+    s_frame_y0 = h;
+    s_frame_y1 = 0;
 
     /* ── Draw overlays (back to front) ── */
 
@@ -1179,7 +1221,22 @@ void overlay_render(PlayerState *ps) {
     if (need_controls)
         draw_controls_overlay(s_pixels, w, h, ps);
 
+    /* Save this frame's dirty range for next frame's partial clear */
+    s_dirty_y0 = s_frame_y0;
+    s_dirty_y1 = s_frame_y1;
+
     /* ── Upload to GPU ── */
     gpu_overlay_upload(ps, s_pixels, w, h);
     ps->overlay_active = 1;
+}
+
+
+/* Free the overlay pixel buffer.  Called once from main.c shutdown. */
+void overlay_cleanup(void) {
+    free(s_pixels);
+    s_pixels = NULL;
+    s_pix_w  = 0;
+    s_pix_h  = 0;
+    s_dirty_y0 = 0;
+    s_dirty_y1 = 0;
 }
