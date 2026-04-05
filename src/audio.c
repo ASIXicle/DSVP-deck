@@ -28,6 +28,33 @@ int audio_decode_frame(PlayerState *ps) {
     for (;;) {
         ret = avcodec_receive_frame(ps->audio_codec_ctx, ps->audio_frame);
         if (ret == 0) {
+            /* ── Post-seek stale-frame skip ──
+             *
+             * After a seek in MPEG-TS, the demuxer reads packets in stream
+             * order.  Audio packets interleaved before the video keyframe
+             * enter the audio queue with PTS well below the first video
+             * frame.  Seek recovery resets audio_clock to video_clock, but
+             * the next audio decode would overwrite audio_clock backward,
+             * creating multi-second positive A/V drift.
+             *
+             * Fix: discard decoded audio whose PTS is more than 50ms before
+             * the recovery point.  The 50ms tolerance absorbs normal
+             * interleave jitter without rejecting valid frames.  The floor
+             * clears itself on the first accepted frame. */
+            if (ps->audio_pts_floor > 0.0) {
+                int64_t fp = ps->audio_frame->best_effort_timestamp;
+                if (fp == AV_NOPTS_VALUE) fp = ps->audio_frame->pts;
+                if (fp != AV_NOPTS_VALUE) {
+                    AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
+                    double pts_sec = (double)fp * av_q2d(as->time_base);
+                    if (pts_sec < ps->audio_pts_floor - 0.05) {
+                        av_frame_unref(ps->audio_frame);
+                        continue;   /* skip stale frame, pull next */
+                    }
+                }
+                ps->audio_pts_floor = 0.0;  /* floor satisfied — clear */
+            }
+
             if (!ps->swr_ctx) {
                 AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
                 ret = swr_alloc_set_opts2(&ps->swr_ctx,

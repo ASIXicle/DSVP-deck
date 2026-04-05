@@ -2476,6 +2476,7 @@ int player_open(PlayerState *ps, const char *filename) {
                 }
             } else if (hwdec_disabled && cid == AV_CODEC_ID_HEVC) {
                 log_msg("VAAPI: disabled by DSVP_HWDEC=0");
+
             }
         }
 #endif /* __linux__ */
@@ -3056,6 +3057,7 @@ void player_close(PlayerState *ps) {
     ps->seek_recovering    = 0;
     ps->decode_frame_ready = 0;
     ps->decode_eof         = 0;
+    ps->audio_pts_floor    = 0.0;
     ps->video_ready        = 0;
     ps->show_debug         = 0;
     ps->show_info          = 0;

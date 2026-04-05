@@ -1430,6 +1430,7 @@ int main(int argc, char *argv[]) {
                     /* Re-sync clocks to the actual first-frame PTS */
                     ps.audio_clock      = ps.video_clock;
                     ps.audio_clock_sync = ps.video_clock;
+                    ps.audio_pts_floor  = ps.video_clock;
                     ps.av_bias          = 0.0;
                     ps.av_bias_samples  = 0;
                     ps.frame_last_pts   = ps.video_clock;
