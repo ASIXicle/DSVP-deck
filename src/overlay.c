@@ -1015,7 +1015,7 @@ void overlay_render_browser(PlayerState *ps) {
         if (ps->game_mode)
             hint = "A:Open  B:Back  D-pad:Navigate  Start:Controls";
         else
-            hint = "Enter:Open  Backspace:Back  O:Dialog  Arrows:Navigate";
+            hint = "Enter:Open  Backspace:Back  Arrows:Navigate";
 
         draw_text(s_pixels, w, h, margin, hint_y, hint, font_scale,
                   140, 150, 170);

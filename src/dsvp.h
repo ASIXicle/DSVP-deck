@@ -113,22 +113,21 @@ typedef struct GPUUniforms {
     float hdr_target_nits;  /* SDR display peak (T key toggle)     4 bytes */
     float hdr_midtone_gain; /* midtone lift exponent (G key)       4 bytes */
     float is_dovi;          /* 1.0 = DV reshaping active           4 bytes */
-    float dovi_c0_I;        /* reshape: I/Y offset                 4 bytes */
-    float dovi_c0_Ct;       /* reshape: Ct/Cb offset               4 bytes */
-    /* ── 144B boundary (old struct end) ── */
-    float dovi_c0_Cp;       /* reshape: Cp/Cr offset               4 bytes */
-    float dovi_c1_I;        /* reshape: I/Y scale                  4 bytes */
-    float dovi_c1_Ct;       /* reshape: Ct/Cb scale                4 bytes */
-    float dovi_c1_Cp;       /* reshape: Cp/Cr scale                4 bytes */
+    float is_semiplanar;    /* 1.0 = UV from single R16G16 tex    4 bytes */
+    float _pad0[1];         /* align to 16B for float4 arrays     4 bytes */
+    /* ── 144B boundary ── */
+    float dovi_num_pieces[4]; /* [I, Ct, Cp, 0] piece counts      16 bytes */
+    float dovi_pivots[9][4];  /* [pivot][comp] normalized pivots 144 bytes */
+    float dovi_c0[8][4];     /* [piece][comp] poly coef c0       128 bytes */
+    float dovi_c1[8][4];     /* [piece][comp] poly coef c1       128 bytes */
+    float dovi_c2[8][4];     /* [piece][comp] poly coef c2       128 bytes */
     float dovi_ycc_r0[4];   /* ycc→rgb row 0 [m,m,m,offset]      16 bytes */
     float dovi_ycc_r1[4];   /* ycc→rgb row 1 [m,m,m,offset]      16 bytes */
     float dovi_ycc_r2[4];   /* ycc→rgb row 2 [m,m,m,offset]      16 bytes */
     float dovi_out_r0[4];   /* output row 0 [m,m,m,0] (lms→2020) 16 bytes */
     float dovi_out_r1[4];   /* output row 1 [m,m,m,0]            16 bytes */
     float dovi_out_r2[4];   /* output row 2 [m,m,m,0]            16 bytes */
-    float is_semiplanar;    /* 1.0 = UV from single R16G16 tex    4 bytes */
-    float _pad[3];          /* pad to 16-byte alignment          12 bytes */
-} GPUUniforms;              /*                                  272 bytes */
+} GPUUniforms;              /*                                  784 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *

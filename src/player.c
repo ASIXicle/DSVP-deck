@@ -175,19 +175,19 @@ static const char hlsl_yuv_planar_frag[] =
     "    float hdr_target_nits;\n"
     "    float hdr_midtone_gain;\n"
     "    float is_dovi;\n"
-    "    float dovi_c0_I;\n"
-    "    float dovi_c0_Ct;\n"
-    "    float dovi_c0_Cp;\n"
-    "    float dovi_c1_I;\n"
-    "    float dovi_c1_Ct;\n"
-    "    float dovi_c1_Cp;\n"
+    "    float is_semiplanar;\n"
+    "    float _pad0;\n"
+    "    float4 dovi_num_pieces;\n"
+    "    float4 dovi_pivots[9];\n"
+    "    float4 dovi_c0[8];\n"
+    "    float4 dovi_c1[8];\n"
+    "    float4 dovi_c2[8];\n"
     "    float4 dovi_ycc_r0;\n"
     "    float4 dovi_ycc_r1;\n"
     "    float4 dovi_ycc_r2;\n"
     "    float4 dovi_out_r0;\n"
     "    float4 dovi_out_r1;\n"
     "    float4 dovi_out_r2;\n"
-    "    float is_semiplanar;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -326,6 +326,32 @@ static const char hlsl_yuv_planar_frag[] =
     "         + (-2.0*t3 + 3.0*t2) * maxLum;\n"
     "}\n"
     "\n"
+    "/* Select component from float4: 0=x(I), 1=y(Ct), 2=z(Cp) */\n"
+    "float sel3(float4 v, int c) {\n"
+    "    if (c == 0) return v.x;\n"
+    "    if (c == 1) return v.y;\n"
+    "    return v.z;\n"
+    "}\n"
+    "\n"
+    "/* Piecewise polynomial reshape for one DV component.\n"
+    " * Searches pivot array to find the active piece, then evaluates\n"
+    " * c0 + c1*x + c2*x*x. Falls back to identity if no pieces. */\n"
+    "float dovi_reshape(float x, int comp) {\n"
+    "    int n = (int)sel3(dovi_num_pieces, comp);\n"
+    "    if (n <= 0) return x;\n"
+    "    for (int p = 0; p < 8; p++) {\n"
+    "        if (p >= n) break;\n"
+    "        float hi = sel3(dovi_pivots[p + 1], comp);\n"
+    "        if (x < hi || p == n - 1) {\n"
+    "            float c0v = sel3(dovi_c0[p], comp);\n"
+    "            float c1v = sel3(dovi_c1[p], comp);\n"
+    "            float c2v = sel3(dovi_c2[p], comp);\n"
+    "            return c0v + c1v * x + c2v * x * x;\n"
+    "        }\n"
+    "    }\n"
+    "    return x;\n"
+    "}\n"
+    "\n"
     "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target0 {\n"
     "    /* Chroma siting: shift UV to actual sample position */\n"
     "    float2 uv_chroma = uv + chromaOffset / texSizeUV;\n"
@@ -354,15 +380,15 @@ static const char hlsl_yuv_planar_frag[] =
     "    if (is_dovi > 0.5) {\n"
     "        /* ── Dolby Vision decode chain ──\n"
     "         * Planes contain I/Ct/Cp (IPTPQc2), not standard YCbCr.\n"
-    "         * 1. Reshape: per-component affine (from RPU polynomials)\n"
+    "         * 1. Reshape: piecewise polynomial (from RPU pivot/coef arrays)\n"
     "         * 2. ycc_to_rgb matrix: IPT → PQ-encoded signal\n"
     "         * 3. PQ EOTF → linear light (nits)\n"
     "         * 4. Output matrix → BT.2020 linear RGB\n"
     "         * 5. BT.2390 tone mapping (shared with HDR10 path) */\n"
     "        float3 ipt = float3(y, cb, cr);\n"
-    "        ipt.x = dovi_c0_I  + dovi_c1_I  * ipt.x;\n"
-    "        ipt.y = dovi_c0_Ct + dovi_c1_Ct * ipt.y;\n"
-    "        ipt.z = dovi_c0_Cp + dovi_c1_Cp * ipt.z;\n"
+    "        ipt.x = dovi_reshape(ipt.x, 0);\n"
+    "        ipt.y = dovi_reshape(ipt.y, 1);\n"
+    "        ipt.z = dovi_reshape(ipt.z, 2);\n"
     "\n"
     "        float3 centered = ipt - float3(dovi_ycc_r0.w, dovi_ycc_r1.w, dovi_ycc_r2.w);\n"
     "        float3 pq_sig;\n"
@@ -1378,13 +1404,20 @@ static void gpu_setup_uniforms(PlayerState *ps) {
 
     /* Initialize DV uniforms to identity (populated from first frame RPU) */
     if (is_dovi_active) {
-        /* Identity reshape: out = 0.0 + 1.0 * in */
-        ps->gpu_uniforms.dovi_c0_I  = 0.0f;
-        ps->gpu_uniforms.dovi_c0_Ct = 0.0f;
-        ps->gpu_uniforms.dovi_c0_Cp = 0.0f;
-        ps->gpu_uniforms.dovi_c1_I  = 1.0f;
-        ps->gpu_uniforms.dovi_c1_Ct = 1.0f;
-        ps->gpu_uniforms.dovi_c1_Cp = 1.0f;
+        /* Identity reshape: 1 piece per component, pivots [0,1], out = x */
+        memset(ps->gpu_uniforms.dovi_num_pieces, 0, sizeof(ps->gpu_uniforms.dovi_num_pieces));
+        memset(ps->gpu_uniforms.dovi_pivots, 0, sizeof(ps->gpu_uniforms.dovi_pivots));
+        memset(ps->gpu_uniforms.dovi_c0, 0, sizeof(ps->gpu_uniforms.dovi_c0));
+        memset(ps->gpu_uniforms.dovi_c1, 0, sizeof(ps->gpu_uniforms.dovi_c1));
+        memset(ps->gpu_uniforms.dovi_c2, 0, sizeof(ps->gpu_uniforms.dovi_c2));
+        for (int c = 0; c < 3; c++) {
+            ps->gpu_uniforms.dovi_num_pieces[c] = 1.0f;
+            ps->gpu_uniforms.dovi_pivots[0][c] = 0.0f;
+            ps->gpu_uniforms.dovi_pivots[1][c] = 1.0f;
+            ps->gpu_uniforms.dovi_c0[0][c] = 0.0f;  /* c0 = 0 */
+            ps->gpu_uniforms.dovi_c1[0][c] = 1.0f;  /* c1 = 1 → out = x */
+            ps->gpu_uniforms.dovi_c2[0][c] = 0.0f;
+        }
         /* Identity matrices (will be overwritten by first frame) */
         memset(ps->gpu_uniforms.dovi_ycc_r0, 0, 4 * sizeof(float));
         memset(ps->gpu_uniforms.dovi_ycc_r1, 0, 4 * sizeof(float));
@@ -3870,27 +3903,56 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 
     double coef_scale = (double)(1LL << hdr->coef_log2_denom);
 
-    /* ── Reshape coefficients (first piece, representative) ──
-     * For DV P5 streaming, all pieces typically have identical coefficients.
-     * Using first piece covers this case. Multi-piece piecewise support
-     * would require uploading pivot arrays + per-piece coefficients. */
+    /* ── Piecewise reshape coefficients (all pieces, all components) ──
+     * DV spec allows up to 8 pieces per component with independent
+     * polynomial coefficients. Pivots are normalized to [0,1] by
+     * dividing by (2^bl_bit_depth - 1). Coefficients are packed into
+     * float4 arrays indexed [piece][component] for GPU access. */
+    float pivot_scale = (float)((1 << hdr->bl_bit_depth) - 1);
+    if (pivot_scale < 1.0f) pivot_scale = 1023.0f; /* safety fallback */
+
     for (int c = 0; c < 3; c++) {
         const AVDOVIReshapingCurve *curve = &mapping->curves[c];
-        double c0 = 0.0, c1 = 1.0;
-        if (curve->num_pivots >= 2 &&
-            curve->mapping_idc[0] == AV_DOVI_MAPPING_POLYNOMIAL) {
-            c0 = (double)curve->poly_coef[0][0] / coef_scale;
-            c1 = (double)curve->poly_coef[0][1] / coef_scale;
-        }
-        switch (c) {
-            case 0: ps->gpu_uniforms.dovi_c0_I  = (float)c0;
-                    ps->gpu_uniforms.dovi_c1_I  = (float)c1; break;
-            case 1: ps->gpu_uniforms.dovi_c0_Ct = (float)c0;
-                    ps->gpu_uniforms.dovi_c1_Ct = (float)c1; break;
-            case 2: ps->gpu_uniforms.dovi_c0_Cp = (float)c0;
-                    ps->gpu_uniforms.dovi_c1_Cp = (float)c1; break;
+        int num_pieces = 0;
+        if (curve->num_pivots >= 2)
+            num_pieces = curve->num_pivots - 1;
+        if (num_pieces > 8) num_pieces = 8;
+        ps->gpu_uniforms.dovi_num_pieces[c] = (float)num_pieces;
+
+        /* Pack normalized pivots — [pivot_idx][component] */
+        for (int i = 0; i < (int)curve->num_pivots && i < 9; i++)
+            ps->gpu_uniforms.dovi_pivots[i][c] =
+                (float)curve->pivots[i] / pivot_scale;
+
+        /* Pack per-piece polynomial coefficients */
+        for (int p = 0; p < num_pieces; p++) {
+            if (curve->mapping_idc[p] == AV_DOVI_MAPPING_POLYNOMIAL) {
+                int order = curve->poly_order[p];
+                ps->gpu_uniforms.dovi_c0[p][c] =
+                    (float)((double)curve->poly_coef[p][0] / coef_scale);
+                ps->gpu_uniforms.dovi_c1[p][c] =
+                    (order >= 1)
+                    ? (float)((double)curve->poly_coef[p][1] / coef_scale)
+                    : 0.0f;
+                ps->gpu_uniforms.dovi_c2[p][c] =
+                    (order >= 2)
+                    ? (float)((double)curve->poly_coef[p][2] / coef_scale)
+                    : 0.0f;
+            } else {
+                /* MMR or unknown — identity passthrough for this piece */
+                ps->gpu_uniforms.dovi_c0[p][c] = 0.0f;
+                ps->gpu_uniforms.dovi_c1[p][c] = 1.0f;
+                ps->gpu_uniforms.dovi_c2[p][c] = 0.0f;
+                if (ps->dovi_metadata_logged < 2) {
+                    const char *comp_names[] = {"I", "Ct", "Cp"};
+                    log_msg("DOVI: WARNING — piece %d comp %s uses MMR "
+                            "(not yet implemented, identity fallback)", p,
+                            comp_names[c]);
+                }
+            }
         }
     }
+    ps->gpu_uniforms.dovi_num_pieces[3] = 0.0f; /* w component unused */
 
     /* ── ycc_to_rgb matrix + offsets → packed as float4 rows ──
      * Row format: [m0, m1, m2, offset] */
@@ -3951,11 +4013,19 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 
     /* Log on first populate only (avoid per-frame log spam) */
     if (ps->dovi_metadata_logged < 2) {
-        log_msg("DOVI: uniforms populated — reshape c0=[%.4f,%.4f,%.4f] c1=[%.4f,%.4f,%.4f]",
-                ps->gpu_uniforms.dovi_c0_I, ps->gpu_uniforms.dovi_c0_Ct,
-                ps->gpu_uniforms.dovi_c0_Cp,
-                ps->gpu_uniforms.dovi_c1_I, ps->gpu_uniforms.dovi_c1_Ct,
-                ps->gpu_uniforms.dovi_c1_Cp);
+        log_msg("DOVI: uniforms populated — pieces I=%d Ct=%d Cp=%d",
+                (int)ps->gpu_uniforms.dovi_num_pieces[0],
+                (int)ps->gpu_uniforms.dovi_num_pieces[1],
+                (int)ps->gpu_uniforms.dovi_num_pieces[2]);
+        /* Log piece-0 coefficients as representative sample */
+        log_msg("DOVI: piece 0 — c0=[%.4f,%.4f,%.4f] c1=[%.4f,%.4f,%.4f] "
+                "c2=[%.4f,%.4f,%.4f]",
+                ps->gpu_uniforms.dovi_c0[0][0], ps->gpu_uniforms.dovi_c0[0][1],
+                ps->gpu_uniforms.dovi_c0[0][2],
+                ps->gpu_uniforms.dovi_c1[0][0], ps->gpu_uniforms.dovi_c1[0][1],
+                ps->gpu_uniforms.dovi_c1[0][2],
+                ps->gpu_uniforms.dovi_c2[0][0], ps->gpu_uniforms.dovi_c2[0][1],
+                ps->gpu_uniforms.dovi_c2[0][2]);
         log_msg("DOVI: output matrix (cone_inv × rgb_to_lms):");
         log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r0[0],
                 ps->gpu_uniforms.dovi_out_r0[1], ps->gpu_uniforms.dovi_out_r0[2]);
