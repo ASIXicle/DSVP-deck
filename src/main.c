@@ -690,11 +690,9 @@ int main(int argc, char *argv[]) {
                             if (!bitstream_start(&ps))
                                 audio_open(&ps);  /* fallback to PCM */
                         }
-                        /* Re-sync audio clock to video position */
-                        ps.audio_clock      = ps.video_clock;
-                        ps.audio_clock_sync = ps.video_clock;
-                        ps.av_bias          = 0.0;
-                        ps.av_bias_samples  = 0;
+                        /* Let seek-recovery re-sync clocks on next
+                         * displayed frame -- same mechanism as post-seek. */
+                        ps.seek_recovering = 1;
                     } else if (ps.audio_mode == AUDIO_MODE_PCM) {
                         ps.bitstream_active = 0;
                     }
