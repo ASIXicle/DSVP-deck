@@ -3224,11 +3224,6 @@ int demux_thread_func(void *arg) {
         /* ── Throttle if queues are full ── */
         if (ps->video_pq.nb_packets > PACKET_QUEUE_MAX ||
             ps->audio_pq.nb_packets > PACKET_QUEUE_MAX) {
-            static int throttle_count = 0;
-            if (++throttle_count == 1 || (throttle_count % 100) == 0)
-                log_msg("DEMUX DIAG: throttled (vpq=%d apq=%d, count=%d)",
-                        ps->video_pq.nb_packets, ps->audio_pq.nb_packets,
-                        throttle_count);
             SDL_Delay(10);
             continue;
         }

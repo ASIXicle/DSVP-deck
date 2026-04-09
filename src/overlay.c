@@ -1070,6 +1070,7 @@ static void draw_controls_overlay(uint8_t *buf, int bw, int bh, PlayerState *ps)
         "D-Pad L/R   Page Up/Down (browser)",
         "D-Pad L/R   Prev/Next File (playback)",
         "R3          Cycle Audio Track",
+        "L3          Transport Control Mode",
         "Start       Controls (this screen)",
         "Select      Debug Overlay",
         NULL
