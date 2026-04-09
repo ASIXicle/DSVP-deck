@@ -312,9 +312,10 @@ void audio_cycle(PlayerState *ps) {
 
     int new_sel = (ps->aud_selection + 1) % ps->aud_count;
 
-    /* Skip TrueHD tracks — unusable without HDMI bitstreaming */
+    /* Skip TrueHD tracks when not in bitstream passthrough */
+    int skip_truehd = (ps->audio_mode == AUDIO_MODE_PCM || !ps->bitstream_active);
     int checked = 0;
-    while (checked < ps->aud_count) {
+    while (skip_truehd && checked < ps->aud_count) {
         int idx = ps->aud_stream_indices[new_sel];
         AVStream *st = ps->fmt_ctx->streams[idx];
         if (st->codecpar->codec_id != AV_CODEC_ID_TRUEHD)
@@ -324,7 +325,7 @@ void audio_cycle(PlayerState *ps) {
         new_sel = (new_sel + 1) % ps->aud_count;
         checked++;
     }
-    if (checked >= ps->aud_count || new_sel == ps->aud_selection) {
+    if (skip_truehd && (checked >= ps->aud_count || new_sel == ps->aud_selection)) {
         /* All other tracks are TrueHD — stay on current */
         snprintf(ps->aud_osd, sizeof(ps->aud_osd),
             "No other non-TrueHD audio tracks");

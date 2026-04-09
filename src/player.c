@@ -2397,19 +2397,20 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->video_stream_idx = av_find_best_stream(ps->fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     ps->audio_stream_idx = av_find_best_stream(ps->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, ps->video_stream_idx, NULL, 0);
 
-    /* ── Skip TrueHD audio (unusable without HDMI bitstreaming) ──
+    /* ── Skip TrueHD audio when not in bitstream passthrough ──
      *
      * TrueHD Atmos 7.1 MLP decode is extremely CPU-heavy and starves the
      * video pipeline on complex files (4K HEVC 10-bit + 29 streams).
      * Without an AVR/soundbar via HDMI, it just gets crushed to S16 stereo
      * anyway — pointless pain. Every Blu-ray with TrueHD ships an AC3 or
      * EAC3 compatibility track. Pick that instead.
-     *
-     * Will be removed when HDMI bitstreaming support lands. */
+     * When bitstream passthrough is active, TrueHD packets go straight to
+     * the HDMI wire without decoding — no CPU cost, lossless output. */
     if (ps->audio_stream_idx >= 0) {
         AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
-        if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD) {
-            log_msg("Audio: default stream is TrueHD — skipping (no bitstream support)");
+        if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD &&
+            (ps->audio_mode == AUDIO_MODE_PCM || !ps->bitstream_active)) {
+            log_msg("Audio: default stream is TrueHD — skipping (PCM mode or passthrough inactive)");
             int fallback = -1;
             for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
                 AVStream *st = ps->fmt_ctx->streams[i];

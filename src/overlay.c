@@ -1090,6 +1090,7 @@ static void draw_controls_overlay(uint8_t *buf, int bw, int bh, PlayerState *ps)
         "T           Cycle SDR Target Nits",
         "G           Cycle Midtone Gain",
         "V           Toggle VSync / Mailbox",
+        "P           Cycle Audio Mode",
         NULL
     };
 

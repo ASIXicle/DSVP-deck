@@ -659,6 +659,32 @@ int main(int argc, char *argv[]) {
                     audio_cycle(&ps);
                     break;
 
+                case SDLK_P:
+                {
+                    /* Cycle audio mode: PCM → AUTO → PASSTHROUGH → PCM */
+                    int m = (int)ps.audio_mode + 1;
+                    if (m > 2) m = 0;
+                    ps.audio_mode = (AudioMode)m;
+
+                    /* Re-probe HDMI sink if entering a passthrough mode */
+                    if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_caps.probed)
+                        bitstream_probe(&ps);
+
+                    /* If returning to PCM, deactivate passthrough */
+                    if (ps.audio_mode == AUDIO_MODE_PCM)
+                        ps.bitstream_active = 0;
+
+                    static const char *mode_names[] = {
+                        "PCM (decode)", "AUTO", "PASSTHROUGH"
+                    };
+                    snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                             "Audio Mode: %s", mode_names[ps.audio_mode]);
+                    ps.aud_osd_until = get_time_sec() + 2.0;
+                    log_msg("Audio mode: %s (bitstream_active=%d)",
+                            mode_names[ps.audio_mode], ps.bitstream_active);
+                    break;
+                }
+
                 case SDLK_LEFT:
                     player_seek(&ps, -SEEK_STEP_SEC);
                     break;
