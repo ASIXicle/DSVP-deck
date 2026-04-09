@@ -946,7 +946,7 @@ int bitstream_start(PlayerState *ps) {
     ps->alsa_pcm = pcm;
 
     log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
-            opened_dev, actual_rate, channels,
+            ps->bitstream_caps.alsa_device, actual_rate, channels,
             buffer_size, period_size);
 
     /* ── Launch output thread ── */
