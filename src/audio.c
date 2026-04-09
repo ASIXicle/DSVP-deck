@@ -579,6 +579,7 @@ static void pipewire_stop(void) {
 static void pipewire_start(void) {
     log_msg("Bitstream: restarting PipeWire");
     system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
+    SDL_Delay(200);  /* give PipeWire time to reclaim audio devices */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
