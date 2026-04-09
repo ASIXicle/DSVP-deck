@@ -786,20 +786,36 @@ int bitstream_start(PlayerState *ps) {
     ps->spdif_ctx  = spdif;
     ps->spdif_avio = avio;
 
-    /* ── Open ALSA device ── */
+    /* ── Open ALSA device with IEC958 channel status ──
+     * Raw hw:X,Y sends S16 data but the HDMI transmitter treats it as PCM.
+     * IEC 61937 passthrough requires the non-audio bit in IEC958 channel
+     * status. We use the ALSA iec958:{} plugin which sets this automatically.
+     * AES0=0x06: non-audio + no copyright
+     * AES1=0x82: digital-digital converter category
+     * AES3=0x02: 48kHz sample rate indicator */
+    int card_num = 0, dev_num = 0;
+    sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
+    char iec958_dev[256];
+    snprintf(iec958_dev, sizeof(iec958_dev),
+        "iec958:{CARD %d DEV %d AES0 0x06 AES1 0x82 AES2 0x00 AES3 0x02}",
+        card_num, dev_num);
+
     snd_pcm_t *pcm = NULL;
-    ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
-                        SND_PCM_STREAM_PLAYBACK, 0);
+    log_msg("Bitstream: opening ALSA device: %s", iec958_dev);
+    ret = snd_pcm_open(&pcm, iec958_dev, SND_PCM_STREAM_PLAYBACK, 0);
     if (ret == -EBUSY) {
-        /* PipeWire is holding the device -- stop it and retry */
         pipewire_stop();
         ps->pipewire_stopped = 1;
+        ret = snd_pcm_open(&pcm, iec958_dev, SND_PCM_STREAM_PLAYBACK, 0);
+    }
+    if (ret < 0) {
+        log_msg("Bitstream: ALSA open '%s' failed: %s — trying raw hw device",
+                iec958_dev, snd_strerror(ret));
         ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
                             SND_PCM_STREAM_PLAYBACK, 0);
     }
     if (ret < 0) {
-        log_msg("Bitstream: ALSA open '%s' failed: %s",
-                ps->bitstream_caps.alsa_device, snd_strerror(ret));
+        log_msg("Bitstream: ALSA open failed: %s", snd_strerror(ret));
         if (ps->pipewire_stopped) { pipewire_start(); ps->pipewire_stopped = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
@@ -808,7 +824,7 @@ int bitstream_start(PlayerState *ps) {
         ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
         return 0;
     }
-
+    
     /* Set ALSA hardware parameters */
     snd_pcm_hw_params_t *hw;
     snd_pcm_hw_params_alloca(&hw);
@@ -846,7 +862,7 @@ int bitstream_start(PlayerState *ps) {
     ps->alsa_pcm = pcm;
 
     log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
-            ps->bitstream_caps.alsa_device, actual_rate, channels,
+            iec958_dev, actual_rate, channels,
             buffer_size, period_size);
 
     /* ── Launch output thread ── */
