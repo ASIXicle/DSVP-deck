@@ -216,6 +216,7 @@ typedef struct PlayerState {
     int                 spdif_buf_size;  /* allocated size of spdif_buf            */
     SDL_Thread         *bitstream_thread;
     int                 bitstream_quit;  /* signal bitstream thread to exit        */
+    int                 pipewire_stopped; /* 1 = we stopped PipeWire for ALSA     */
 
     /* ── Packet queues ── */
     PacketQueue         video_pq;

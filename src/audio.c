@@ -551,6 +551,23 @@ void bitstream_probe(PlayerState *ps) {
 
 #define SPDIF_MAX_BUF  32768   /* max IEC 61937 burst (TrueHD HBR=61440) */
 
+/* ── PipeWire device contention ──
+ * PipeWire holds ALSA HDMI devices exclusively. For bitstream passthrough
+ * we need raw ALSA access, so we temporarily stop PipeWire. This is the
+ * same approach mpv/Kodi users use on Linux for audio passthrough.
+ * Services are restarted in bitstream_stop or on error fallback. */
+
+static void pipewire_stop(void) {
+    log_msg("Bitstream: stopping PipeWire for exclusive ALSA access");
+    system("systemctl --user stop wireplumber pipewire-pulse.socket pipewire.socket pipewire 2>/dev/null");
+    SDL_Delay(100);  /* give PipeWire time to release ALSA devices */
+}
+
+static void pipewire_start(void) {
+    log_msg("Bitstream: restarting PipeWire");
+    system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
+}
+
 /* ── spdifenc AVIO write callback ──
  * Called by av_write_frame when the spdif muxer has framed data.
  * Accumulates into ps->spdif_buf for subsequent ALSA writei. */
@@ -772,9 +789,17 @@ int bitstream_start(PlayerState *ps) {
     snd_pcm_t *pcm = NULL;
     ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
                         SND_PCM_STREAM_PLAYBACK, 0);
+    if (ret == -EBUSY) {
+        /* PipeWire is holding the device -- stop it and retry */
+        pipewire_stop();
+        ps->pipewire_stopped = 1;
+        ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
+                            SND_PCM_STREAM_PLAYBACK, 0);
+    }
     if (ret < 0) {
-        log_msg("Bitstream: ALSA open '%s' failed: %s (device may be held by PipeWire)",
+        log_msg("Bitstream: ALSA open '%s' failed: %s",
                 ps->bitstream_caps.alsa_device, snd_strerror(ret));
+        if (ps->pipewire_stopped) { pipewire_start(); ps->pipewire_stopped = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -807,6 +832,7 @@ int bitstream_start(PlayerState *ps) {
     if (ret < 0) {
         log_msg("Bitstream: ALSA hw_params failed: %s", snd_strerror(ret));
         snd_pcm_close(pcm);
+        if (ps->pipewire_stopped) { pipewire_start(); ps->pipewire_stopped = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -833,6 +859,7 @@ int bitstream_start(PlayerState *ps) {
         snd_pcm_close(pcm);
         ps->alsa_pcm = NULL;
         ps->bitstream_active = 0;
+        if (ps->pipewire_stopped) { pipewire_start(); ps->pipewire_stopped = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -897,6 +924,12 @@ void bitstream_stop(PlayerState *ps) {
 
     /* Reset abort so audio_pq works normally for PCM fallback */
     ps->audio_pq.abort_request = 0;
+
+    /* Restart PipeWire if we stopped it for ALSA access */
+    if (ps->pipewire_stopped) {
+        pipewire_start();
+        ps->pipewire_stopped = 0;
+    }
 
     log_msg("Bitstream: passthrough stopped");
 }
