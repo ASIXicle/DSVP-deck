@@ -680,12 +680,21 @@ int main(int argc, char *argv[]) {
                     if (ps.playing && ps.audio_codec_ctx) {
                         if (ps.audio_mode == AUDIO_MODE_PCM && ps.bitstream_active) {
                             bitstream_stop(&ps);
+                            pq_flush(&ps.audio_pq);
+                            avcodec_flush_buffers(ps.audio_codec_ctx);
                             audio_open(&ps);
                         } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
                             audio_close(&ps);
+                            pq_flush(&ps.audio_pq);
+                            avcodec_flush_buffers(ps.audio_codec_ctx);
                             if (!bitstream_start(&ps))
                                 audio_open(&ps);  /* fallback to PCM */
                         }
+                        /* Re-sync audio clock to video position */
+                        ps.audio_clock      = ps.video_clock;
+                        ps.audio_clock_sync = ps.video_clock;
+                        ps.av_bias          = 0.0;
+                        ps.av_bias_samples  = 0;
                     } else if (ps.audio_mode == AUDIO_MODE_PCM) {
                         ps.bitstream_active = 0;
                     }
