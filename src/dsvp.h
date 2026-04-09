@@ -70,6 +70,8 @@
 #define BROWSER_MAX_VISIBLE 20   /* max visible entries in file list  */
 #define BROWSER_PATH_MAX    1024
 
+
+
 /* ── Bitstream Audio Passthrough ────────────────────────────────────
  *
  * AudioMode controls how audio reaches the output device:
@@ -96,6 +98,7 @@ typedef struct BitstreamCaps {
     int  hbr_capable;      /* HDMI supports High Bit Rate (TrueHD req) */
     int  max_channels;     /* max channel count reported by sink       */
     int  probed;           /* 1 = caps have been queried this session   */
+    char alsa_device[32];  /* ALSA hw device for passthrough (e.g. "hw:0,8") */
 } BitstreamCaps;
 
 /* ── Packet Queue ───────────────────────────────────────────────────
@@ -470,6 +473,7 @@ void  SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
 int   audio_decode_frame(PlayerState *ps);
 void  audio_find_streams(PlayerState *ps);
 void  audio_cycle(PlayerState *ps);
+void  bitstream_probe(PlayerState *ps);
 
 /* ── Subtitle API (subtitle.c) ───────────────────────────────────── */
 

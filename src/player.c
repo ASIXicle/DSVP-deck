@@ -2967,6 +2967,10 @@ int player_open(PlayerState *ps, const char *filename) {
         audio_open(ps);
     }
 
+    /* ── Probe HDMI sink for bitstream capabilities (once per session) ── */
+    if (!ps->bitstream_caps.probed)
+        bitstream_probe(ps);
+
     /* ── Start demux thread ── */
     ps->eof     = 0;
     ps->playing = 1;

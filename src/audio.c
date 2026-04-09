@@ -400,3 +400,135 @@ void audio_cycle(PlayerState *ps) {
         ps->aud_stream_names[new_sel]);
     ps->aud_osd_until = get_time_sec() + 2.0;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Bitstream Probe — HDMI sink capability detection via ALSA ELD
+ *
+ * Scans /proc/asound/cardN/eld#M.X files for a connected HDMI monitor.
+ * Parses Short Audio Descriptors (SADs) to determine which compressed
+ * codecs the sink supports. Maps the ELD index to an ALSA PCM device
+ * via /proc/asound/cardN/pcmDp/info matching.
+ *
+ * Called once at startup or when the user toggles audio mode.
+ * Results cached in ps->bitstream_caps (re-probe by clearing .probed).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+void bitstream_probe(PlayerState *ps) {
+    memset(&ps->bitstream_caps, 0, sizeof(BitstreamCaps));
+
+    /* ── Scan ELD files for a connected HDMI monitor ── */
+    int card = -1, eld_idx = -1;
+    char eld_path[256];
+
+    for (int c = 0; c < 8; c++) {
+        for (int i = 0; i < 16; i++) {
+            snprintf(eld_path, sizeof(eld_path),
+                     "/proc/asound/card%d/eld#0.%d", c, i);
+            FILE *f = fopen(eld_path, "r");
+            if (!f) continue;
+
+            int present = 0, valid = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                sscanf(line, " monitor_present %d", &present);
+                sscanf(line, " eld_valid %d", &valid);
+            }
+            fclose(f);
+
+            if (present && valid) {
+                card = c;
+                eld_idx = i;
+                break;
+            }
+        }
+        if (card >= 0) break;
+    }
+
+    if (card < 0) {
+        log_msg("Bitstream: no HDMI monitor detected in ELD scan");
+        return;
+    }
+
+    /* ── Parse SADs from the active ELD ── */
+    snprintf(eld_path, sizeof(eld_path),
+             "/proc/asound/card%d/eld#0.%d", card, eld_idx);
+    FILE *f = fopen(eld_path, "r");
+    if (!f) return;
+
+    char line[256];
+    char monitor[128] = "";
+
+    while (fgets(line, sizeof(line), f)) {
+        sscanf(line, " monitor_name %127[^\n]", monitor);
+
+        /* Parse SAD coding types: "sadN_coding_type  [0xHEX] ..." */
+        int sad_idx, coding_type;
+        if (sscanf(line, " sad%d_coding_type [0x%x]", &sad_idx, &coding_type) == 2) {
+            switch (coding_type) {
+                case 0x2:  ps->bitstream_caps.support_ac3    = 1; break;
+                case 0x7:  ps->bitstream_caps.support_dts    = 1; break;
+                case 0xa:  ps->bitstream_caps.support_eac3   = 1; break;
+                case 0xb:  ps->bitstream_caps.support_dtshd  = 1; break;
+                case 0xc:  ps->bitstream_caps.support_truehd = 1; break;
+            }
+        }
+
+        /* Track max channel count across all SADs */
+        int channels;
+        if (sscanf(line, " sad%d_channels %d", &sad_idx, &channels) == 2) {
+            if (channels > ps->bitstream_caps.max_channels)
+                ps->bitstream_caps.max_channels = channels;
+        }
+    }
+    fclose(f);
+
+    /* TrueHD requires HBR — if the sink reports TrueHD, it supports HBR */
+    if (ps->bitstream_caps.support_truehd)
+        ps->bitstream_caps.hbr_capable = 1;
+
+    /* ── Map ELD index → ALSA PCM device ──
+     *
+     * ELD index N corresponds to "HDMI N" in the ALSA PCM device info.
+     * Scan /proc/asound/cardC/pcmDp/info files for a matching id line.
+     */
+    char search_id[32];
+    snprintf(search_id, sizeof(search_id), "HDMI %d", eld_idx);
+
+    for (int dev = 0; dev < 32; dev++) {
+        char info_path[256];
+        snprintf(info_path, sizeof(info_path),
+                 "/proc/asound/card%d/pcm%dp/info", card, dev);
+        FILE *info = fopen(info_path, "r");
+        if (!info) continue;
+
+        char info_line[256];
+        while (fgets(info_line, sizeof(info_line), info)) {
+            char id[64];
+            if (sscanf(info_line, " id: %63[^\n]", id) == 1) {
+                if (strcmp(id, search_id) == 0) {
+                    snprintf(ps->bitstream_caps.alsa_device,
+                             sizeof(ps->bitstream_caps.alsa_device),
+                             "hw:%d,%d", card, dev);
+                }
+                break;  /* id is always near the top — stop reading */
+            }
+        }
+        fclose(info);
+        if (ps->bitstream_caps.alsa_device[0]) break;
+    }
+
+    ps->bitstream_caps.probed = 1;
+
+    log_msg("Bitstream: probed %s via ELD (card%d, eld#0.%d)",
+            monitor[0] ? monitor : "unknown", card, eld_idx);
+    log_msg("Bitstream: AC3=%d EAC3=%d TrueHD=%d DTS=%d DTS-HD=%d "
+            "HBR=%d maxch=%d device=%s",
+            ps->bitstream_caps.support_ac3,
+            ps->bitstream_caps.support_eac3,
+            ps->bitstream_caps.support_truehd,
+            ps->bitstream_caps.support_dts,
+            ps->bitstream_caps.support_dtshd,
+            ps->bitstream_caps.hbr_capable,
+            ps->bitstream_caps.max_channels,
+            ps->bitstream_caps.alsa_device[0] ? ps->bitstream_caps.alsa_device : "none");
+}
