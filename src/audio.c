@@ -753,8 +753,9 @@ static int bitstream_thread_func(void *arg) {
 
         if (s_spdif_pos <= 0) continue;
 
-        /* Write IEC 61937 burst to ALSA — S16LE stereo, 4 bytes/frame */
-        int frames = s_spdif_pos / 4;
+        /* Write IEC 61937 burst to ALSA */
+        int bpf = ps->bitstream_frame_bytes;  /* 4 for stereo, 16 for 8ch TrueHD */
+        int frames = s_spdif_pos / bpf;
         const uint8_t *ptr = ps->spdif_buf;
         while (frames > 0) {
             snd_pcm_sframes_t written = snd_pcm_writei(pcm, ptr, frames);
@@ -770,7 +771,7 @@ static int bitstream_thread_func(void *arg) {
                 break;
             }
             frames -= (int)written;
-            ptr += written * 4;
+            ptr += written * bpf;
         }
     }
 
@@ -962,6 +963,7 @@ int bitstream_start(PlayerState *ps) {
 
     snd_pcm_prepare(pcm);
     ps->alsa_pcm = pcm;
+    ps->bitstream_frame_bytes = channels * 2;  /* S16LE: 4 for stereo, 16 for 8ch */
 
     log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
             ps->bitstream_caps.alsa_device, actual_rate, channels,
