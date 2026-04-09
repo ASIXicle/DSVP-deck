@@ -569,8 +569,7 @@ static void pipewire_start(void) {
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
- * Maps ALSA sample rate to IEC 60958 channel status byte 3 value.
- * Used to construct ALSA device names with AES parameters. */
+ * Maps ALSA sample rate to IEC 60958 channel status byte 3 value. */
 
 static int iec958_rate_code(int rate) {
     switch (rate) {
@@ -583,6 +582,84 @@ static int iec958_rate_code(int rate) {
         case 192000: return 14;
         default:     return 1;  /* not indicated */
     }
+}
+
+/* ── IEC 60958 channel status for HDMI passthrough ──
+ * HDMI transmitters check the channel status to distinguish PCM from
+ * compressed audio. Without the non-audio bit set, the TV receives
+ * IEC 61937 bursts but interprets them as PCM → static noise.
+ *
+ * AMD HDA HDMI driver uses MIXER interface with INDEX (not DEVICE).
+ * The IEC958 controls are indexed by HDMI port order (0,1,2,3),
+ * not by PCM device number (3,7,8,9 on Steam Deck). We discover
+ * the correct index by enumerating "HDMI/DP,pcm=N Jack" controls. */
+
+static void set_iec958_nonpcm(int card, int dev, int aes3) {
+    char ctl_name[32];
+    snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
+
+    snd_ctl_t *ctl;
+    int err = snd_ctl_open(&ctl, ctl_name, 0);
+    if (err < 0) {
+        log_msg("Bitstream: IEC958 control open failed: %s", snd_strerror(err));
+        return;
+    }
+
+    /* ── Find mixer index for our PCM device ──
+     * Enumerate HDMI/DP Jack controls in device order.
+     * The position of our device in the list = the IEC958 mixer index. */
+    snd_ctl_elem_id_t *id;
+    snd_ctl_elem_value_t *val;
+    snd_ctl_elem_id_alloca(&id);
+    snd_ctl_elem_value_alloca(&val);
+
+    int iec958_idx = -1;
+    int idx_count = 0;
+    for (int d = 0; d < 16; d++) {
+        char jack_name[64];
+        snprintf(jack_name, sizeof(jack_name), "HDMI/DP,pcm=%d Jack", d);
+        snd_ctl_elem_id_clear(id);
+        snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_CARD);
+        snd_ctl_elem_id_set_name(id, jack_name);
+        snd_ctl_elem_value_set_id(val, id);
+        if (snd_ctl_elem_read(ctl, val) >= 0) {
+            if (d == dev) {
+                iec958_idx = idx_count;
+                log_msg("Bitstream: pcm device %d → IEC958 mixer index %d", dev, iec958_idx);
+            }
+            idx_count++;
+        }
+    }
+
+    if (iec958_idx < 0) {
+        log_msg("Bitstream: could not find IEC958 index for pcm device %d", dev);
+        snd_ctl_close(ctl);
+        return;
+    }
+
+    /* ── Set channel status: non-audio + sample rate ── */
+    snd_ctl_elem_id_clear(id);
+    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
+    snd_ctl_elem_id_set_name(id, "IEC958 Playback Default");
+    snd_ctl_elem_id_set_index(id, iec958_idx);
+    snd_ctl_elem_value_set_id(val, id);
+
+    snd_aes_iec958_t iec958;
+    memset(&iec958, 0, sizeof(iec958));
+    iec958.status[0] = 0x06;  /* non-audio + no copyright */
+    iec958.status[1] = 0x82;  /* digital-digital converter */
+    iec958.status[2] = 0x00;
+    iec958.status[3] = aes3;  /* sample rate */
+    snd_ctl_elem_value_set_iec958(val, &iec958);
+
+    err = snd_ctl_elem_write(ctl, val);
+    if (err < 0)
+        log_msg("Bitstream: IEC958 set failed (idx=%d): %s", iec958_idx, snd_strerror(err));
+    else
+        log_msg("Bitstream: IEC958 non-audio set (idx=%d, AES0=0x06 AES3=0x%02x)",
+                iec958_idx, aes3);
+
+    snd_ctl_close(ctl);
 }
 
 /* ── spdifenc AVIO write callback ──
@@ -804,15 +881,9 @@ int bitstream_start(PlayerState *ps) {
     ps->spdif_avio = avio;
 
     /* ── Open ALSA device for passthrough ──
-     * HDMI passthrough requires IEC958 channel status with the non-audio
-     * bit set. We try device names that embed AES parameters, matching
-     * exactly how mpv handles this (ao_alsa.c try_open_device).
-     *
-     * Cascade: hdmi: → iec958: → raw hw: (last resort, may produce static)
-     * All values decimal, matching IEC958_AES0/1/3 constants from alsa-lib.
-     * AES0=6: IEC958_AES0_NONAUDIO | IEC958_AES0_PRO_EMPHASIS_NONE
-     * AES1=130: IEC958_AES1_CON_ORIGINAL | IEC958_AES1_CON_PCM_CODER
-     * AES3: sample rate code from iec958_rate_code() */
+     * 1. Stop PipeWire (always holds HDMI devices exclusively)
+     * 2. Set IEC958 channel status via snd_ctl (non-audio bit)
+     * 3. Open the raw hw device */
     int card_num = 0, dev_num = 0;
     sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
     int aes3 = iec958_rate_code(rate);
@@ -820,46 +891,23 @@ int bitstream_start(PlayerState *ps) {
     pipewire_stop();
     ps->pipewire_stopped = 1;
 
-    /* Build device name candidates (mpv format: KEY=VALUE,KEY=VALUE) */
-    char dev_hdmi[256], dev_iec[256];
-    snprintf(dev_hdmi, sizeof(dev_hdmi),
-        "hdmi:CARD=%d,DEV=%d,AES0=6,AES1=130,AES2=0,AES3=%d",
-        card_num, dev_num, aes3);
-    snprintf(dev_iec, sizeof(dev_iec),
-        "iec958:CARD=%d,DEV=%d,AES0=6,AES1=130,AES2=0,AES3=%d",
-        card_num, dev_num, aes3);
+    /* Set non-audio bit BEFORE opening PCM (some drivers latch on open) */
+    set_iec958_nonpcm(card_num, dev_num, aes3);
 
     snd_pcm_t *pcm = NULL;
-    const char *opened_dev = NULL;
-
-    /* Try hdmi: device (has IEC958 status built in) */
-    log_msg("Bitstream: trying ALSA device: %s", dev_hdmi);
-    ret = snd_pcm_open(&pcm, dev_hdmi, SND_PCM_STREAM_PLAYBACK, 0);
-    if (ret >= 0) { opened_dev = dev_hdmi; goto alsa_opened; }
-    log_msg("Bitstream: hdmi device failed: %s", snd_strerror(ret));
-
-    /* Try iec958: device */
-    log_msg("Bitstream: trying ALSA device: %s", dev_iec);
-    ret = snd_pcm_open(&pcm, dev_iec, SND_PCM_STREAM_PLAYBACK, 0);
-    if (ret >= 0) { opened_dev = dev_iec; goto alsa_opened; }
-    log_msg("Bitstream: iec958 device failed: %s", snd_strerror(ret));
-
-    /* Last resort: raw hw device (no IEC958 status — may produce static) */
-    log_msg("Bitstream: trying raw ALSA device: %s", ps->bitstream_caps.alsa_device);
     ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
                         SND_PCM_STREAM_PLAYBACK, 0);
-    if (ret >= 0) { opened_dev = ps->bitstream_caps.alsa_device; goto alsa_opened; }
-
-    log_msg("Bitstream: all ALSA devices failed: %s", snd_strerror(ret));
-    pipewire_start(); ps->pipewire_stopped = 0;
-    av_write_trailer(spdif);
-    avio_context_free(&avio);
-    avformat_free_context(spdif);
-    av_free(ps->spdif_buf); ps->spdif_buf = NULL;
-    ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
-    return 0;
-
-alsa_opened:
+    if (ret < 0) {
+        log_msg("Bitstream: ALSA open '%s' failed: %s",
+                ps->bitstream_caps.alsa_device, snd_strerror(ret));
+        pipewire_start(); ps->pipewire_stopped = 0;
+        av_write_trailer(spdif);
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
+        return 0;
+    }
     
     /* Set ALSA hardware parameters */
     snd_pcm_hw_params_t *hw;
