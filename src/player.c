@@ -2963,14 +2963,20 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->diag_max_av_drift     = 0.0;
     ps->diag_last_report      = get_time_sec();
 
-    /* ── Open audio output ── */
-    if (ps->audio_codec_ctx) {
-        audio_open(ps);
-    }
-
     /* ── Probe HDMI sink for bitstream capabilities (once per session) ── */
     if (!ps->bitstream_caps.probed)
         bitstream_probe(ps);
+
+    /* ── Open audio output ──
+     * If passthrough mode is requested and the sink supports the codec,
+     * use ALSA direct (bitstream_start). Otherwise fall back to SDL3 PCM. */
+    if (ps->audio_codec_ctx) {
+        int use_bitstream = 0;
+        if (ps->audio_mode != AUDIO_MODE_PCM && ps->bitstream_caps.probed)
+            use_bitstream = bitstream_start(ps);
+        if (!use_bitstream)
+            audio_open(ps);
+    }
 
     /* ── Start demux thread ── */
     ps->eof     = 0;
@@ -3032,6 +3038,7 @@ void player_close(PlayerState *ps) {
     }
 
     /* Close audio */
+    bitstream_stop(ps);  /* no-op if not active */
     audio_close(ps);
 
     /* Close subtitles */

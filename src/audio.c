@@ -534,3 +534,368 @@ void bitstream_probe(PlayerState *ps) {
             ps->bitstream_caps.max_channels,
             ps->bitstream_caps.alsa_device[0] ? ps->bitstream_caps.alsa_device : "none");
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Bitstream Output — IEC 61937 framing (spdifenc) + ALSA direct
+ *
+ * Bypasses SDL3 audio entirely. Compressed packets from the demuxer
+ * are wrapped in IEC 61937 bursts by FFmpeg's spdif muxer, then
+ * written directly to the ALSA HDMI device. The TV/AVR decodes.
+ *
+ * Flow: audio_pq → spdifenc → spdif_buf → ALSA hw:X,Y → HDMI → sink
+ *
+ * Called from player_open when audio_mode != PCM and the sink
+ * supports the current codec. Falls back to PCM if ALSA open fails.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define SPDIF_MAX_BUF  32768   /* max IEC 61937 burst (TrueHD HBR=61440) */
+
+/* ── spdifenc AVIO write callback ──
+ * Called by av_write_frame when the spdif muxer has framed data.
+ * Accumulates into ps->spdif_buf for subsequent ALSA writei. */
+
+static int s_spdif_pos = 0;   /* write cursor — reset before each frame */
+
+static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
+    PlayerState *ps = (PlayerState *)opaque;
+    if (s_spdif_pos + len > SPDIF_MAX_BUF) {
+        log_msg("Bitstream: spdif buffer overflow (%d + %d > %d)",
+                s_spdif_pos, len, SPDIF_MAX_BUF);
+        return AVERROR(ENOMEM);
+    }
+    memcpy(ps->spdif_buf + s_spdif_pos, data, len);
+    s_spdif_pos += len;
+    return len;
+}
+
+/* ── Bitstream output thread ──
+ * Pops compressed audio packets from audio_pq, frames them via
+ * spdifenc, and writes IEC 61937 bursts to the ALSA device. */
+
+static int bitstream_thread_func(void *arg) {
+    PlayerState *ps = (PlayerState *)arg;
+    snd_pcm_t *pcm = (snd_pcm_t *)ps->alsa_pcm;
+    AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
+
+    log_msg("Bitstream: output thread started");
+
+    while (!ps->bitstream_quit) {
+        /* Pop a packet from the audio queue (blocking) */
+        AVPacket pkt;
+        int ret = pq_get(&ps->audio_pq, &pkt, 1);  /* blocking */
+        if (ret <= 0 || ps->bitstream_quit) {
+            if (ret > 0) av_packet_unref(&pkt);
+            break;
+        }
+
+        /* Skip packets from wrong stream */
+        if (pkt.stream_index != ps->audio_stream_idx) {
+            av_packet_unref(&pkt);
+            continue;
+        }
+
+        /* Update audio clock from packet PTS */
+        if (pkt.pts != AV_NOPTS_VALUE) {
+            AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
+            double pts = (double)pkt.pts * av_q2d(as->time_base);
+            ps->audio_clock = pts;
+
+            /* Estimate buffered time from ALSA delay */
+            snd_pcm_sframes_t delay = 0;
+            snd_pcm_delay(pcm, &delay);
+            double buffered = (delay > 0)
+                ? (double)delay / 48000.0   /* TODO: use actual rate */
+                : 0.0;
+            if (buffered > 0.1) buffered = 0.1;
+            ps->audio_clock_sync = pts - buffered;
+        }
+
+        /* Frame the packet through spdifenc → spdif_buf */
+        s_spdif_pos = 0;
+        ret = av_write_frame(spdif, &pkt);
+        av_packet_unref(&pkt);
+
+        if (ret < 0) {
+            log_msg("Bitstream: spdifenc write failed: %s", av_err2str(ret));
+            continue;
+        }
+
+        if (s_spdif_pos <= 0) continue;
+
+        /* Write IEC 61937 burst to ALSA — S16LE stereo, 4 bytes/frame */
+        int frames = s_spdif_pos / 4;
+        const uint8_t *ptr = ps->spdif_buf;
+        while (frames > 0) {
+            snd_pcm_sframes_t written = snd_pcm_writei(pcm, ptr, frames);
+            if (written < 0) {
+                if (written == -EPIPE) {
+                    /* Underrun — recover and retry */
+                    snd_pcm_prepare(pcm);
+                    log_msg("Bitstream: ALSA underrun — recovered");
+                    continue;
+                }
+                log_msg("Bitstream: ALSA write error: %s",
+                        snd_strerror((int)written));
+                break;
+            }
+            frames -= (int)written;
+            ptr += written * 4;
+        }
+    }
+
+    log_msg("Bitstream: output thread exiting");
+    return 0;
+}
+
+/* ── Check if the current audio codec is supported for passthrough ── */
+static int bitstream_codec_supported(PlayerState *ps) {
+    if (!ps->audio_codec_ctx) return 0;
+    BitstreamCaps *caps = &ps->bitstream_caps;
+
+    switch (ps->audio_codec_ctx->codec_id) {
+        case AV_CODEC_ID_AC3:     return caps->support_ac3;
+        case AV_CODEC_ID_EAC3:    return caps->support_eac3;
+        case AV_CODEC_ID_TRUEHD:  return caps->support_truehd;
+        case AV_CODEC_ID_DTS:     return caps->support_dts || caps->support_dtshd;
+        default: return 0;
+    }
+}
+
+/* ── Determine IEC 61937 sample rate for codec ── */
+static int bitstream_rate_for_codec(enum AVCodecID id) {
+    switch (id) {
+        case AV_CODEC_ID_AC3:    return 48000;
+        case AV_CODEC_ID_EAC3:   return 192000;  /* 4× for IEC 61937 */
+        case AV_CODEC_ID_DTS:    return 48000;
+        case AV_CODEC_ID_TRUEHD: return 192000;  /* HBR */
+        default: return 48000;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * bitstream_start — Open ALSA + spdifenc, launch output thread
+ *
+ * Returns 1 on success, 0 on failure (caller should fall back to PCM).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+int bitstream_start(PlayerState *ps) {
+    if (!ps->audio_codec_ctx || !ps->bitstream_caps.alsa_device[0]) {
+        log_msg("Bitstream: no codec or no ALSA device — cannot start");
+        return 0;
+    }
+
+    if (!bitstream_codec_supported(ps)) {
+        log_msg("Bitstream: codec %s not supported by sink — falling back to PCM",
+                avcodec_get_name(ps->audio_codec_ctx->codec_id));
+        return 0;
+    }
+
+    enum AVCodecID codec_id = ps->audio_codec_ctx->codec_id;
+    int rate = bitstream_rate_for_codec(codec_id);
+    int channels = 2;  /* IEC 61937 is always stereo (except TrueHD HBR=8ch) */
+    if (codec_id == AV_CODEC_ID_TRUEHD) channels = 8;
+
+    log_msg("Bitstream: starting %s passthrough at %d Hz %dch on %s",
+            avcodec_get_name(codec_id), rate, channels,
+            ps->bitstream_caps.alsa_device);
+
+    /* ── Allocate IEC 61937 output buffer ── */
+    ps->spdif_buf = (uint8_t *)av_malloc(SPDIF_MAX_BUF);
+    if (!ps->spdif_buf) {
+        log_msg("Bitstream: failed to allocate spdif buffer");
+        return 0;
+    }
+    ps->spdif_buf_size = SPDIF_MAX_BUF;
+
+    /* ── Set up spdifenc muxer with memory AVIO ── */
+    const AVOutputFormat *ofmt = av_guess_format("spdif", NULL, NULL);
+    if (!ofmt) {
+        log_msg("Bitstream: spdif muxer not found in FFmpeg");
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
+
+    AVFormatContext *spdif = avformat_alloc_context();
+    if (!spdif) {
+        log_msg("Bitstream: failed to allocate spdifenc context");
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
+    spdif->oformat = ofmt;
+
+    /* Custom AVIO — writes framed data to ps->spdif_buf */
+    uint8_t *avio_buf = (uint8_t *)av_malloc(SPDIF_MAX_BUF);
+    if (!avio_buf) {
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
+    AVIOContext *avio = avio_alloc_context(
+        avio_buf, SPDIF_MAX_BUF, 1 /* writable */, ps,
+        NULL /* no read */, spdif_write_cb, NULL /* no seek */);
+    if (!avio) {
+        av_free(avio_buf);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
+    spdif->pb = avio;
+
+    /* Add one stream matching the audio codec */
+    AVStream *st = avformat_new_stream(spdif, NULL);
+    if (!st) {
+        log_msg("Bitstream: failed to create spdifenc stream");
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
+    st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    st->codecpar->codec_id   = codec_id;
+    st->codecpar->sample_rate = ps->audio_codec_ctx->sample_rate;
+    st->codecpar->ch_layout   = ps->audio_codec_ctx->ch_layout;
+
+    int ret = avformat_write_header(spdif, NULL);
+    if (ret < 0) {
+        log_msg("Bitstream: spdifenc write_header failed: %s", av_err2str(ret));
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
+
+    ps->spdif_ctx  = spdif;
+    ps->spdif_avio = avio;
+
+    /* ── Open ALSA device ── */
+    snd_pcm_t *pcm = NULL;
+    ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
+                        SND_PCM_STREAM_PLAYBACK, 0);
+    if (ret < 0) {
+        log_msg("Bitstream: ALSA open '%s' failed: %s (device may be held by PipeWire)",
+                ps->bitstream_caps.alsa_device, snd_strerror(ret));
+        av_write_trailer(spdif);
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
+        return 0;
+    }
+
+    /* Set ALSA hardware parameters */
+    snd_pcm_hw_params_t *hw;
+    snd_pcm_hw_params_alloca(&hw);
+    snd_pcm_hw_params_any(pcm, hw);
+    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(pcm, hw, channels);
+
+    unsigned int actual_rate = rate;
+    snd_pcm_hw_params_set_rate_near(pcm, hw, &actual_rate, NULL);
+    if ((int)actual_rate != rate) {
+        log_msg("Bitstream: ALSA rate %d requested, got %d", rate, actual_rate);
+    }
+
+    /* Buffer: 200ms, period: 50ms — generous for passthrough */
+    snd_pcm_uframes_t buffer_size = actual_rate / 5;   /* 200ms */
+    snd_pcm_uframes_t period_size = actual_rate / 20;   /* 50ms */
+    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer_size);
+    snd_pcm_hw_params_set_period_size_near(pcm, hw, &period_size, NULL);
+
+    ret = snd_pcm_hw_params(pcm, hw);
+    if (ret < 0) {
+        log_msg("Bitstream: ALSA hw_params failed: %s", snd_strerror(ret));
+        snd_pcm_close(pcm);
+        av_write_trailer(spdif);
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
+        return 0;
+    }
+
+    snd_pcm_prepare(pcm);
+    ps->alsa_pcm = pcm;
+
+    log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
+            ps->bitstream_caps.alsa_device, actual_rate, channels,
+            buffer_size, period_size);
+
+    /* ── Launch output thread ── */
+    ps->bitstream_quit = 0;
+    ps->bitstream_active = 1;
+    ps->bitstream_thread = SDL_CreateThread(
+        bitstream_thread_func, "bitstream", ps);
+
+    if (!ps->bitstream_thread) {
+        log_msg("Bitstream: failed to create thread: %s", SDL_GetError());
+        snd_pcm_close(pcm);
+        ps->alsa_pcm = NULL;
+        ps->bitstream_active = 0;
+        av_write_trailer(spdif);
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
+        return 0;
+    }
+
+    log_msg("Bitstream: passthrough active — %s → %s",
+            avcodec_get_name(codec_id), ps->bitstream_caps.alsa_device);
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * bitstream_stop — Shut down ALSA + spdifenc, join output thread
+ * ═══════════════════════════════════════════════════════════════════ */
+
+void bitstream_stop(PlayerState *ps) {
+    if (!ps->bitstream_active) return;
+
+    log_msg("Bitstream: stopping passthrough");
+
+    /* Signal thread to exit and wake it from pq_get block */
+    ps->bitstream_quit = 1;
+    ps->audio_pq.abort_request = 1;
+    SDL_SignalCondition(ps->audio_pq.cond);
+
+    if (ps->bitstream_thread) {
+        SDL_WaitThread(ps->bitstream_thread, NULL);
+        ps->bitstream_thread = NULL;
+    }
+
+    /* Close ALSA */
+    if (ps->alsa_pcm) {
+        snd_pcm_drop((snd_pcm_t *)ps->alsa_pcm);
+        snd_pcm_close((snd_pcm_t *)ps->alsa_pcm);
+        ps->alsa_pcm = NULL;
+    }
+
+    /* Close spdifenc */
+    if (ps->spdif_ctx) {
+        AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
+        av_write_trailer(spdif);
+        avformat_free_context(spdif);
+        ps->spdif_ctx = NULL;
+    }
+    if (ps->spdif_avio) {
+        AVIOContext *avio = (AVIOContext *)ps->spdif_avio;
+        av_free(avio->buffer);
+        avio_context_free(&avio);
+        ps->spdif_avio = NULL;
+    }
+
+    if (ps->spdif_buf) {
+        av_free(ps->spdif_buf);
+        ps->spdif_buf = NULL;
+    }
+    ps->spdif_buf_size = 0;
+
+    ps->bitstream_active = 0;
+    ps->bitstream_quit = 0;
+
+    /* Reset abort so audio_pq works normally for PCM fallback */
+    ps->audio_pq.abort_request = 0;
+
+    log_msg("Bitstream: passthrough stopped");
+}
