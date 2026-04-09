@@ -630,8 +630,8 @@ static int bitstream_thread_func(void *arg) {
 
         /* Frame the packet through spdifenc → spdif_buf */
         s_spdif_pos = 0;
-        ret = av_write_frame(spdif, &pkt);
         pkt.stream_index = 0;  /* spdifenc has one stream at index 0 */
+        ret = av_write_frame(spdif, &pkt);
         av_packet_unref(&pkt);
 
         if (ret < 0) {
