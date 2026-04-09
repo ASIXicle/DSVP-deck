@@ -312,10 +312,23 @@ void audio_cycle(PlayerState *ps) {
         return;
     }
 
+    /* Stop bitstream before switching tracks — the bitstream thread
+     * holds audio_pq and the spdifenc is configured for the current codec.
+     * Switching tracks without stopping causes a race on pq_flush and
+     * feeds wrong-codec packets to spdifenc. User can press P to
+     * re-enable passthrough for the new codec. */
+    int was_bitstream = ps->bitstream_active;
+    if (was_bitstream) {
+        bitstream_stop(ps);
+        audio_open(ps);  /* need SDL audio for PCM fallback */
+        if (!ps->paused && ps->audio_stream)
+            SDL_ResumeAudioStreamDevice(ps->audio_stream);
+    }
+
     int new_sel = (ps->aud_selection + 1) % ps->aud_count;
 
     /* Skip TrueHD tracks when not in bitstream passthrough */
-    int skip_truehd = (ps->audio_mode == AUDIO_MODE_PCM || !ps->bitstream_active);
+    int skip_truehd = (ps->audio_mode == AUDIO_MODE_PCM || !was_bitstream);
     int checked = 0;
     while (skip_truehd && checked < ps->aud_count) {
         int idx = ps->aud_stream_indices[new_sel];
@@ -549,7 +562,7 @@ void bitstream_probe(PlayerState *ps) {
  * supports the current codec. Falls back to PCM if ALSA open fails.
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define SPDIF_MAX_BUF  32768   /* max IEC 61937 burst (TrueHD HBR=61440) */
+#define SPDIF_MAX_BUF  65536   /* max IEC 61937 burst (TrueHD HBR=61440) */
 
 /* ── PipeWire device contention ──
  * PipeWire holds ALSA HDMI devices exclusively. For bitstream passthrough
@@ -688,6 +701,7 @@ static int bitstream_thread_func(void *arg) {
     PlayerState *ps = (PlayerState *)arg;
     snd_pcm_t *pcm = (snd_pcm_t *)ps->alsa_pcm;
     AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
+    int spdif_err_count = 0;
 
     log_msg("Bitstream: output thread started");
 
@@ -729,7 +743,10 @@ static int bitstream_thread_func(void *arg) {
         av_packet_unref(&pkt);
 
         if (ret < 0) {
-            log_msg("Bitstream: spdifenc write failed: %s", av_err2str(ret));
+            if (++spdif_err_count <= 3)
+                log_msg("Bitstream: spdifenc write failed: %s", av_err2str(ret));
+            else if (spdif_err_count == 4)
+                log_msg("Bitstream: suppressing further spdifenc errors");
             continue;
         }
 
