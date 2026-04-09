@@ -670,13 +670,26 @@ int main(int argc, char *argv[]) {
                     if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_caps.probed)
                         bitstream_probe(&ps);
 
-                    /* If returning to PCM, deactivate passthrough */
-                    if (ps.audio_mode == AUDIO_MODE_PCM)
-                        ps.bitstream_active = 0;
-
                     static const char *mode_names[] = {
                         "PCM (decode)", "AUTO", "PASSTHROUGH"
                     };
+
+                    /* ── Live audio mode switch during playback ──
+                     * Wire the mode change to the audio subsystem so it
+                     * takes effect immediately, not just on next file open. */
+                    if (ps.playing && ps.audio_codec_ctx) {
+                        if (ps.audio_mode == AUDIO_MODE_PCM && ps.bitstream_active) {
+                            bitstream_stop(&ps);
+                            audio_open(&ps);
+                        } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
+                            audio_close(&ps);
+                            if (!bitstream_start(&ps))
+                                audio_open(&ps);  /* fallback to PCM */
+                        }
+                    } else if (ps.audio_mode == AUDIO_MODE_PCM) {
+                        ps.bitstream_active = 0;
+                    }
+
                     snprintf(ps.aud_osd, sizeof(ps.aud_osd),
                              "Audio Mode: %s", mode_names[ps.audio_mode]);
                     ps.aud_osd_until = get_time_sec() + 2.0;
