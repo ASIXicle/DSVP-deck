@@ -209,6 +209,13 @@ typedef struct PlayerState {
     AudioMode           audio_mode;       /* PCM / Auto / Passthrough   */
     BitstreamCaps       bitstream_caps;   /* HDMI sink capabilities     */
     int                 bitstream_active; /* 1 = currently passing through */
+    void               *alsa_pcm;        /* snd_pcm_t* — ALSA passthrough handle  */
+    void               *spdif_ctx;       /* AVFormatContext* — spdifenc muxer      */
+    void               *spdif_avio;      /* AVIOContext* — spdifenc memory buffer  */
+    uint8_t            *spdif_buf;       /* IEC 61937 framed output buffer         */
+    int                 spdif_buf_size;  /* allocated size of spdif_buf            */
+    SDL_Thread         *bitstream_thread;
+    int                 bitstream_quit;  /* signal bitstream thread to exit        */
 
     /* ── Packet queues ── */
     PacketQueue         video_pq;
@@ -474,6 +481,8 @@ int   audio_decode_frame(PlayerState *ps);
 void  audio_find_streams(PlayerState *ps);
 void  audio_cycle(PlayerState *ps);
 void  bitstream_probe(PlayerState *ps);
+int   bitstream_start(PlayerState *ps);  /* open ALSA + spdifenc, start thread */
+void  bitstream_stop(PlayerState *ps);   /* close ALSA + spdifenc, join thread */
 
 /* ── Subtitle API (subtitle.c) ───────────────────────────────────── */
 

@@ -15,6 +15,7 @@
  */
 
 #include "dsvp.h"
+#include <alsa/asoundlib.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Decode

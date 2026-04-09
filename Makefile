@@ -22,7 +22,8 @@ SC_LDFLAGS = -L$(SC_ROOT)/lib -lSDL3_shadercross -Wl,-rpath,'$$ORIGIN/../shaderc
 
 # VAAPI zero-copy interop: libva (surface export), libva-drm (DRM_PRIME),
 # libvulkan (DMA-BUF import + GPU copy)
-BASE_LDFLAGS += -lva -lva-drm -lvulkan
+# ALSA: direct PCM access for bitstream audio passthrough (bypasses PipeWire)
+BASE_LDFLAGS += -lva -lva-drm -lvulkan -lasound
 
 CFLAGS  = $(BASE_CFLAGS) $(SC_CFLAGS)
 LDFLAGS = $(BASE_LDFLAGS) $(SC_LDFLAGS)
