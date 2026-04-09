@@ -59,7 +59,7 @@ int audio_decode_frame(PlayerState *ps) {
             if (!ps->swr_ctx) {
                 AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
                 ret = swr_alloc_set_opts2(&ps->swr_ctx,
-                    &out_layout, AV_SAMPLE_FMT_S16, ps->audio_spec.freq,
+                    &out_layout, AV_SAMPLE_FMT_FLT, ps->audio_spec.freq,
                     &ps->audio_frame->ch_layout, ps->audio_frame->format,
                     ps->audio_frame->sample_rate, 0, NULL);
                 if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
@@ -69,7 +69,7 @@ int audio_decode_frame(PlayerState *ps) {
             }
 
             int out_samples = swr_get_out_samples(ps->swr_ctx, ps->audio_frame->nb_samples);
-            int out_size = out_samples * 2 * 2;
+            int out_size = out_samples * 2 * 4;  /* stereo F32 = 8 bytes/frame */
 
             if (!ps->audio_buf || out_size > AUDIO_BUF_SIZE) {
                 av_free(ps->audio_buf);
@@ -88,7 +88,7 @@ int audio_decode_frame(PlayerState *ps) {
                 return -1;
             }
 
-            data_size = converted * 2 * 2;
+            data_size = converted * 2 * 4;  /* stereo F32 = 8 bytes/frame */
 
             int64_t frame_pts = ps->audio_frame->best_effort_timestamp;
             if (frame_pts == AV_NOPTS_VALUE)
@@ -168,7 +168,7 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
      * CRITICAL: Cap the correction at 100ms to prevent FLAC/large-buffer
      * runaway where SDL reports huge queued amounts during startup. */
     if (ps->audio_spec.freq > 0 && !ps->seek_recovering) {
-        int bytes_per_sample = 2 * 2;  /* S16 stereo = 4 bytes/frame */
+        int bytes_per_sample = 2 * 4;  /* F32 stereo = 8 bytes/frame */
 
         /* Our internal buffer: decoded but not yet pushed to SDL */
         int internal_pending = ps->audio_buf_size - ps->audio_buf_index;
@@ -201,7 +201,7 @@ int audio_open(PlayerState *ps) {
 
     SDL_AudioSpec spec;
     SDL_zero(spec);
-    spec.format   = SDL_AUDIO_S16;
+    spec.format   = SDL_AUDIO_F32;
     spec.channels = 2;
     spec.freq     = ps->audio_codec_ctx->sample_rate;
 
@@ -226,7 +226,8 @@ int audio_open(PlayerState *ps) {
      * This prevents audio from running ahead during VAAPI DPB warmup
      * or any other initial decode latency. */
 
-    log_msg("Audio opened: %d Hz, %d ch (SDL3 stream)",
+    log_msg("Audio opened: %s %d Hz, %d ch (SDL3 stream)",
+        (spec.format == SDL_AUDIO_F32) ? "F32" : "S16",
         spec.freq, spec.channels);
     return 0;
 }

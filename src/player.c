@@ -4800,10 +4800,6 @@ void player_build_debug_info(PlayerState *ps) {
 
     off += snprintf(buf + off, sz - off, "=== DEBUG ===\n");
     off += snprintf(buf + off, sz - off, "Renderer: SDL_GPU\n");
-    off += snprintf(buf + off, sz - off, "Video Clock: %.3f s\n", ps->video_clock);
-    off += snprintf(buf + off, sz - off, "Audio Clock: %.3f s\n", ps->audio_clock_sync);
-    off += snprintf(buf + off, sz - off, "A/V Diff:    %.3f ms\n",
-        (ps->video_clock - ps->audio_clock_sync) * 1000.0);
     off += snprintf(buf + off, sz - off, "A/V Bias:    %.1f ms\n",
         ps->av_bias * 1000.0);
     off += snprintf(buf + off, sz - off, "Video Queue: %d pkts (%d KB)\n",
@@ -4811,8 +4807,6 @@ void player_build_debug_info(PlayerState *ps) {
     off += snprintf(buf + off, sz - off, "Audio Queue: %d pkts (%d KB)\n",
         ps->audio_pq.nb_packets, ps->audio_pq.size / 1024);
     off += snprintf(buf + off, sz - off, "Volume:      %.0f%%\n", ps->volume * 100.0);
-    off += snprintf(buf + off, sz - off, "Paused:      %s\n", ps->paused ? "yes" : "no");
-    off += snprintf(buf + off, sz - off, "EOF:         %s\n", ps->eof ? "yes" : "no");
 
     if (ps->video_codec_ctx) {
         if (ps->vaapi_active) {
@@ -4883,6 +4877,74 @@ void player_build_debug_info(PlayerState *ps) {
         ? (double)ps->fmt_ctx->duration / AV_TIME_BASE : 0.0;
     double pos = ps->video_clock;
     off += snprintf(buf + off, sz - off, "Position:    %.1f / %.1f s\n", pos, duration);
+
+    /* Audio status */
+    off += snprintf(buf + off, sz - off, "\n--- Audio ---\n");
+    if (ps->audio_codec_ctx) {
+        const char *acodec = avcodec_get_name(ps->audio_codec_ctx->codec_id);
+        const char *afmt   = av_get_sample_fmt_name(ps->audio_codec_ctx->sample_fmt);
+        int src_rate = ps->audio_codec_ctx->sample_rate;
+        int src_ch   = ps->audio_codec_ctx->ch_layout.nb_channels;
+
+        char layout_desc[64] = {0};
+        av_channel_layout_describe(&ps->audio_codec_ctx->ch_layout,
+                                   layout_desc, sizeof(layout_desc));
+
+        off += snprintf(buf + off, sz - off, "Source:  %s %s %dHz %dch (%s)\n",
+            acodec, afmt ? afmt : "?", src_rate, src_ch, layout_desc);
+
+        /* Determine output format name from SDL spec */
+        const char *out_fmt = (ps->audio_spec.format == SDL_AUDIO_F32) ? "F32" :
+                              (ps->audio_spec.format == SDL_AUDIO_S16) ? "S16" : "???";
+        int out_rate = ps->audio_spec.freq;
+        int out_ch   = ps->audio_spec.channels;
+        off += snprintf(buf + off, sz - off, "Output:  %s %dHz %dch (stereo)\n",
+            out_fmt, out_rate, out_ch);
+
+        int resampling = (src_rate != out_rate);
+        int downmixing = (src_ch != out_ch);
+
+        if (resampling && downmixing)
+            off += snprintf(buf + off, sz - off,
+                "Pipeline: resample %d->%dHz + downmix %dch->%dch + %s\n",
+                src_rate, out_rate, src_ch, out_ch, out_fmt);
+        else if (resampling)
+            off += snprintf(buf + off, sz - off,
+                "Pipeline: resample %d->%dHz + %s\n", src_rate, out_rate, out_fmt);
+        else if (downmixing)
+            off += snprintf(buf + off, sz - off,
+                "Pipeline: downmix %dch->%dch + %s\n", src_ch, out_ch, out_fmt);
+        else if (afmt && strcmp(afmt, "flt") == 0 &&
+                 ps->audio_spec.format == SDL_AUDIO_F32)
+            off += snprintf(buf + off, sz - off, "Pipeline: direct (no conversion)\n");
+        else
+            off += snprintf(buf + off, sz - off,
+                "Pipeline: format convert %s->%s\n", afmt ? afmt : "?", out_fmt);
+    } else {
+        off += snprintf(buf + off, sz - off, "No audio\n");
+    }
+
+    /* Bitstream status */
+    off += snprintf(buf + off, sz - off, "\n--- Bitstream ---\n");
+    {
+        static const char *mode_names[] = { "PCM", "AUTO", "PASSTHROUGH" };
+        off += snprintf(buf + off, sz - off, "Mode:    %s\n",
+            mode_names[ps->audio_mode]);
+        off += snprintf(buf + off, sz - off, "Active:  %s\n",
+            ps->bitstream_active ? "yes" : "no");
+        if (ps->bitstream_caps.probed) {
+            off += snprintf(buf + off, sz - off, "Sink:    %s\n",
+                ps->bitstream_caps.alsa_device[0] ? ps->bitstream_caps.alsa_device : "none");
+            off += snprintf(buf + off, sz - off, "Codecs:  %s%s%s%s%s\n",
+                ps->bitstream_caps.support_ac3    ? "AC3 " : "",
+                ps->bitstream_caps.support_eac3   ? "EAC3 " : "",
+                ps->bitstream_caps.support_truehd  ? "TrueHD " : "",
+                ps->bitstream_caps.support_dts     ? "DTS " : "",
+                ps->bitstream_caps.support_dtshd   ? "DTS-HD " : "");
+        } else {
+            off += snprintf(buf + off, sz - off, "Sink:    not probed\n");
+        }
+    }
 
     /* Playback diagnostics */
     off += snprintf(buf + off, sz - off, "\n--- Diagnostics ---\n");
