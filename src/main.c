@@ -676,23 +676,20 @@ int main(int argc, char *argv[]) {
 
                     /* ── Live audio mode switch during playback ──
                      * Wire the mode change to the audio subsystem so it
-                     * takes effect immediately, not just on next file open. */
+                     * takes effect immediately, not just on next file open.
+                     * After restart, seek to current position to force the
+                     * demux to reposition -- otherwise its 8s read-ahead
+                     * fills the audio queue with future packets. */
                     if (ps.playing && ps.audio_codec_ctx) {
                         if (ps.audio_mode == AUDIO_MODE_PCM && ps.bitstream_active) {
                             bitstream_stop(&ps);
-                            pq_flush(&ps.audio_pq);
-                            avcodec_flush_buffers(ps.audio_codec_ctx);
                             audio_open(&ps);
                         } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
                             audio_close(&ps);
-                            pq_flush(&ps.audio_pq);
-                            avcodec_flush_buffers(ps.audio_codec_ctx);
                             if (!bitstream_start(&ps))
                                 audio_open(&ps);  /* fallback to PCM */
                         }
-                        /* Let seek-recovery re-sync clocks on next
-                         * displayed frame -- same mechanism as post-seek. */
-                        ps.seek_recovering = 1;
+                        player_seek(&ps, 0.0);
                     } else if (ps.audio_mode == AUDIO_MODE_PCM) {
                         ps.bitstream_active = 0;
                     }
