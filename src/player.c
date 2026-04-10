@@ -3041,6 +3041,15 @@ void player_close(PlayerState *ps) {
     bitstream_stop(ps);  /* no-op if not active */
     audio_close(ps);
 
+    /* Ensure PipeWire is healthy at exit. Rapid bitstream stop/start cycles
+     * can leave PipeWire in a broken state (killed mid-startup, socket not
+     * reclaimed). Without this, Game Mode loses all audio until reboot.
+     * Unconditional: cheap if PipeWire is already running, essential if not. */
+    if (ps->bitstream_caps.probed) {
+        system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
+        SDL_Delay(1500);
+    }
+
     /* Close subtitles */
     sub_close_codec(ps);
 

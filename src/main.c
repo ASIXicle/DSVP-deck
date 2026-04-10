@@ -681,24 +681,35 @@ int main(int argc, char *argv[]) {
                      * demux to reposition -- otherwise its 8s read-ahead
                      * fills the audio queue with future packets. */
                     if (ps.playing && ps.audio_codec_ctx) {
+                        int did_seek = 0;
                         if (ps.audio_mode == AUDIO_MODE_PCM && ps.bitstream_active) {
                             bitstream_stop(&ps);
-                            audio_open(&ps);
                             /* If current track is TrueHD, we CANNOT PCM-decode it
                              * on the Deck — 1200 pkt/sec MLP decode starves video
                              * within 200ms. Switch to the EAC3 compatibility track.
-                             * audio_cycle's TrueHD skip logic handles this. */
+                             * audio_cycle does its own codec switch + seek. */
                             if (ps.audio_codec_ctx &&
                                 ps.audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD) {
                                 log_msg("Audio: TrueHD on PCM return — auto-switching to decodable track");
+                                audio_open(&ps);
                                 audio_cycle(&ps);
+                                did_seek = 1;  /* audio_cycle already seeked */
+                            } else {
+                                audio_open(&ps);
+                                /* Resume SDL audio immediately — seek_recovering
+                                 * gate is for initial file open, not mode switch.
+                                 * Without this, audio stays paused until a frame
+                                 * display triggers seek_recovery clear. */
+                                if (ps.audio_stream && !ps.paused)
+                                    SDL_ResumeAudioStreamDevice(ps.audio_stream);
                             }
                         } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
                             audio_close(&ps);
                             if (!bitstream_start(&ps))
                                 audio_open(&ps);  /* fallback to PCM */
                         }
-                        player_seek(&ps, 0.0);
+                        if (!did_seek)
+                            player_seek(&ps, 0.0);
                     } else if (ps.audio_mode == AUDIO_MODE_PCM) {
                         ps.bitstream_active = 0;
                     }
