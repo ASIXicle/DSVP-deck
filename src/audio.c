@@ -731,9 +731,9 @@ static int bitstream_thread_func(void *arg) {
             snd_pcm_sframes_t delay = 0;
             snd_pcm_delay(pcm, &delay);
             double buffered = (delay > 0)
-                ? (double)delay / 48000.0   /* TODO: use actual rate */
+                ? (double)delay / (double)ps->bitstream_alsa_rate
                 : 0.0;
-            if (buffered > 0.1) buffered = 0.1;
+            if (buffered > 1.5) buffered = 1.5;  /* sanity clamp */
             ps->audio_clock_sync = pts - buffered;
         }
 
@@ -968,6 +968,7 @@ int bitstream_start(PlayerState *ps) {
     snd_pcm_prepare(pcm);
     ps->alsa_pcm = pcm;
     ps->bitstream_frame_bytes = channels * 2;  /* S16LE: 4 for stereo, 16 for 8ch */
+    ps->bitstream_alsa_rate = actual_rate;     /* for snd_pcm_delay → seconds conversion */
 
     log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
             ps->bitstream_caps.alsa_device, actual_rate, channels,

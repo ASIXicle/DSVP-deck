@@ -217,6 +217,7 @@ typedef struct PlayerState {
     SDL_Thread         *bitstream_thread;
     int                 bitstream_quit;  /* signal bitstream thread to exit        */
     int                 bitstream_frame_bytes; /* ALSA frame size: channels * 2 (S16) */
+    int                 bitstream_alsa_rate;   /* actual ALSA sample rate (for delay calc) */
     int                 pipewire_stopped; /* 1 = we stopped PipeWire for ALSA     */
 
     /* ── Packet queues ── */
