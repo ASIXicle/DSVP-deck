@@ -580,8 +580,7 @@ void bitstream_probe(PlayerState *ps) {
                 /* Track current card name */
                 char name[128];
                 if (sscanf(pline, " Name: %127s", name) == 1) {
-                    strncpy(cur_name, name, sizeof(cur_name) - 1);
-                    cur_name[sizeof(cur_name) - 1] = '\0';
+                    snprintf(cur_name, sizeof(cur_name), "%s", name);
                     match_card = 0;
                 }
                 /* Check if this card matches our ALSA card number */
@@ -595,10 +594,10 @@ void bitstream_probe(PlayerState *ps) {
                 /* Capture active profile for our card */
                 char prof[128];
                 if (match_card && sscanf(pline, " Active Profile: %127s", prof) == 1) {
-                    strncpy(ps->bitstream_caps.pa_card_name, cur_name,
-                            sizeof(ps->bitstream_caps.pa_card_name) - 1);
-                    strncpy(ps->bitstream_caps.pa_saved_profile, prof,
-                            sizeof(ps->bitstream_caps.pa_saved_profile) - 1);
+                    snprintf(ps->bitstream_caps.pa_card_name,
+                         sizeof(ps->bitstream_caps.pa_card_name), "%s", cur_name);
+                    snprintf(ps->bitstream_caps.pa_saved_profile,
+                         sizeof(ps->bitstream_caps.pa_saved_profile), "%s", prof);
                     log_msg("Bitstream: PA card '%s' active profile '%s'",
                             ps->bitstream_caps.pa_card_name,
                             ps->bitstream_caps.pa_saved_profile);
