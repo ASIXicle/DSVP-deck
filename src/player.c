@@ -2409,7 +2409,7 @@ int player_open(PlayerState *ps, const char *filename) {
     if (ps->audio_stream_idx >= 0) {
         AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
         if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD &&
-            (ps->audio_mode == AUDIO_MODE_PCM || !ps->bitstream_active)) {
+            (ps->audio_mode == AUDIO_MODE_PCM || !ps->bitstream_caps.support_truehd)) {
             log_msg("Audio: default stream is TrueHD — skipping (PCM mode or passthrough inactive)");
             int fallback = -1;
             for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
@@ -3233,9 +3233,14 @@ int demux_thread_func(void *arg) {
             log_msg("Demux: seek complete");
         }
 
-        /* ── Throttle if queues are full ── */
-        if (ps->video_pq.nb_packets > PACKET_QUEUE_MAX ||
-            ps->audio_pq.nb_packets > PACKET_QUEUE_MAX) {
+        /* ── Throttle if queues are full ──
+         * In bitstream mode, only throttle on video queue — TrueHD generates
+         * ~1200 audio packets/sec vs ~24 video. Blocking on audio fullness
+         * starves the video pipeline within ~200ms. The bitstream thread
+         * drains audio at wire rate; letting audio queue grow is safe. */
+        int video_full = ps->video_pq.nb_packets > PACKET_QUEUE_MAX;
+        int audio_full = ps->audio_pq.nb_packets > PACKET_QUEUE_MAX;
+        if (video_full || (audio_full && !ps->bitstream_active)) {
             SDL_Delay(10);
             continue;
         }

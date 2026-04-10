@@ -205,12 +205,23 @@ int audio_open(PlayerState *ps) {
     spec.channels = 2;
     spec.freq     = ps->audio_codec_ctx->sample_rate;
 
-    ps->audio_stream = SDL_OpenAudioDeviceStream(
-        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-        &spec, audio_callback, ps);
+    /* Retry with backoff — PipeWire may still be reclaiming ALSA after restart.
+     * 5 attempts × 400ms = 2s max wait, which covers PipeWire's typical
+     * startup time on SteamOS (500-1500ms observed). */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ps->audio_stream = SDL_OpenAudioDeviceStream(
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+            &spec, audio_callback, ps);
+        if (ps->audio_stream) break;
+        if (attempt < 4) {
+            log_msg("Audio: SDL open attempt %d/5 failed: %s — retrying",
+                    attempt + 1, SDL_GetError());
+            SDL_Delay(400);
+        }
+    }
 
     if (!ps->audio_stream) {
-        log_msg("ERROR: SDL_OpenAudioDeviceStream failed: %s", SDL_GetError());
+        log_msg("ERROR: SDL_OpenAudioDeviceStream failed after retries: %s", SDL_GetError());
         return -1;
     }
 
@@ -598,7 +609,7 @@ static void pipewire_stop(void) {
 static void pipewire_start(void) {
     log_msg("Bitstream: restarting PipeWire");
     system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
-    SDL_Delay(1000);  /* PipeWire needs time to fully start and reclaim ALSA */
+    SDL_Delay(300);  /* minimal settle time; audio_open retry loop handles the rest */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
@@ -695,21 +706,63 @@ static void set_iec958_nonpcm(int card, int dev, int aes3) {
     snd_ctl_close(ctl);
 }
 
-/* ── spdifenc AVIO write callback ──
- * Called by av_write_frame when the spdif muxer has framed data.
- * Accumulates into ps->spdif_buf for subsequent ALSA writei. */
+/* ── Reset IEC958 channel status to PCM mode ──
+ * Clears the non-audio bit so PipeWire reclaims the device cleanly.
+ * Without this, PipeWire may misinterpret the device state on restart. */
 
-static int s_spdif_pos = 0;   /* write cursor — reset before each frame */
+static void set_iec958_pcm(int card, int dev) {
+    char ctl_name[32];
+    snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
+
+    snd_ctl_t *ctl;
+    if (snd_ctl_open(&ctl, ctl_name, 0) < 0) return;
+
+    snd_ctl_elem_id_t *id;
+    snd_ctl_elem_value_t *val;
+    snd_ctl_elem_id_alloca(&id);
+    snd_ctl_elem_value_alloca(&val);
+
+    /* Find mixer index (same logic as set_iec958_nonpcm) */
+    int iec958_idx = -1, idx_count = 0;
+    for (int d = 0; d < 16; d++) {
+        char jack_name[64];
+        snprintf(jack_name, sizeof(jack_name), "HDMI/DP,pcm=%d Jack", d);
+        snd_ctl_elem_id_clear(id);
+        snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_CARD);
+        snd_ctl_elem_id_set_name(id, jack_name);
+        snd_ctl_elem_value_set_id(val, id);
+        if (snd_ctl_elem_read(ctl, val) >= 0) {
+            if (d == dev) { iec958_idx = idx_count; }
+            idx_count++;
+        }
+    }
+    if (iec958_idx < 0) { snd_ctl_close(ctl); return; }
+
+    snd_ctl_elem_id_clear(id);
+    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
+    snd_ctl_elem_id_set_name(id, "IEC958 Playback Default");
+    snd_ctl_elem_id_set_index(id, iec958_idx);
+    snd_ctl_elem_value_set_id(val, id);
+
+    snd_aes_iec958_t iec958;
+    memset(&iec958, 0, sizeof(iec958));
+    iec958.status[0] = 0x04;  /* consumer, audio (non-audio bit CLEAR), no copyright */
+    snd_ctl_elem_value_set_iec958(val, &iec958);
+    snd_ctl_elem_write(ctl, val);
+
+    snd_ctl_close(ctl);
+    log_msg("Bitstream: IEC958 reset to PCM mode (idx=%d)", iec958_idx);
+}
 
 static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
     PlayerState *ps = (PlayerState *)opaque;
-    if (s_spdif_pos + len > SPDIF_MAX_BUF) {
+    if (ps->spdif_write_pos + len > SPDIF_MAX_BUF) {
         log_msg("Bitstream: spdif buffer overflow (%d + %d > %d)",
-                s_spdif_pos, len, SPDIF_MAX_BUF);
+                ps->spdif_write_pos, len, SPDIF_MAX_BUF);
         return AVERROR(ENOMEM);
     }
-    memcpy(ps->spdif_buf + s_spdif_pos, data, len);
-    s_spdif_pos += len;
+    memcpy(ps->spdif_buf + ps->spdif_write_pos, data, len);
+    ps->spdif_write_pos += len;
     return len;
 }
 
@@ -760,7 +813,7 @@ static int bitstream_thread_func(void *arg) {
         }
 
         /* Frame the packet through spdifenc → spdif_buf */
-        s_spdif_pos = 0;
+        ps->spdif_write_pos = 0;
         pkt.stream_index = 0;  /* spdifenc has one stream at index 0 */
         ret = av_write_frame(spdif, &pkt);
         av_packet_unref(&pkt);
@@ -773,11 +826,11 @@ static int bitstream_thread_func(void *arg) {
             continue;
         }
 
-        if (s_spdif_pos <= 0) continue;
+        if (ps->spdif_write_pos <= 0) continue;
 
         /* Write IEC 61937 burst to ALSA */
         int bpf = ps->bitstream_frame_bytes;  /* 4 for stereo, 16 for 8ch TrueHD */
-        int frames = s_spdif_pos / bpf;
+        int frames = ps->spdif_write_pos / bpf;
         const uint8_t *ptr = ps->spdif_buf;
         while (frames > 0) {
             snd_pcm_sframes_t written = snd_pcm_writei(pcm, ptr, frames);
@@ -992,6 +1045,23 @@ int bitstream_start(PlayerState *ps) {
     }
 
     snd_pcm_prepare(pcm);
+
+    /* Set start_threshold to 50% of buffer so ALSA doesn't start playback
+     * until the buffer is half-full. This gives the bitstream thread ~500ms
+     * of headroom before the first underrun can occur — critical for TrueHD
+     * where demux thread interleaving can delay packet delivery. */
+    {
+        snd_pcm_sw_params_t *sw;
+        snd_pcm_sw_params_alloca(&sw);
+        snd_pcm_sw_params_current(pcm, sw);
+        snd_pcm_sw_params_set_start_threshold(pcm, sw, buffer_size / 2);
+        int sw_ret = snd_pcm_sw_params(pcm, sw);
+        if (sw_ret < 0)
+            log_msg("Bitstream: ALSA sw_params failed: %s (non-fatal)", snd_strerror(sw_ret));
+        else
+            log_msg("Bitstream: ALSA start_threshold=%lu (warmup headroom)", buffer_size / 2);
+    }
+
     ps->alsa_pcm = pcm;
     ps->bitstream_frame_bytes = channels * 2;  /* S16LE: 4 for stereo, 16 for 8ch */
     ps->bitstream_alsa_rate = actual_rate;
@@ -1071,7 +1141,8 @@ void bitstream_stop(PlayerState *ps) {
     }
     if (ps->spdif_avio) {
         AVIOContext *avio = (AVIOContext *)ps->spdif_avio;
-        av_free(avio->buffer);
+        /* avio_context_free frees both the context and its buffer in FFmpeg 8.x.
+         * Do NOT call av_free(avio->buffer) separately — that's a double-free. */
         avio_context_free(&avio);
         ps->spdif_avio = NULL;
     }
@@ -1081,6 +1152,7 @@ void bitstream_stop(PlayerState *ps) {
         ps->spdif_buf = NULL;
     }
     ps->spdif_buf_size = 0;
+    ps->spdif_write_pos = 0;
 
     ps->bitstream_active = 0;
     ps->bitstream_quit = 0;
@@ -1089,6 +1161,13 @@ void bitstream_stop(PlayerState *ps) {
 
     /* Reset abort so audio_pq works normally for PCM fallback */
     ps->audio_pq.abort_request = 0;
+
+    /* Reset IEC958 to PCM mode before PipeWire reclaims the device */
+    if (ps->bitstream_caps.alsa_device[0]) {
+        int card_num = 0, dev_num = 0;
+        sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
+        set_iec958_pcm(card_num, dev_num);
+    }
 
     /* Restart PipeWire if we stopped it for ALSA access */
     if (ps->pipewire_stopped) {

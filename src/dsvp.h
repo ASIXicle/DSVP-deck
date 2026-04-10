@@ -214,6 +214,7 @@ typedef struct PlayerState {
     void               *spdif_avio;      /* AVIOContext* — spdifenc memory buffer  */
     uint8_t            *spdif_buf;       /* IEC 61937 framed output buffer         */
     int                 spdif_buf_size;  /* allocated size of spdif_buf            */
+    int                 spdif_write_pos; /* write cursor into spdif_buf (per-frame) */
     SDL_Thread         *bitstream_thread;
     int                 bitstream_quit;  /* signal bitstream thread to exit        */
     int                 bitstream_frame_bytes; /* ALSA frame size: channels * 2 (S16) */
