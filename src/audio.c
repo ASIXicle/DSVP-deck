@@ -409,6 +409,25 @@ void audio_cycle(PlayerState *ps) {
     ps->seek_flags   = AVSEEK_FLAG_BACKWARD;
     ps->seek_request = 1;
 
+    /* Auto-restart bitstream for TrueHD when mode permits.
+     * TrueHD PCM decode (1200 pkt/sec MLP) floods audio_pq and starves
+     * video within 200ms. Don't leave it in PCM purgatory -- go straight
+     * to bitstream if the sink supports it. */
+    if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD
+        && ps->audio_mode != AUDIO_MODE_PCM
+        && ps->bitstream_caps.support_truehd) {
+        audio_close(ps);
+        if (bitstream_start(ps)) {
+            snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: %s (passthrough)",
+                ps->aud_stream_names[new_sel]);
+            ps->aud_osd_until = get_time_sec() + 2.0;
+            return;
+        }
+        /* Bitstream failed -- fall back to PCM */
+        audio_open(ps);
+        log_msg("Audio: TrueHD bitstream failed, falling back to PCM decode");
+    }
+
     if (ps->audio_stream && !ps->paused)
         SDL_ResumeAudioStreamDevice(ps->audio_stream);
 
@@ -579,7 +598,7 @@ static void pipewire_stop(void) {
 static void pipewire_start(void) {
     log_msg("Bitstream: restarting PipeWire");
     system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
-    SDL_Delay(500);  /* give PipeWire time to reclaim audio devices */
+    SDL_Delay(1000);  /* PipeWire needs time to fully start and reclaim ALSA */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
@@ -1065,6 +1084,8 @@ void bitstream_stop(PlayerState *ps) {
 
     ps->bitstream_active = 0;
     ps->bitstream_quit = 0;
+    ps->bitstream_frames_written = 0;
+    ps->bitstream_wall_start = 0;
 
     /* Reset abort so audio_pq works normally for PCM fallback */
     ps->audio_pq.abort_request = 0;
