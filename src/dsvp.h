@@ -101,6 +101,7 @@ typedef struct BitstreamCaps {
     char alsa_device[32];  /* ALSA hw device for passthrough (e.g. "hw:0,8") */
     char pa_card_name[128];     /* PulseAudio/PipeWire card name             */
     char pa_saved_profile[128]; /* profile to restore after bitstream        */
+    char pa_default_sink[256];  /* default sink before hdmi_release          */
 } BitstreamCaps;
 
 /* ── Packet Queue ───────────────────────────────────────────────────
