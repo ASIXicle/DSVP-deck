@@ -16,7 +16,6 @@
 
 #include "dsvp.h"
 #include <alsa/asoundlib.h>
-#include <sys/wait.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Decode
@@ -655,21 +654,6 @@ static void hdmi_release(PlayerState *ps) {
         SDL_Delay(100);
         return;
     }
-
-    /* Save default sink before we destroy it — needed to restore routing
-     * after profile restore so SDL doesn't open the wrong output. */
-    ps->bitstream_caps.pa_default_sink[0] = '\0';
-    FILE *fp = popen("pactl get-default-sink 2>/dev/null", "r");
-    if (fp) {
-        if (fgets(ps->bitstream_caps.pa_default_sink,
-                  sizeof(ps->bitstream_caps.pa_default_sink), fp)) {
-            /* trim trailing newline */
-            char *nl = strchr(ps->bitstream_caps.pa_default_sink, '\n');
-            if (nl) *nl = '\0';
-        }
-        pclose(fp);
-    }
-
     char cmd[384];
     snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' off 2>/dev/null",
              ps->bitstream_caps.pa_card_name);
@@ -692,37 +676,7 @@ static void hdmi_restore(PlayerState *ps) {
              ps->bitstream_caps.pa_card_name, profile);
     log_msg("Bitstream: restoring HDMI — %s", cmd);
     system(cmd);
-
-    /* ── Wait for HDMI sink to reappear and restore default routing ──
-     *
-     * Setting the card profile back creates the PipeWire sink, but it
-     * takes time.  If SDL opens audio before the HDMI sink is the
-     * default, PipeWire routes to internal speakers → silence on TV.
-     *
-     * Poll: try to set the saved sink as default.  pactl returns
-     * non-zero if the sink doesn't exist yet.  20 × 100ms = 2s max. */
-    if (ps->bitstream_caps.pa_default_sink[0]) {
-        snprintf(cmd, sizeof(cmd), "pactl set-default-sink '%s' 2>/dev/null",
-                 ps->bitstream_caps.pa_default_sink);
-        int restored = 0;
-        for (int i = 0; i < 20; i++) {
-            int rc = system(cmd);
-            if (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) {
-                log_msg("Bitstream: HDMI sink restored as default (%dms)",
-                        (i + 1) * 100);
-                restored = 1;
-                break;
-            }
-            SDL_Delay(100);
-        }
-        if (!restored)
-            log_msg("Bitstream: WARN — HDMI sink '%s' not available after 2s",
-                    ps->bitstream_caps.pa_default_sink);
-    } else {
-        SDL_Delay(200);  /* no saved sink — use fixed delay as fallback */
-    }
-
-    SDL_Delay(100);  /* brief settle after sink becomes default */
+    SDL_Delay(200);  /* give PipeWire time to reclaim the ALSA device */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
