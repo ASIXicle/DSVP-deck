@@ -727,14 +727,22 @@ static int bitstream_thread_func(void *arg) {
             double pts = (double)pkt.pts * av_q2d(as->time_base);
             ps->audio_clock = pts;
 
-            /* Estimate buffered time from ALSA delay */
-            snd_pcm_sframes_t delay = 0;
-            snd_pcm_delay(pcm, &delay);
-            double buffered = (delay > 0)
-                ? (double)delay / (double)ps->bitstream_alsa_rate
-                : 0.0;
-            if (buffered > 1.5) buffered = 1.5;  /* sanity clamp */
-            ps->audio_clock_sync = pts - buffered;
+             * ALSA consumes at a fixed hardware rate, so:
+             *   submitted_seconds = frames_written / sample_rate
+             *   consumed_seconds  = wall_elapsed  (hardware is the clock)
+             *   buffered          = submitted - consumed
+             * This is deterministic — no snd_pcm_delay jitter, no period-
+             * boundary quantization, no warmup instability during buffer fill.
+             * Credit: Wren (cross-instance advisory #2, April 2026) */
+            if (ps->bitstream_wall_start > 0) {
+                double submitted = (double)ps->bitstream_frames_written
+                                 / (double)ps->bitstream_alsa_rate;
+                double consumed  = get_time_sec() - ps->bitstream_wall_start;
+                double buffered  = submitted - consumed;
+                if (buffered < 0) buffered = 0;
+                if (buffered > 1.5) buffered = 1.5;
+                ps->audio_clock_sync = pts - buffered;
+            }
         }
 
         /* Frame the packet through spdifenc → spdif_buf */
@@ -770,6 +778,10 @@ static int bitstream_thread_func(void *arg) {
                         snd_strerror((int)written));
                 break;
             }
+            /* Track wall start from first successful write */
+            if (ps->bitstream_wall_start == 0)
+                ps->bitstream_wall_start = get_time_sec();
+            ps->bitstream_frames_written += written;
             frames -= (int)written;
             ptr += written * bpf;
         }
@@ -947,8 +959,8 @@ int bitstream_start(PlayerState *ps) {
      * At 192kHz, 200ms was only 38400 frames — insufficient for TrueHD's
      * ~1200 packet/sec rate. 1s gives the bitstream thread enough
      * headroom for the demux thread to interleave video packets. */
-    snd_pcm_uframes_t buffer_size = actual_rate;       /* 1s */
-    snd_pcm_uframes_t period_size = actual_rate / 4;   /* 250ms */
+    snd_pcm_uframes_t buffer_size = actual_rate;        /* 1s */
+    snd_pcm_uframes_t period_size = actual_rate / 20;   /* 50ms */
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer_size);
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period_size, NULL);
 
@@ -968,7 +980,9 @@ int bitstream_start(PlayerState *ps) {
     snd_pcm_prepare(pcm);
     ps->alsa_pcm = pcm;
     ps->bitstream_frame_bytes = channels * 2;  /* S16LE: 4 for stereo, 16 for 8ch */
-    ps->bitstream_alsa_rate = actual_rate;     /* for snd_pcm_delay → seconds conversion */
+    ps->bitstream_alsa_rate = actual_rate;
+    ps->bitstream_frames_written = 0;
+    ps->bitstream_wall_start = 0;  /* set on first ALSA write in thread */
 
     log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
             ps->bitstream_caps.alsa_device, actual_rate, channels,
