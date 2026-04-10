@@ -1172,6 +1172,13 @@ void bitstream_stop(PlayerState *ps) {
     /* Restart PipeWire if we stopped it for ALSA access */
     if (ps->pipewire_stopped) {
         pipewire_start();
+        /* On application exit, PipeWire must fully reclaim ALSA devices
+         * before our process terminates — otherwise Game Mode/Desktop
+         * has no audio until reboot. The 300ms in pipewire_start is
+         * enough for mid-playback transitions (audio_open retries),
+         * but on exit there's no retry opportunity. */
+        if (ps->quit)
+            SDL_Delay(1500);
         ps->pipewire_stopped = 0;
     }
 

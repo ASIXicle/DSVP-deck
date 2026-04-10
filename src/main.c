@@ -684,6 +684,15 @@ int main(int argc, char *argv[]) {
                         if (ps.audio_mode == AUDIO_MODE_PCM && ps.bitstream_active) {
                             bitstream_stop(&ps);
                             audio_open(&ps);
+                            /* If current track is TrueHD, we CANNOT PCM-decode it
+                             * on the Deck — 1200 pkt/sec MLP decode starves video
+                             * within 200ms. Switch to the EAC3 compatibility track.
+                             * audio_cycle's TrueHD skip logic handles this. */
+                            if (ps.audio_codec_ctx &&
+                                ps.audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD) {
+                                log_msg("Audio: TrueHD on PCM return — auto-switching to decodable track");
+                                audio_cycle(&ps);
+                            }
                         } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
                             audio_close(&ps);
                             if (!bitstream_start(&ps))
