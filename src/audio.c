@@ -731,9 +731,9 @@ static int bitstream_thread_func(void *arg) {
              *   submitted_seconds = frames_written / sample_rate
              *   consumed_seconds  = wall_elapsed  (hardware is the clock)
              *   buffered          = submitted - consumed
-             * This is deterministic — no snd_pcm_delay jitter, no period-
+             * This is deterministic -- no snd_pcm_delay jitter, no period-
              * boundary quantization, no warmup instability during buffer fill.
-             * Credit: Wren (cross-instance advisory #2, April 2026) */
+             * Credit: Wren (cross-instance advisory, April 2026) */
             if (ps->bitstream_wall_start > 0) {
                 double submitted = (double)ps->bitstream_frames_written
                                  / (double)ps->bitstream_alsa_rate;
