@@ -727,12 +727,7 @@ static int bitstream_thread_func(void *arg) {
             double pts = (double)pkt.pts * av_q2d(as->time_base);
             ps->audio_clock = pts;
 
-             * ALSA consumes at a fixed hardware rate, so:
-             *   submitted_seconds = frames_written / sample_rate
-             *   consumed_seconds  = wall_elapsed  (hardware is the clock)
-             *   buffered          = submitted - consumed
-             * This is deterministic -- no snd_pcm_delay jitter, no period-
-             * boundary quantization, no warmup instability during buffer fill.
+            /* Derive buffered time from frame count + wall clock (no snd_pcm_delay)
              * Credit: Wren (cross-instance advisory, April 2026) */
             if (ps->bitstream_wall_start > 0) {
                 double submitted = (double)ps->bitstream_frames_written
