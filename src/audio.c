@@ -843,7 +843,18 @@ static int bitstream_thread_func(void *arg) {
     AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
     int spdif_err_count = 0;
 
-    log_msg("Bitstream: output thread started");
+    /* TrueHD: spdifenc requires a major sync frame to initialize.
+     * After a seek or track switch, the first packets in audio_pq
+     * may precede the next major sync — spdifenc rejects them with
+     * "Invalid data found when processing input". Skip until we see
+     * the 0xF8726FBA sync word at bytes 4-7 of the access unit. */
+    int need_truehd_sync = (ps->audio_codec_ctx &&
+        ps->audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD);
+    int truehd_synced = !need_truehd_sync;
+    int truehd_skipped = 0;
+
+    log_msg("Bitstream: output thread started%s",
+            need_truehd_sync ? " (waiting for TrueHD major sync)" : "");
 
     while (!ps->bitstream_quit) {
         /* Pop a packet from the audio queue (blocking) */
@@ -858,6 +869,24 @@ static int bitstream_thread_func(void *arg) {
         if (pkt.stream_index != ps->audio_stream_idx) {
             av_packet_unref(&pkt);
             continue;
+        }
+
+        /* TrueHD: skip packets until we hit a major sync frame.
+         * Major sync word 0xF8726FBA sits at bytes 4-7 of the access unit.
+         * Without this, spdifenc can't determine stream parameters and
+         * rejects every packet until a major sync arrives naturally. */
+        if (!truehd_synced) {
+            if (pkt.size >= 8 &&
+                pkt.data[4] == 0xF8 && pkt.data[5] == 0x72 &&
+                pkt.data[6] == 0x6F && pkt.data[7] == 0xBA) {
+                truehd_synced = 1;
+                log_msg("Bitstream: TrueHD major sync found (skipped %d packets)",
+                        truehd_skipped);
+            } else {
+                truehd_skipped++;
+                av_packet_unref(&pkt);
+                continue;
+            }
         }
 
         /* Update audio clock from packet PTS */
