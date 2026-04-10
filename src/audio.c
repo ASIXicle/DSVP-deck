@@ -579,7 +579,7 @@ static void pipewire_stop(void) {
 static void pipewire_start(void) {
     log_msg("Bitstream: restarting PipeWire");
     system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
-    SDL_Delay(200);  /* give PipeWire time to reclaim audio devices */
+    SDL_Delay(500);  /* give PipeWire time to reclaim audio devices */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
@@ -942,9 +942,13 @@ int bitstream_start(PlayerState *ps) {
         log_msg("Bitstream: ALSA rate %d requested, got %d", rate, actual_rate);
     }
 
-    /* Buffer: 200ms, period: 50ms — generous for passthrough */
-    snd_pcm_uframes_t buffer_size = actual_rate / 5;   /* 200ms */
-    snd_pcm_uframes_t period_size = actual_rate / 20;   /* 50ms */
+    /* Buffer: 1s, period: 250ms — TrueHD HBR needs large runway
+     * to prevent snd_pcm_writei blocking, which starves demux/video.
+     * At 192kHz, 200ms was only 38400 frames — insufficient for TrueHD's
+     * ~1200 packet/sec rate. 1s gives the bitstream thread enough
+     * headroom for the demux thread to interleave video packets. */
+    snd_pcm_uframes_t buffer_size = actual_rate;       /* 1s */
+    snd_pcm_uframes_t period_size = actual_rate / 4;   /* 250ms */
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer_size);
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period_size, NULL);
 
@@ -971,6 +975,15 @@ int bitstream_start(PlayerState *ps) {
 
     /* ── Launch output thread ── */
     ps->bitstream_quit = 0;
+
+    /* Flush stale decoded PCM frames from audio_pq.
+     * When switching from PCM→bitstream on a TrueHD track, the decode
+     * thread fills audio_pq with decoded PCM frames. The bitstream
+     * thread expects raw compressed packets. Without this flush,
+     * spdifenc gets PCM data → garbage IEC 61937 bursts.
+     * Credit: Wren (cross-instance advisory, April 2026) */
+    pq_flush(&ps->audio_pq);
+
     ps->bitstream_active = 1;
     ps->bitstream_thread = SDL_CreateThread(
         bitstream_thread_func, "bitstream", ps);
