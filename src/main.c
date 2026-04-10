@@ -692,6 +692,12 @@ int main(int argc, char *argv[]) {
                                 ps.audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD) {
                                 log_msg("Audio: TrueHD on PCM return — auto-switching to decodable track");
                                 audio_open(&ps);
+                                /* Pause immediately — without this, the audio
+                                 * callback fires while audio_codec_ctx is still
+                                 * the TrueHD context, producing garbage/silence.
+                                 * audio_cycle resumes after switching to EAC3. */
+                                if (ps.audio_stream)
+                                    SDL_PauseAudioStreamDevice(ps.audio_stream);
                                 audio_cycle(&ps);
                                 did_seek = 1;  /* audio_cycle already seeked */
                             } else {

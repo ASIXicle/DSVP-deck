@@ -814,11 +814,17 @@ static void set_iec958_pcm(int card, int dev) {
     snd_aes_iec958_t iec958;
     memset(&iec958, 0, sizeof(iec958));
     iec958.status[0] = 0x04;  /* consumer, audio (non-audio bit CLEAR), no copyright */
+    iec958.status[3] = 0x02;  /* 48 kHz — explicit rate helps HDMI TX after HBR */
     snd_ctl_elem_value_set_iec958(val, &iec958);
-    snd_ctl_elem_write(ctl, val);
+
+    int err = snd_ctl_elem_write(ctl, val);
+    if (err < 0)
+        log_msg("Bitstream: IEC958 PCM reset failed (idx=%d): %s",
+                iec958_idx, snd_strerror(err));
+    else
+        log_msg("Bitstream: IEC958 reset to PCM mode (idx=%d)", iec958_idx);
 
     snd_ctl_close(ctl);
-    log_msg("Bitstream: IEC958 reset to PCM mode (idx=%d)", iec958_idx);
 }
 
 static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
@@ -1274,8 +1280,13 @@ void bitstream_stop(PlayerState *ps) {
         set_iec958_pcm(card_num, dev_num);
     }
 
-    /* Restore HDMI card profile so PipeWire reclaims the device */
+    /* Restore HDMI card profile so PipeWire reclaims the device.
+     * After TrueHD HBR (192kHz 8ch), the AMD HDA driver and HDMI link
+     * need extra time to fully reset before PipeWire can reopen at
+     * 48kHz 2ch. Without this, PipeWire may open a stale device. */
     if (ps->hdmi_released) {
+        if (ps->bitstream_frame_bytes > 4)  /* HBR: 16 bytes (8ch) */
+            SDL_Delay(300);  /* extra settle time for HBR → PCM */
         hdmi_restore(ps);
         ps->hdmi_released = 0;
     }
