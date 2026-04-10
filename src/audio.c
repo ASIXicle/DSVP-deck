@@ -565,6 +565,50 @@ void bitstream_probe(PlayerState *ps) {
 
     ps->bitstream_caps.probed = 1;
 
+    /* ── Discover PipeWire/PulseAudio card name and active profile ──
+     * Parse `pactl list cards` to find the PA card corresponding to our
+     * ALSA card number. We need this to toggle the card profile instead
+     * of stopping PipeWire entirely for ALSA exclusive access. */
+    {
+        FILE *p = popen("pactl list cards 2>/dev/null", "r");
+        if (p) {
+            char pline[512];
+            char cur_name[128] = "";
+            int match_card = 0;
+
+            while (fgets(pline, sizeof(pline), p)) {
+                /* Track current card name */
+                char name[128];
+                if (sscanf(pline, " Name: %127s", name) == 1) {
+                    strncpy(cur_name, name, sizeof(cur_name) - 1);
+                    cur_name[sizeof(cur_name) - 1] = '\0';
+                    match_card = 0;
+                }
+                /* Check if this card matches our ALSA card number */
+                if (strstr(pline, "api.alsa.card")) {
+                    int acn;
+                    if (sscanf(pline, " api.alsa.card = \"%d\"", &acn) == 1
+                        && acn == card) {
+                        match_card = 1;
+                    }
+                }
+                /* Capture active profile for our card */
+                char prof[128];
+                if (match_card && sscanf(pline, " Active Profile: %127s", prof) == 1) {
+                    strncpy(ps->bitstream_caps.pa_card_name, cur_name,
+                            sizeof(ps->bitstream_caps.pa_card_name) - 1);
+                    strncpy(ps->bitstream_caps.pa_saved_profile, prof,
+                            sizeof(ps->bitstream_caps.pa_saved_profile) - 1);
+                    log_msg("Bitstream: PA card '%s' active profile '%s'",
+                            ps->bitstream_caps.pa_card_name,
+                            ps->bitstream_caps.pa_saved_profile);
+                    break;
+                }
+            }
+            pclose(p);
+        }
+    }
+
     log_msg("Bitstream: probed %s via ELD (card%d, eld#0.%d)",
             monitor[0] ? monitor : "unknown", card, eld_idx);
     log_msg("Bitstream: AC3=%d EAC3=%d TrueHD=%d DTS=%d DTS-HD=%d "
@@ -594,22 +638,46 @@ void bitstream_probe(PlayerState *ps) {
 
 #define SPDIF_MAX_BUF  65536   /* max IEC 61937 burst (TrueHD HBR=61440) */
 
-/* ── PipeWire device contention ──
- * PipeWire holds ALSA HDMI devices exclusively. For bitstream passthrough
- * we need raw ALSA access, so we temporarily stop PipeWire. This is the
- * same approach mpv/Kodi users use on Linux for audio passthrough.
- * Services are restarted in bitstream_stop or on error fallback. */
+/* ── HDMI card profile release/restore ──
+ * Instead of stopping PipeWire entirely (which breaks Game Mode audio
+ * and causes restart instability), we set the HDMI sound card's
+ * PulseAudio/PipeWire profile to "off". This releases the ALSA device
+ * for exclusive access while keeping PipeWire running and healthy.
+ * The internal speaker/headphone card is unaffected.
+ *
+ * SteamOS 3.8.1 + PipeWire 1.4.10: card profiles are exposed and
+ * iec958.codecs.detected is populated from ELD, making this reliable. */
 
-static void pipewire_stop(void) {
-    log_msg("Bitstream: stopping PipeWire for exclusive ALSA access");
-    system("systemctl --user stop wireplumber pipewire-pulse.socket pipewire.socket pipewire 2>/dev/null");
-    SDL_Delay(100);  /* give PipeWire time to release ALSA devices */
+static void hdmi_release(PlayerState *ps) {
+    if (!ps->bitstream_caps.pa_card_name[0]) {
+        log_msg("Bitstream: no PA card name — falling back to PipeWire stop");
+        system("systemctl --user stop wireplumber pipewire-pulse.socket pipewire.socket pipewire 2>/dev/null");
+        SDL_Delay(100);
+        return;
+    }
+    char cmd[384];
+    snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' off 2>/dev/null",
+             ps->bitstream_caps.pa_card_name);
+    log_msg("Bitstream: releasing HDMI — %s", cmd);
+    system(cmd);
+    SDL_Delay(200);  /* give PipeWire time to close the ALSA device */
 }
 
-static void pipewire_start(void) {
-    log_msg("Bitstream: restarting PipeWire");
-    system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
-    SDL_Delay(300);  /* minimal settle time; audio_open retry loop handles the rest */
+static void hdmi_restore(PlayerState *ps) {
+    if (!ps->bitstream_caps.pa_card_name[0]) {
+        log_msg("Bitstream: no PA card name — falling back to PipeWire start");
+        system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
+        SDL_Delay(300);
+        return;
+    }
+    const char *profile = ps->bitstream_caps.pa_saved_profile[0]
+        ? ps->bitstream_caps.pa_saved_profile : "output:hdmi-stereo-extra2";
+    char cmd[384];
+    snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' '%s' 2>/dev/null",
+             ps->bitstream_caps.pa_card_name, profile);
+    log_msg("Bitstream: restoring HDMI — %s", cmd);
+    system(cmd);
+    SDL_Delay(200);  /* give PipeWire time to reclaim the ALSA device */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
@@ -986,8 +1054,8 @@ int bitstream_start(PlayerState *ps) {
     sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
     int aes3 = iec958_rate_code(rate);
 
-    pipewire_stop();
-    ps->pipewire_stopped = 1;
+    hdmi_release(ps);
+    ps->hdmi_released = 1;
 
     /* Set non-audio bit BEFORE opening PCM (some drivers latch on open) */
     set_iec958_nonpcm(card_num, dev_num, aes3);
@@ -998,7 +1066,7 @@ int bitstream_start(PlayerState *ps) {
     if (ret < 0) {
         log_msg("Bitstream: ALSA open '%s' failed: %s",
                 ps->bitstream_caps.alsa_device, snd_strerror(ret));
-        pipewire_start(); ps->pipewire_stopped = 0;
+        hdmi_restore(ps); ps->hdmi_released = 0;
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1035,7 +1103,7 @@ int bitstream_start(PlayerState *ps) {
     if (ret < 0) {
         log_msg("Bitstream: ALSA hw_params failed: %s", snd_strerror(ret));
         snd_pcm_close(pcm);
-        if (ps->pipewire_stopped) { pipewire_start(); ps->pipewire_stopped = 0; }
+        if (ps->hdmi_released) { hdmi_restore(ps); ps->hdmi_released = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1092,7 +1160,7 @@ int bitstream_start(PlayerState *ps) {
         snd_pcm_close(pcm);
         ps->alsa_pcm = NULL;
         ps->bitstream_active = 0;
-        if (ps->pipewire_stopped) { pipewire_start(); ps->pipewire_stopped = 0; }
+        if (ps->hdmi_released) { hdmi_restore(ps); ps->hdmi_released = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1178,10 +1246,10 @@ void bitstream_stop(PlayerState *ps) {
         set_iec958_pcm(card_num, dev_num);
     }
 
-    /* Restart PipeWire if we stopped it for ALSA access */
-    if (ps->pipewire_stopped) {
-        pipewire_start();
-        ps->pipewire_stopped = 0;
+    /* Restore HDMI card profile so PipeWire reclaims the device */
+    if (ps->hdmi_released) {
+        hdmi_restore(ps);
+        ps->hdmi_released = 0;
     }
 
     log_msg("Bitstream: passthrough stopped");

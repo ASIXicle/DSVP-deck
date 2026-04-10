@@ -99,6 +99,8 @@ typedef struct BitstreamCaps {
     int  max_channels;     /* max channel count reported by sink       */
     int  probed;           /* 1 = caps have been queried this session   */
     char alsa_device[32];  /* ALSA hw device for passthrough (e.g. "hw:0,8") */
+    char pa_card_name[128];     /* PulseAudio/PipeWire card name             */
+    char pa_saved_profile[128]; /* profile to restore after bitstream        */
 } BitstreamCaps;
 
 /* ── Packet Queue ───────────────────────────────────────────────────
@@ -221,7 +223,7 @@ typedef struct PlayerState {
     int                 bitstream_alsa_rate;   /* actual ALSA sample rate             */
     double              bitstream_wall_start;  /* wall clock at first ALSA write      */
     int64_t             bitstream_frames_written; /* cumulative frames sent to ALSA   */
-    int                 pipewire_stopped; /* 1 = we stopped PipeWire for ALSA     */
+    int                 hdmi_released;   /* 1 = HDMI card profile set to off   */
 
     /* ── Packet queues ── */
     PacketQueue         video_pq;

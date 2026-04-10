@@ -3041,13 +3041,18 @@ void player_close(PlayerState *ps) {
     bitstream_stop(ps);  /* no-op if not active */
     audio_close(ps);
 
-    /* Ensure PipeWire is healthy at exit. Rapid bitstream stop/start cycles
-     * can leave PipeWire in a broken state (killed mid-startup, socket not
-     * reclaimed). Without this, Game Mode loses all audio until reboot.
-     * Unconditional: cheap if PipeWire is already running, essential if not. */
-    if (ps->bitstream_caps.probed) {
-        system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
-        SDL_Delay(1500);
+    /* Ensure HDMI card profile is restored at exit. If DSVP crashed or
+     * was killed during bitstream, the profile may still be "off".
+     * Restoring it lets PipeWire reclaim the HDMI device cleanly.
+     * This is cheap if the profile is already correct. */
+    if (ps->bitstream_caps.probed && ps->bitstream_caps.pa_card_name[0]) {
+        const char *profile = ps->bitstream_caps.pa_saved_profile[0]
+            ? ps->bitstream_caps.pa_saved_profile : "output:hdmi-stereo-extra2";
+        char cmd[384];
+        snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' '%s' 2>/dev/null",
+                 ps->bitstream_caps.pa_card_name, profile);
+        system(cmd);
+        SDL_Delay(200);
     }
 
     /* Close subtitles */
