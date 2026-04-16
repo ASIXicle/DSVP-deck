@@ -3003,6 +3003,19 @@ int player_open(PlayerState *ps, const char *filename) {
     /* ── Start decode thread ── */
     ps->decode_thread = SDL_CreateThread(decode_thread_func, "decode", ps);
 
+    /* Schedule a deferred warm-reset seek for 60fps content.
+     * At 4K 60fps, cold-start decode variance causes frame_timer drift
+     * that 1:1 pacing (mc=1) can't recover from. After 1.5s the pipeline
+     * is warm (CPU freq scaled, caches hot) — a silent seek resets timing. */
+    {
+        AVStream *vst = ps->fmt_ctx->streams[ps->video_stream_idx];
+        double fps = (vst->avg_frame_rate.den > 0)
+            ? av_q2d(vst->avg_frame_rate) : 0.0;
+        if (fps >= 48.0) {
+            ps->warm_reset_time = get_time_sec() + 1.5;
+        }
+    }
+
     /* Build media info string */
     player_build_media_info(ps);
 

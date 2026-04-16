@@ -1494,6 +1494,16 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            /* Deferred warm-reset for 60fps content: after 1.5s of playback,
+             * seek to current position to reset timing with warm pipeline.
+             * Cold-start decode variance causes irrecoverable drift at mc=1. */
+            if (ps.warm_reset_time > 0.0 && now >= ps.warm_reset_time) {
+                ps.warm_reset_time = 0.0;
+                log_msg("DIAG: warm-reset seek at %.3fs (60fps cold-start fix)",
+                        ps.video_clock);
+                player_seek(&ps, 0);  /* seek to current position — resets timing */
+            }
+
             /* Snap forward on extreme stall */
             if (ps.frame_timer < now - 0.1) {
                 ps.frame_timer = now;
