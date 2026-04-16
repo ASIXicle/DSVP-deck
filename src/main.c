@@ -574,17 +574,13 @@ int main(int argc, char *argv[]) {
                     }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
-                        /* Schedule warm-reset after fullscreen toggle for 60fps.
-                         * The overlay audio pause in gpu_overlay_ensure handles
-                         * the stall drift; this is a safety net for any residual
-                         * timing issues after resolution change. */
-                        {
-                            AVStream *vst = ps.fmt_ctx->streams[ps.video_stream_idx];
-                            double fps = (vst->avg_frame_rate.den > 0)
-                                ? av_q2d(vst->avg_frame_rate) : 0.0;
-                            if (fps >= 48.0)
-                                ps.warm_reset_time = get_time_sec() + 2.0;
-                        }
+                        /* Lock frame_timer to wall-clock during VSync transition.
+                         * Wayland fullscreen toggles change the VSync source
+                         * (compositor → direct display). During the 2-3s transition,
+                         * VSync timing is disrupted, causing frame_timer drift.
+                         * Locking prevents drift accumulation; normal pacing
+                         * resumes once VSync stabilizes. */
+                        ps.fs_settle_until = get_time_sec() + 3.0;
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
@@ -1525,6 +1521,25 @@ int main(int argc, char *argv[]) {
                         log_msg("DIAG: frame_timer snapped forward "
                                 "(stall recovery at %.3fs)", ps.video_clock);
                 }
+            }
+
+            /* ── VSync settle: lock timing during fullscreen transition ──
+             * After F-key toggle, Wayland changes the VSync source. During the
+             * 2-3s transition, frame presentation timing is erratic. Lock
+             * frame_timer to wall-clock and continuously re-sync audio clocks
+             * to prevent drift accumulation. */
+            if (ps.fs_settle_until > 0.0 && now < ps.fs_settle_until) {
+                ps.frame_timer = now;
+                if (ps.audio_stream) {
+                    ps.audio_clock      = ps.video_clock;
+                    ps.audio_clock_sync = ps.video_clock;
+                }
+            } else if (ps.fs_settle_until > 0.0) {
+                /* Settle period ended — do a final clean seek to re-sync */
+                ps.fs_settle_until = 0.0;
+                log_msg("DIAG: VSync settle complete at %.3fs — final seek",
+                        ps.video_clock);
+                player_seek(&ps, 0);
             }
 
             /* Display the last decoded frame via GPU */

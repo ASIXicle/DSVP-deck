@@ -292,6 +292,7 @@ typedef struct PlayerState {
     int                 seek_flags;
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
     double              warm_reset_time;  /* wall-clock time to fire deferred seek (0 = none) */
+    double              fs_settle_until;  /* wall-clock time until which frame_timer is locked to now (VSync transition) */
     double              last_frame_wall;  /* wall-clock of last displayed frame */
     int                 audio_stalled;    /* 1 = audio paused due to video stall */
 
