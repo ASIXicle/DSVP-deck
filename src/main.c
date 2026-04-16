@@ -1269,6 +1269,20 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        /* ── Deferred warm-reset for 60fps content ──
+         * Must fire OUTSIDE the render block (like the P-key handler does)
+         * so that seek_recovering is set BEFORE any frame processing.
+         * Firing mid-render causes re-entrancy: frames consumed with stale
+         * timing before the seek resets it. */
+        if (ps.warm_reset_time > 0.0 && get_time_sec() >= ps.warm_reset_time) {
+            ps.warm_reset_time = 0.0;
+            log_msg("DIAG: warm-reset at %.3fs (audio reopen + seek)",
+                    ps.video_clock);
+            audio_close(&ps);
+            audio_open(&ps);
+            player_seek(&ps, 0);
+        }
+
         /* ── Render ── */
         if (ps.playing && !ps.paused) {
             /* Decode pending subtitles (still queued for Phase 2) */
@@ -1495,23 +1509,6 @@ int main(int argc, char *argv[]) {
                         ps.quit = 0;
                     }
                 }
-            }
-
-            /* Deferred warm-reset for 60fps content: close and reopen
-             * the SDL audio stream, then seek to current position.
-             * The SDL audio stream buffers PCM samples that survive a bare
-             * seek — those stale samples put audio_clock ahead of video_clock.
-             * Closing discards the buffers; reopening starts the stream
-             * PAUSED — audio won't resume until seek_recovering clears after
-             * the first video frame displays. This is exactly what the manual
-             * P-key audio mode cycle does. */
-            if (ps.warm_reset_time > 0.0 && now >= ps.warm_reset_time) {
-                ps.warm_reset_time = 0.0;
-                log_msg("DIAG: warm-reset at %.3fs (audio reopen + seek)",
-                        ps.video_clock);
-                audio_close(&ps);
-                audio_open(&ps);
-                player_seek(&ps, 0);
             }
 
             /* Snap forward on extreme stall */
