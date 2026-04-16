@@ -1494,9 +1494,10 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Deferred warm-reset for 60fps content: after 1.5s of playback,
+            /* Deferred warm-reset for 60fps content: after 4s of playback,
              * seek to current position to reset timing with warm pipeline.
-             * Cold-start decode variance causes irrecoverable drift at mc=1. */
+             * Cold-start decode variance causes irrecoverable drift at mc=1.
+             * Must fire AFTER overlay texture allocation (~2.5s) to stick. */
             if (ps.warm_reset_time > 0.0 && now >= ps.warm_reset_time) {
                 ps.warm_reset_time = 0.0;
                 log_msg("DIAG: warm-reset seek at %.3fs (60fps cold-start fix)",
