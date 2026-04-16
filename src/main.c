@@ -1308,7 +1308,7 @@ int main(int argc, char *argv[]) {
              * blocking reblits and causing visible judder. */
 
             int is_1to1 = (ps.frame_last_delay > 0.001
-                           && ps.frame_last_delay < 0.020);
+                           && ps.frame_last_delay < 0.014);
 
             SDL_LockMutex(ps.decode_mutex);
             int frame_avail = ps.decode_frame_ready;
@@ -1356,21 +1356,19 @@ int main(int argc, char *argv[]) {
                         av_diff_c = av_diff - bias;
                     }
 
-                    /* 1:1 VSync pacing: when content frame rate
-                     * matches display refresh (~50-60fps), VSync
-                     * alone provides the pacing heartbeat. Full
-                     * A/V delay correction at 1:1 causes oscillation
-                     * because any jitter triggers multi-decode
-                     * bunching.
+                    /* N:1 pacing for 60fps content: at 4K fullscreen, the
+                     * decode+blit pipeline exceeds 16.67ms by a small but
+                     * consistent margin. 1:1 pacing (mc=1) has zero recovery —
+                     * drift accumulates forever as snap-forward cascades.
+                     * N:1 mode enables catch-up drops (skip one 16.7ms frame
+                     * when behind), self-correcting the drift.
                      *
-                     * Instead, once the bias EMA has converged
-                     * (~2s of playback), apply a micro-correction:
-                     * 2% of the converged bias per frame.  At 50ms
-                     * bias this is ~1ms/frame on a 16.67ms period —
-                     * too small to cause a tick skip, converges in
-                     * ~1 second. */
+                     * Threshold 0.014 (71fps+) = 1:1, below = N:1.
+                     * 60fps (16.7ms) and 50fps (20ms) use N:1.
+                     * For true 1:1 content (display-matched), the micro-
+                     * correction path below still applies once bias converges. */
                     one_to_one = (pts_delay > 0.001
-                                  && pts_delay < 0.020);
+                                  && pts_delay < 0.014);
 
                     double threshold = fmax(pts_delay, 0.01);
                     if (!one_to_one) {
