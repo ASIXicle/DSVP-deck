@@ -1494,6 +1494,14 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     /* Destroy old resources */
     gpu_overlay_destroy(ps);
 
+    /* Pause audio during GPU allocation — on shared-memory APUs, creating
+     * 33MB+ textures stalls the CPU for 200-350ms. Without this, audio
+     * advances during the stall while video is blocked, creating permanent
+     * A/V drift that manifests as a snap-forward cascade. */
+    int was_audio_playing = (ps->playing && ps->audio_stream && !ps->paused);
+    if (was_audio_playing)
+        SDL_PauseAudioStreamDevice(ps->audio_stream);
+
     /* Create RGBA8888 texture */
     SDL_GPUTextureCreateInfo tex_info;
     SDL_zero(tex_info);
@@ -1531,12 +1539,15 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
 
     log_msg("GPU: overlay texture created (%dx%d RGBA)", width, height);
 
-    /* Reset frame timer after large texture allocation during playback.
-     * On shared-memory APUs (Zen 2), allocating 33MB+ (4K RGBA) can stall
-     * the CPU for 200ms+, causing the frame timer to race ahead and trigger
-     * snap-forward cascades. Resetting here catches the stall at its source. */
+    /* Resume audio and re-sync after GPU stall */
     if (ps->playing) {
         ps->frame_timer = get_time_sec();
+        if (was_audio_playing && ps->audio_stream) {
+            SDL_ClearAudioStream(ps->audio_stream);
+            ps->audio_clock      = ps->video_clock;
+            ps->audio_clock_sync = ps->video_clock;
+            SDL_ResumeAudioStreamDevice(ps->audio_stream);
+        }
     }
 
     return 0;
