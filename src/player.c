@@ -1530,6 +1530,15 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     ps->overlay_dirty = 0;
 
     log_msg("GPU: overlay texture created (%dx%d RGBA)", width, height);
+
+    /* Reset frame timer after large texture allocation during playback.
+     * On shared-memory APUs (Zen 2), allocating 33MB+ (4K RGBA) can stall
+     * the CPU for 200ms+, causing the frame timer to race ahead and trigger
+     * snap-forward cascades. Resetting here catches the stall at its source. */
+    if (ps->playing) {
+        ps->frame_timer = get_time_sec();
+    }
+
     return 0;
 }
 
@@ -2362,7 +2371,13 @@ int player_open(PlayerState *ps, const char *filename) {
     strncpy(ps->filepath, filename, sizeof(ps->filepath) - 1);
     ps->io_error = 0;
     ps->filepath[sizeof(ps->filepath) - 1] = '\0';
-    log_msg("player_open: %s", filename);
+    if (log_anon_active()) {
+        /* Redact file path — show only codec-relevant info for public logs */
+        const char *ext = strrchr(filename, '.');
+        log_msg("player_open: [redacted]%s", ext ? ext : "");
+    } else {
+        log_msg("player_open: %s", filename);
+    }
 
     /* ── Open container ── */
     ps->fmt_ctx = avformat_alloc_context();

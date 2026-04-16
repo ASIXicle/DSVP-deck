@@ -375,6 +375,7 @@ int main(int argc, char *argv[]) {
     ps.hdr_target_idx = 0;  /* default: 203 nits (industry standard) */
     ps.gpu_uniforms.hdr_target_nits = 203.0f;
     ps.gpu_uniforms.hdr_midtone_gain = 1.3f;  /* default: moderate midtone lift */
+    ps.audio_mode = AUDIO_MODE_AUTO;  /* probe HDMI sink, passthrough if supported */
 
     /* ── Detect Game Mode vs Desktop Mode ──
      * Gamescope (SteamOS Game Mode compositor) sets GAMESCOPE_WAYLAND_DISPLAY.
@@ -475,10 +476,9 @@ int main(int argc, char *argv[]) {
                         if (browser_enter(&ps)) {
                             ps.show_controls = 0;
                             log_msg("Browser: opening %s",
-                                    ps.browser_selected_file);
+                                    log_anon_active() ? "[redacted]" : ps.browser_selected_file);
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
-                                log_msg("ERROR: Failed to open: %s",
-                                        ps.browser_selected_file);
+                                log_msg("ERROR: Failed to open file");
                             } else {
                                 playlist_scan(&ps);
                             }
@@ -554,6 +554,24 @@ int main(int argc, char *argv[]) {
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+                    /* Returning to windowed: resize to current video's aspect ratio.
+                     * Without this, opening a different-aspect file while fullscreen
+                     * leaves the old window shape (stale black bars). */
+                    if (!ps.fullscreen && ps.playing && ps.vid_w > 0 && ps.vid_h > 0) {
+                        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(
+                            SDL_GetPrimaryDisplay());
+                        int max_w = dm ? (int)(dm->w * 0.8) : 1920;
+                        int max_h = dm ? (int)(dm->h * 0.8) : 1080;
+                        int w = ps.vid_w, h = ps.vid_h;
+                        if (w > max_w || h > max_h) {
+                            double scale = fmin((double)max_w / w, (double)max_h / h);
+                            w = (int)(w * scale);
+                            h = (int)(h * scale);
+                        }
+                        ps.win_w = w;
+                        ps.win_h = h;
+                        SDL_SetWindowSize(window, w, h);
+                    }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
                         if (!ps.paused && ps.audio_stream)
@@ -929,10 +947,9 @@ int main(int argc, char *argv[]) {
                         if (browser_enter(&ps)) {
                             ps.show_controls = 0;
                             log_msg("Browser: opening %s",
-                                    ps.browser_selected_file);
+                                    log_anon_active() ? "[redacted]" : ps.browser_selected_file);
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
-                                log_msg("ERROR: Failed to open: %s",
-                                        ps.browser_selected_file);
+                                log_msg("ERROR: Failed to open file");
                             } else {
                                 playlist_scan(&ps);
                             }
@@ -1481,8 +1498,12 @@ int main(int argc, char *argv[]) {
             if (ps.frame_timer < now - 0.1) {
                 ps.frame_timer = now;
                 ps.diag_timer_snaps++;
-                log_msg("DIAG: frame_timer snapped forward "
-                        "(stall recovery at %.3fs)", ps.video_clock);
+                /* Suppress log for the first-frame snap at file open (always
+                 * fires because decode pipeline takes >100ms to produce frame 1).
+                 * Only log mid-playback snaps which indicate real stalls. */
+                if (ps.video_clock > 0.5)
+                    log_msg("DIAG: frame_timer snapped forward "
+                            "(stall recovery at %.3fs)", ps.video_clock);
             }
 
             /* Display the last decoded frame via GPU */

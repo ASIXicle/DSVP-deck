@@ -9,8 +9,10 @@
 #include "dsvp.h"
 
 static FILE *g_logfile = NULL;
+static int g_log_anon = 0;  /* set by DSVP_LOG_ANON=1 to redact file paths */
 
 void log_init(void) {
+    g_log_anon = (getenv("DSVP_LOG_ANON") != NULL);
     g_logfile = fopen("dsvp.log", "w");
     if (g_logfile) {
         /* Disable buffering — every fprintf goes to disk immediately */
@@ -50,3 +52,5 @@ void log_msg(const char *fmt, ...) {
     va_end(args);
     fprintf(stderr, "\n");
 }
+
+int log_anon_active(void) { return g_log_anon; }

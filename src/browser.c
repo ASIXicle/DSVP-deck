@@ -451,7 +451,8 @@ void browser_scan(PlayerState *ps) {
     ps->browser_sel = 0;
     ps->browser_scroll = 0;
 
-    log_msg("browser: scanned %s — %d entries", ps->browser_path, count);
+    log_msg("browser: scanned %s — %d entries",
+            log_anon_active() ? "[redacted]" : ps->browser_path, count);
 }
 
 
@@ -463,7 +464,8 @@ void browser_init(PlayerState *ps) {
     browser_load_path(ps);
     browser_scan(ps);
     ps->browser_active = 1;
-    log_msg("browser: initialized at %s", ps->browser_path);
+    log_msg("browser: initialized at %s",
+            log_anon_active() ? "[redacted]" : ps->browser_path);
 }
 
 void browser_navigate(PlayerState *ps, int delta) {

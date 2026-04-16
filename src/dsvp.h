@@ -530,6 +530,7 @@ void  browser_save_path(PlayerState *ps);
 void  log_init(void);
 void  log_close(void);
 void  log_msg(const char *fmt, ...);
+int   log_anon_active(void);  /* returns 1 if DSVP_LOG_ANON is set */
 
 /* ── Utility ──────────────────────────────────────────────────────── */
 
