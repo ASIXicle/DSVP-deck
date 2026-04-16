@@ -2994,6 +2994,22 @@ int player_open(PlayerState *ps, const char *filename) {
             audio_open(ps);
     }
 
+    /* ── Pre-allocate overlay at max display resolution ──
+     * The overlay texture (up to 33MB at 4K RGBA) causes a GPU stall on
+     * shared-memory APUs when allocated mid-playback. Pre-allocating here
+     * moves the stall to init time, before the first frame is decoded. */
+    {
+        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(
+            SDL_GetPrimaryDisplay());
+        if (dm) {
+            int ow, oh;
+            SDL_GetWindowSizeInPixels(ps->window, &ow, &oh);
+            int max_w = (dm->w > ow) ? dm->w : ow;
+            int max_h = (dm->h > oh) ? dm->h : oh;
+            gpu_overlay_ensure(ps, max_w, max_h);
+        }
+    }
+
     /* ── Start demux thread ── */
     ps->eof     = 0;
     ps->playing = 1;
