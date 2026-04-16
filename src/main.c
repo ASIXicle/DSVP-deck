@@ -1308,7 +1308,7 @@ int main(int argc, char *argv[]) {
              * blocking reblits and causing visible judder. */
 
             int is_1to1 = (ps.frame_last_delay > 0.001
-                           && ps.frame_last_delay < 0.014);
+                           && ps.frame_last_delay < 0.020);
 
             SDL_LockMutex(ps.decode_mutex);
             int frame_avail = ps.decode_frame_ready;
@@ -1356,19 +1356,13 @@ int main(int argc, char *argv[]) {
                         av_diff_c = av_diff - bias;
                     }
 
-                    /* N:1 pacing for 60fps content: at 4K fullscreen, the
-                     * decode+blit pipeline exceeds 16.67ms by a small but
-                     * consistent margin. 1:1 pacing (mc=1) has zero recovery —
-                     * drift accumulates forever as snap-forward cascades.
-                     * N:1 mode enables catch-up drops (skip one 16.7ms frame
-                     * when behind), self-correcting the drift.
-                     *
-                     * Threshold 0.014 (71fps+) = 1:1, below = N:1.
-                     * 60fps (16.7ms) and 50fps (20ms) use N:1.
-                     * For true 1:1 content (display-matched), the micro-
-                     * correction path below still applies once bias converges. */
+                    /* 1:1 VSync pacing: when content frame rate
+                     * matches display refresh (~50-60fps), VSync
+                     * alone provides the pacing heartbeat. Frame drops
+                     * are disabled — the warm-reset (audio reopen + seek)
+                     * fixes cold-start drift at 60fps. */
                     one_to_one = (pts_delay > 0.001
-                                  && pts_delay < 0.014);
+                                  && pts_delay < 0.020);
 
                     double threshold = fmax(pts_delay, 0.01);
                     if (!one_to_one) {
@@ -1503,15 +1497,21 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Deferred warm-reset for 60fps content: after 4s of playback,
-             * seek to current position to reset timing with warm pipeline.
-             * Cold-start decode variance causes irrecoverable drift at mc=1.
-             * Must fire AFTER overlay texture allocation (~2.5s) to stick. */
+            /* Deferred warm-reset for 60fps content: close and reopen
+             * the SDL audio stream, then seek to current position.
+             * The SDL audio stream buffers PCM samples that survive a bare
+             * seek — those stale samples put audio_clock ahead of video_clock.
+             * Closing discards the buffers; reopening starts the stream
+             * PAUSED — audio won't resume until seek_recovering clears after
+             * the first video frame displays. This is exactly what the manual
+             * P-key audio mode cycle does. */
             if (ps.warm_reset_time > 0.0 && now >= ps.warm_reset_time) {
                 ps.warm_reset_time = 0.0;
-                log_msg("DIAG: warm-reset seek at %.3fs (60fps cold-start fix)",
+                log_msg("DIAG: warm-reset at %.3fs (audio reopen + seek)",
                         ps.video_clock);
-                player_seek(&ps, 0);  /* seek to current position — resets timing */
+                audio_close(&ps);
+                audio_open(&ps);
+                player_seek(&ps, 0);
             }
 
             /* Snap forward on extreme stall */
