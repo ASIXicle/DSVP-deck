@@ -67,7 +67,7 @@
 #define DEFAULT_WIN_H       540
 
 /* Built-in file browser */
-#define BROWSER_MAX_VISIBLE 20   /* max visible entries in file list  */
+#define BROWSER_MAX_VISIBLE 40   /* max visible entries in file list  */
 #define BROWSER_PATH_MAX    1024
 
 

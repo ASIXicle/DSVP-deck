@@ -864,9 +864,9 @@ void overlay_render_browser(PlayerState *ps) {
     int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0) return;
 
-    /* Browser is text-dense — always scale 1 regardless of Game Mode.
-     * Playback OSD uses the larger Game Mode scale (3) separately. */
-    s_ui_scale = 1;
+    /* Browser scale: match overlay scale in desktop fullscreen for readability.
+     * Windowed=1 (perfect), Game Mode=1 (user-tested), Desktop FS=2 (readable). */
+    s_ui_scale = (ps->fullscreen && !ps->game_mode) ? 2 : 1;
 
     if (gpu_overlay_ensure(ps, w, h) < 0) {
         ps->overlay_active = 0;

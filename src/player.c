@@ -2886,6 +2886,7 @@ int player_open(PlayerState *ps, const char *filename) {
             ps->win_h = h;
 
             SDL_SetWindowSize(ps->window, w, h);
+            SDL_SyncWindow(ps->window);  /* let WM process resize before centering */
             SDL_SetWindowPosition(ps->window,
                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         } else {
