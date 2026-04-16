@@ -259,6 +259,8 @@ int main(int argc, char *argv[]) {
         SDL_Quit();
         return 1;
     }
+    /* Center window on screen (fixes offset at high DPI / 200% scaling) */
+    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
     /* ── Set window icon ── */
     {
@@ -826,14 +828,17 @@ int main(int argc, char *argv[]) {
                  * s = UI scale factor (1 windowed, 2 fullscreen) must
                  * match s_ui_scale in overlay.c. */
                 if (ev.button.button == SDL_BUTTON_LEFT && ps.playing
-                        && ps.show_seekbar) {
+                      && ps.show_seekbar) {
                     int h_now;
-                    SDL_GetWindowSize(window, NULL, &h_now);
-                    int s = ps.fullscreen ? 2 : 1;
+                    SDL_GetWindowSizeInPixels(window, NULL, &h_now);
+                    float density = SDL_GetWindowPixelDensity(window);
+                    int mx = (int)(ev.button.x * density);
+                    int my = (int)(ev.button.y * density);
+                    int s = ps.game_mode ? 3 : (ps.fullscreen ? 2 : 1);
                     int bar_h = 30 * s;
                     int bar_y = h_now - bar_h;
 
-                    if (ev.button.y >= bar_y && ev.button.y <= h_now) {
+                    if (my >= bar_y && my <= h_now) {
                         /* Button geometry (must match overlay.c) */
                         int btn_x = 8 * s;
                         int btn_sz = 8 * s;
@@ -842,16 +847,16 @@ int main(int argc, char *argv[]) {
 
 
                         /* Prev button click area */
-                        if (ev.button.x >= btn_x &&
-                                ev.button.x <= btn_x + btn_sz) {
+                        if (mx >= btn_x &&
+                                mx <= btn_x + btn_sz) {
                             SDL_Event fake = {0};
                             fake.type = SDL_EVENT_KEY_DOWN;
                             fake.key.key = SDLK_B;
                             SDL_PushEvent(&fake);
                         }
                         /* Next button click area */
-                        else if (ev.button.x >= btn2_x &&
-                                ev.button.x <= btn2_x + btn_sz) {
+                        else if (mx >= btn2_x &&
+                                mx <= btn2_x + btn_sz) {
                             SDL_Event fake = {0};
                             fake.type = SDL_EVENT_KEY_DOWN;
                             fake.key.key = SDLK_N;
@@ -862,9 +867,9 @@ int main(int argc, char *argv[]) {
                             int track_x = ps.seekbar_track_x;
                             int track_w = ps.seekbar_track_w;
 
-                            if (track_w > 20 && ev.button.x >= track_x
-                                    && ev.button.x <= track_x + track_w) {
-                                double frac = (double)(ev.button.x - track_x) / track_w;
+                            if (track_w > 20 && mx >= track_x
+                                    && mx <= track_x + track_w) {
+                                double frac = (double)(mx - track_x) / track_w;
                                 if (frac < 0.0) frac = 0.0;
                                 if (frac > 1.0) frac = 1.0;
                                 double duration = (ps.fmt_ctx->duration != AV_NOPTS_VALUE)
