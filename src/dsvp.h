@@ -293,6 +293,7 @@ typedef struct PlayerState {
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
     double              warm_reset_time;  /* wall-clock time to fire deferred seek (0 = none) */
     int                 warm_reset_phase; /* 0 = phase 1 (audio reopen), 1 = phase 2 (seek only) */
+    AudioMode           warm_reset_saved_mode; /* original audio_mode before warm-reset */
     double              last_frame_wall;  /* wall-clock of last displayed frame */
     int                 audio_stalled;    /* 1 = audio paused due to video stall */
 

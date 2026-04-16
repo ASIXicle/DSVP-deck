@@ -1272,25 +1272,30 @@ int main(int argc, char *argv[]) {
         }
 
         /* ── Deferred warm-reset for 60fps content ──
-         * Two-phase reset mirrors the P-key cycle that Holden proved works:
-         * Phase 1: audio_close + audio_open + seek (like PASSTHROUGH transition)
-         * Phase 2: just seek (like PCM transition) — the SECOND seek after
-         *   audio reopen is what actually fixes the drift.
-         * The first seek after audio_open doesn't fully stabilize because
-         * seek_recovering from the reopen hasn't cleanly settled. */
+         * Simulates the exact P-key cycle that's proven to fix drift:
+         * Phase 1: switch to PASSTHROUGH mode → audio_close + bitstream_start
+         *          (fails for PCM codecs) + audio_open + seek
+         * Phase 2: switch back to original mode + seek
+         * This matches the EXACT code path of the P-key handler. */
         if (ps.warm_reset_time > 0.0 && get_time_sec() >= ps.warm_reset_time) {
             if (ps.warm_reset_phase == 0) {
-                /* Phase 1: audio reopen + seek */
-                log_msg("DIAG: warm-reset phase 1 at %.3fs (audio reopen + seek)",
+                /* Phase 1: simulate P-key to PASSTHROUGH */
+                ps.warm_reset_saved_mode = ps.audio_mode;
+                ps.audio_mode = AUDIO_MODE_PASSTHROUGH;
+                log_msg("DIAG: warm-reset phase 1 at %.3fs (P-key sim → PASSTHROUGH)",
                         ps.video_clock);
-                audio_close(&ps);
-                audio_open(&ps);
-                player_seek(&ps, 0);
+                if (ps.playing && ps.audio_codec_ctx) {
+                    audio_close(&ps);
+                    if (!bitstream_start(&ps))
+                        audio_open(&ps);
+                    player_seek(&ps, 0);
+                }
                 ps.warm_reset_phase = 1;
-                ps.warm_reset_time = get_time_sec() + 2.0;  /* schedule phase 2 */
+                ps.warm_reset_time = get_time_sec() + 2.0;
             } else {
-                /* Phase 2: just seek — stabilizes after audio stream settles */
-                log_msg("DIAG: warm-reset phase 2 at %.3fs (seek only)",
+                /* Phase 2: simulate P-key back to original mode + seek */
+                ps.audio_mode = ps.warm_reset_saved_mode;
+                log_msg("DIAG: warm-reset phase 2 at %.3fs (restore mode + seek)",
                         ps.video_clock);
                 player_seek(&ps, 0);
                 ps.warm_reset_time = 0.0;
