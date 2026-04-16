@@ -1499,8 +1499,11 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
      * advances during the stall while video is blocked, creating permanent
      * A/V drift that manifests as a snap-forward cascade. */
     int was_audio_playing = (ps->playing && ps->audio_stream && !ps->paused);
-    if (was_audio_playing)
+    if (was_audio_playing) {
         SDL_PauseAudioStreamDevice(ps->audio_stream);
+        log_msg("GPU: audio PAUSED for overlay alloc (%dx%d)", width, height);
+    }
+    double alloc_start = get_time_sec();
 
     /* Create RGBA8888 texture */
     SDL_GPUTextureCreateInfo tex_info;
@@ -1537,7 +1540,8 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     ps->overlay_tex_h = height;
     ps->overlay_dirty = 0;
 
-    log_msg("GPU: overlay texture created (%dx%d RGBA)", width, height);
+    log_msg("GPU: overlay texture created (%dx%d RGBA, alloc %.0fms)",
+            width, height, (get_time_sec() - alloc_start) * 1000.0);
 
     /* Resume audio and re-sync after GPU stall */
     if (ps->playing) {
@@ -1547,6 +1551,8 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
             ps->audio_clock      = ps->video_clock;
             ps->audio_clock_sync = ps->video_clock;
             SDL_ResumeAudioStreamDevice(ps->audio_stream);
+            log_msg("GPU: audio RESUMED after overlay alloc (clocks synced to %.3fs)",
+                    ps->video_clock);
         }
     }
 
