@@ -574,18 +574,16 @@ int main(int argc, char *argv[]) {
                     }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
-                        /* Schedule fresh two-phase warm-reset after fullscreen toggle.
-                         * ALWAYS reschedule — cancels any pending phase from the
-                         * initial warm-reset. The overlay texture reallocation stalls
-                         * for ~350ms; wait 2s for it to fully settle before phase 1. */
+                        /* Schedule warm-reset after fullscreen toggle for 60fps.
+                         * The overlay audio pause in gpu_overlay_ensure handles
+                         * the stall drift; this is a safety net for any residual
+                         * timing issues after resolution change. */
                         {
                             AVStream *vst = ps.fmt_ctx->streams[ps.video_stream_idx];
                             double fps = (vst->avg_frame_rate.den > 0)
                                 ? av_q2d(vst->avg_frame_rate) : 0.0;
-                            if (fps >= 48.0) {
+                            if (fps >= 48.0)
                                 ps.warm_reset_time = get_time_sec() + 2.0;
-                                ps.warm_reset_phase = 0;
-                            }
                         }
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
@@ -1271,36 +1269,18 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* ── Deferred warm-reset for 60fps content ──
-         * Simulates the exact P-key cycle that's proven to fix drift:
-         * Phase 1: switch to PASSTHROUGH mode → audio_close + bitstream_start
-         *          (fails for PCM codecs) + audio_open + seek
-         * Phase 2: switch back to original mode + seek
-         * This matches the EXACT code path of the P-key handler. */
+        /* ── Deferred warm-reset for 60fps cold-start ──
+         * At file open, the decode pipeline takes a few seconds to reach
+         * steady state. Close/reopen the audio stream and seek to reset
+         * A/V sync once the pipeline is warm. The overlay stall drift is
+         * handled separately by pausing audio during gpu_overlay_ensure. */
         if (ps.warm_reset_time > 0.0 && get_time_sec() >= ps.warm_reset_time) {
-            if (ps.warm_reset_phase == 0) {
-                /* Phase 1: simulate P-key to PASSTHROUGH */
-                ps.warm_reset_saved_mode = ps.audio_mode;
-                ps.audio_mode = AUDIO_MODE_PASSTHROUGH;
-                log_msg("DIAG: warm-reset phase 1 at %.3fs (P-key sim → PASSTHROUGH)",
-                        ps.video_clock);
-                if (ps.playing && ps.audio_codec_ctx) {
-                    audio_close(&ps);
-                    if (!bitstream_start(&ps))
-                        audio_open(&ps);
-                    player_seek(&ps, 0);
-                }
-                ps.warm_reset_phase = 1;
-                ps.warm_reset_time = get_time_sec() + 2.0;
-            } else {
-                /* Phase 2: simulate P-key back to original mode + seek */
-                ps.audio_mode = ps.warm_reset_saved_mode;
-                log_msg("DIAG: warm-reset phase 2 at %.3fs (restore mode + seek)",
-                        ps.video_clock);
-                player_seek(&ps, 0);
-                ps.warm_reset_time = 0.0;
-                ps.warm_reset_phase = 0;
-            }
+            ps.warm_reset_time = 0.0;
+            log_msg("DIAG: warm-reset at %.3fs (audio reopen + seek)",
+                    ps.video_clock);
+            audio_close(&ps);
+            audio_open(&ps);
+            player_seek(&ps, 0);
         }
 
         /* ── Render ── */
