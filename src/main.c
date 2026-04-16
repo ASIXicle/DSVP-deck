@@ -574,16 +574,16 @@ int main(int argc, char *argv[]) {
                     }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
-                        /* Schedule warm-reset after fullscreen toggle for 60fps.
-                         * The overlay texture reallocation (up to 33MB at 4K)
-                         * stalls the pipeline, causing irrecoverable drift at
-                         * 1:1 pacing. A deferred seek resets timing cleanly. */
-                        if (ps.warm_reset_time == 0.0) {
+                        /* Schedule fresh two-phase warm-reset after fullscreen toggle.
+                         * ALWAYS reschedule — cancels any pending phase from the
+                         * initial warm-reset. The overlay texture reallocation stalls
+                         * for ~350ms; wait 2s for it to fully settle before phase 1. */
+                        {
                             AVStream *vst = ps.fmt_ctx->streams[ps.video_stream_idx];
                             double fps = (vst->avg_frame_rate.den > 0)
                                 ? av_q2d(vst->avg_frame_rate) : 0.0;
                             if (fps >= 48.0) {
-                                ps.warm_reset_time = get_time_sec() + 0.5;
+                                ps.warm_reset_time = get_time_sec() + 2.0;
                                 ps.warm_reset_phase = 0;
                             }
                         }
