@@ -1511,16 +1511,20 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Snap forward on extreme stall */
-            if (ps.frame_timer < now - 0.1) {
-                ps.frame_timer = now;
-                ps.diag_timer_snaps++;
-                /* Suppress log for the first-frame snap at file open (always
-                 * fires because decode pipeline takes >100ms to produce frame 1).
-                 * Only log mid-playback snaps which indicate real stalls. */
-                if (ps.video_clock > 0.5)
-                    log_msg("DIAG: frame_timer snapped forward "
-                            "(stall recovery at %.3fs)", ps.video_clock);
+            /* Snap forward on extreme stall.
+             * In 1:1 VSync mode, use a wider 500ms threshold — VSync handles
+             * pacing, so small drifts self-correct. The tight 100ms threshold
+             * fires on minor GPU hiccups and causes visible judder.
+             * In N:1 mode, keep the original 100ms for responsive catch-up. */
+            {
+                double snap_threshold = is_1to1 ? 0.5 : 0.1;
+                if (ps.frame_timer < now - snap_threshold) {
+                    ps.frame_timer = now;
+                    ps.diag_timer_snaps++;
+                    if (ps.video_clock > 0.5)
+                        log_msg("DIAG: frame_timer snapped forward "
+                                "(stall recovery at %.3fs)", ps.video_clock);
+                }
             }
 
             /* Display the last decoded frame via GPU */
