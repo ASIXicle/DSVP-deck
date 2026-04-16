@@ -582,8 +582,10 @@ int main(int argc, char *argv[]) {
                             AVStream *vst = ps.fmt_ctx->streams[ps.video_stream_idx];
                             double fps = (vst->avg_frame_rate.den > 0)
                                 ? av_q2d(vst->avg_frame_rate) : 0.0;
-                            if (fps >= 48.0)
+                            if (fps >= 48.0) {
                                 ps.warm_reset_time = get_time_sec() + 0.5;
+                                ps.warm_reset_phase = 0;
+                            }
                         }
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
@@ -1270,17 +1272,30 @@ int main(int argc, char *argv[]) {
         }
 
         /* ── Deferred warm-reset for 60fps content ──
-         * Must fire OUTSIDE the render block (like the P-key handler does)
-         * so that seek_recovering is set BEFORE any frame processing.
-         * Firing mid-render causes re-entrancy: frames consumed with stale
-         * timing before the seek resets it. */
+         * Two-phase reset mirrors the P-key cycle that Holden proved works:
+         * Phase 1: audio_close + audio_open + seek (like PASSTHROUGH transition)
+         * Phase 2: just seek (like PCM transition) — the SECOND seek after
+         *   audio reopen is what actually fixes the drift.
+         * The first seek after audio_open doesn't fully stabilize because
+         * seek_recovering from the reopen hasn't cleanly settled. */
         if (ps.warm_reset_time > 0.0 && get_time_sec() >= ps.warm_reset_time) {
-            ps.warm_reset_time = 0.0;
-            log_msg("DIAG: warm-reset at %.3fs (audio reopen + seek)",
-                    ps.video_clock);
-            audio_close(&ps);
-            audio_open(&ps);
-            player_seek(&ps, 0);
+            if (ps.warm_reset_phase == 0) {
+                /* Phase 1: audio reopen + seek */
+                log_msg("DIAG: warm-reset phase 1 at %.3fs (audio reopen + seek)",
+                        ps.video_clock);
+                audio_close(&ps);
+                audio_open(&ps);
+                player_seek(&ps, 0);
+                ps.warm_reset_phase = 1;
+                ps.warm_reset_time = get_time_sec() + 2.0;  /* schedule phase 2 */
+            } else {
+                /* Phase 2: just seek — stabilizes after audio stream settles */
+                log_msg("DIAG: warm-reset phase 2 at %.3fs (seek only)",
+                        ps.video_clock);
+                player_seek(&ps, 0);
+                ps.warm_reset_time = 0.0;
+                ps.warm_reset_phase = 0;
+            }
         }
 
         /* ── Render ── */
