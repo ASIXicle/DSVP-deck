@@ -588,7 +588,7 @@ int main(int argc, char *argv[]) {
                          * (~100-500ms), short enough residual drift stays
                          * bounded. Reuses the cold-start warm-reset site at
                          * the top of the main render loop. */
-                        ps.warm_reset_time = get_time_sec() + 0.8;
+                        ps.warm_reset_time = get_time_sec() + 1.2;
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
