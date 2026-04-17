@@ -7,31 +7,30 @@ BUILDDIR = build
 
 # ── Local dep discovery (SteamOS strips dev metadata on updates) ──
 # SDL3 and FFmpeg 8.1 are built from source into these prefixes on the Deck
-# and survive SteamOS updates (unlike /usr/lib/pkgconfig, which gets wiped).
-# pkg-config finds their .pc files via PKG_CONFIG_PATH; rpath (below) lets
-# the binary load the shared libs at runtime. Override on the make line
-# (e.g. `SDL3_LOCAL=/opt/sdl3 make`) if your paths differ.
+# and survive SteamOS updates (unlike /usr/include, which gets wiped).
+# We hardcode -I/-L rather than using pkg-config because SteamOS also
+# wipes /usr/lib/pkgconfig, leaving SDL3_ttf's transitive deps unresolvable
+# through pkg-config. Override on the make line if paths differ.
 SDL3_LOCAL   ?= /home/deck/sdl3-local
 FFMPEG_LOCAL ?= /home/deck/ffmpeg-8.1-local
-export PKG_CONFIG_PATH := $(SDL3_LOCAL)/lib/pkgconfig:$(FFMPEG_LOCAL)/lib/pkgconfig:$(PKG_CONFIG_PATH)
 
 # SteamOS keeps the system headers for SDL3_ttf's transitive deps (freetype,
-# harfbuzz, libpng, glib) but wipes their .pc files, so pkg-config can't
-# resolve the Requires chain from SDL3_ttf.pc. Inject the include paths
-# directly. Harmless on systems where pkg-config would have supplied them.
+# harfbuzz, libpng, glib) but wipes their .pc files. Inject the include
+# paths directly; harmless where they'd be resolved automatically.
 SYSTEM_FONT_CFLAGS = -I/usr/include/freetype2 -I/usr/include/harfbuzz -I/usr/include/libpng16 -I/usr/include/glib-2.0 -I/usr/lib/glib-2.0/include
 
 # ── Base flags (SDL3, FFmpeg) ──
-BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample) $(SYSTEM_FONT_CFLAGS)
-BASE_LDFLAGS = $(shell pkg-config --libs sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample) -lm -lz \
-               -Wl,-rpath,$(SDL3_LOCAL)/lib -Wl,-rpath,$(FFMPEG_LOCAL)/lib
+BASE_CFLAGS  = -Wall -Wextra -O2 \
+               -I$(SDL3_LOCAL)/include \
+               -I$(FFMPEG_LOCAL)/include \
+               $(SYSTEM_FONT_CFLAGS)
 
-# If pkg-config doesn't find SDL3_ttf, try sdl3-ttf
-ifeq ($(shell pkg-config --exists SDL3_ttf 2>/dev/null && echo yes),)
-  BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) $(SYSTEM_FONT_CFLAGS)
-  BASE_LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) -lm -lz \
-                 -Wl,-rpath,$(SDL3_LOCAL)/lib -Wl,-rpath,$(FFMPEG_LOCAL)/lib
-endif
+BASE_LDFLAGS = -L$(SDL3_LOCAL)/lib -lSDL3_ttf -lSDL3 \
+               -L$(FFMPEG_LOCAL)/lib -lavformat -lavcodec -lswscale -lswresample -lavutil \
+               -Wl,-rpath,$(SDL3_LOCAL)/lib \
+               -Wl,-rpath,$(FFMPEG_LOCAL)/lib \
+               -Wl,--enable-new-dtags \
+               -lm -lz
 
 # ── SDL3_shadercross (bundled) ──
 SC_ROOT    = shadercross/SDL3_shadercross-3.0.0-linux-x64
