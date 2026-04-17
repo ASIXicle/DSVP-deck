@@ -554,20 +554,11 @@ int main(int argc, char *argv[]) {
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
-                    /* ── Fullscreen transition fix (deferred) ──
-                     * Windowed → fullscreen on KWin-Wayland leaves the Vulkan
-                     * swapchain in a bad state. Recreating it fixes the state,
-                     * BUT the recreation has to happen AFTER Wayland finishes
-                     * the window size transition. Firing it here (immediately
-                     * after SDL_SetWindowFullscreen) was proven to happen
-                     * before the resize — Wayland reports the 4K window size
-                     * ~25ms later (overlay alloc as proxy), and the premature
-                     * recreation binds to the still-windowed state.
-                     * Defer to the SDL_EVENT_WINDOW_RESIZED handler, which
-                     * fires once Wayland has confirmed the new size. */
-                    if (ps.fullscreen) {
-                        ps.fs_recreate_pending = 1;
-                    }
+                    /* Swapchain recreation (when needed) happens at the
+                     * settle-end warm-reset, see the fs_settle_until block
+                     * in the main render loop. Firing it here or on
+                     * WINDOW_RESIZED was proven ineffective. */
+
                     /* Returning to windowed: resize to current video's aspect ratio.
                      * Without this, opening a different-aspect file while fullscreen
                      * leaves the old window shape (stale black bars). */
@@ -669,23 +660,35 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_V:
-                    /* Manual swapchain-refresh debug hammer: single
-                     * SDL_SetGPUSwapchainParameters call with same VSYNC
-                     * mode. Tests whether SDL recreates the swapchain on
-                     * a same-mode call. If pressing V visibly fixes the
-                     * drift → SDL recreates on same mode, and the
-                     * deferred F-key fix could be simplified to one call.
-                     * If pressing V does nothing → SDL no-ops same-mode
-                     * calls and the double-toggle is required. */
+                    /* Manual MAILBOX/VSYNC present-mode toggle.
+                     * Kept as a debug lever for the fullscreen swapchain
+                     * bug — each press issues one
+                     * SDL_SetGPUSwapchainParameters call (different mode
+                     * from current), which triggers swapchain recreation.
+                     * Historically (April 17 session, mem-ecbece06ab51f06b),
+                     * pressing this shortly after a warm-reset was the
+                     * only reliable way to recover A/V drift when the
+                     * automatic fixes failed. Will be removed once the
+                     * automatic fix is confirmed working. */
                 {
-                    bool ok = SDL_SetGPUSwapchainParameters(
-                        gpu_device, window,
-                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                        SDL_GPU_PRESENTMODE_VSYNC);
-                    snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                             "Swapchain refresh (VSYNC, ok=%d)", ok);
-                    log_msg("Swapchain refresh (manual, single-call VSYNC=%d)",
-                            ok);
+                    int want_mailbox = !ps.present_mailbox;
+                    SDL_GPUPresentMode mode = want_mailbox
+                        ? SDL_GPU_PRESENTMODE_MAILBOX
+                        : SDL_GPU_PRESENTMODE_VSYNC;
+                    if (SDL_SetGPUSwapchainParameters(gpu_device, window,
+                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
+                        ps.present_mailbox = want_mailbox;
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Present: %s",
+                                 want_mailbox ? "MAILBOX" : "VSYNC");
+                        log_msg("Present mode: %s",
+                                want_mailbox ? "MAILBOX" : "VSYNC");
+                    } else {
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "MAILBOX not supported");
+                        log_msg("Present mode: MAILBOX not supported (%s)",
+                                SDL_GetError());
+                    }
                     ps.aud_osd_until = get_time_sec() + 2.0;
                     break;
                 }
@@ -929,23 +932,6 @@ int main(int argc, char *argv[]) {
                     ps.win_h = ev.window.data2;
                     log_msg("SDL_EVENT_WINDOW_RESIZED: %dx%d",
                             ev.window.data1, ev.window.data2);
-                    /* Deferred swapchain recreation for windowed→fullscreen
-                     * transition. See F-key handler for rationale. Fire on
-                     * the first resize after F-key set the pending flag. */
-                    if (ps.fs_recreate_pending) {
-                        bool ok_a = SDL_SetGPUSwapchainParameters(
-                            gpu_device, window,
-                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                            SDL_GPU_PRESENTMODE_MAILBOX);
-                        bool ok_b = SDL_SetGPUSwapchainParameters(
-                            gpu_device, window,
-                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                            SDL_GPU_PRESENTMODE_VSYNC);
-                        log_msg("FS-fix: deferred swapchain recreation "
-                                "(%dx%d, MAILBOX=%d VSYNC=%d)",
-                                ev.window.data1, ev.window.data2, ok_a, ok_b);
-                        ps.fs_recreate_pending = 0;
-                    }
                 break;
 
             /* ── Gamepad hotplug ── */
@@ -1654,6 +1640,26 @@ int main(int argc, char *argv[]) {
                 audio_close(&ps);
                 audio_open(&ps);
                 player_seek(&ps, 0);
+                /* Swapchain recreation ONLY when going into fullscreen.
+                 * Hypothesis: the drift recovery observed in the April 17
+                 * session (mem-ecbece06ab51f06b) was the combination of
+                 * warm-reset + swapchain mode-change in that order.
+                 * Neither alone has fixed the drift in any other test.
+                 * Guarded on ps.fullscreen because fs→windowed already
+                 * works correctly and we do not want to perturb its
+                 * already-healthy swapchain. */
+                if (ps.fullscreen) {
+                    bool ok_a = SDL_SetGPUSwapchainParameters(
+                        gpu_device, window,
+                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                        SDL_GPU_PRESENTMODE_MAILBOX);
+                    bool ok_b = SDL_SetGPUSwapchainParameters(
+                        gpu_device, window,
+                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                        SDL_GPU_PRESENTMODE_VSYNC);
+                    log_msg("FS-fix: post-warm-reset swapchain recreation "
+                            "(MAILBOX=%d VSYNC=%d)", ok_a, ok_b);
+                }
             }
 
             /* Display the last decoded frame via GPU */
