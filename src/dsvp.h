@@ -327,6 +327,7 @@ typedef struct PlayerState {
     int                 eof;              /* demuxer hit end of file    */
     int                 io_error;         /* demux thread hit I/O error (NFS loss etc.) */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
+    int                 fs_recreate_pending; /* 1 = F-key set, fire swapchain recreate on next WINDOW_RESIZED */
 
     /* ── Gamepad (steamdeck branch) ── */
     SDL_Gamepad        *gamepad;           /* first connected gamepad (NULL if none) */
