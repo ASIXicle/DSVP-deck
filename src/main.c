@@ -1535,10 +1535,21 @@ int main(int argc, char *argv[]) {
                     ps.audio_clock_sync = ps.video_clock;
                 }
             } else if (ps.fs_settle_until > 0.0) {
-                /* Settle period ended — do a final clean seek to re-sync */
+                /* Settle period ended — do a full warm-reset (audio_close +
+                 * audio_open + seek), not just a seek. The SDL3 audio stream
+                 * accumulates up to 3 seconds of samples during the settle
+                 * window that player_seek cannot flush — the demux thread
+                 * flushes libavcodec, but the SDL3 stream queue survives,
+                 * and those stale samples play out behind the new position,
+                 * producing persistent A/V drift that snap-forward can only
+                 * bound, not fix. Closing and reopening the stream drops
+                 * the queue. Matches the warm-reset path at line 1273.
+                 * (Per Wren, April 16: "audio stream buffers survive seek.") */
                 ps.fs_settle_until = 0.0;
-                log_msg("DIAG: VSync settle complete at %.3fs — final seek",
+                log_msg("DIAG: VSync settle complete at %.3fs — warm-reset",
                         ps.video_clock);
+                audio_close(&ps);
+                audio_open(&ps);
                 player_seek(&ps, 0);
             }
 
