@@ -554,10 +554,6 @@ int main(int argc, char *argv[]) {
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
-                    /* Swapchain recreation (when needed) happens at the
-                     * settle-end warm-reset, see the fs_settle_until block
-                     * in the main render loop. Firing it here or on
-                     * WINDOW_RESIZED was proven ineffective. */
 
                     /* Returning to windowed: resize to current video's aspect ratio.
                      * Without this, opening a different-aspect file while fullscreen
@@ -579,13 +575,20 @@ int main(int argc, char *argv[]) {
                     }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
-                        /* Lock frame_timer to wall-clock during VSync transition.
-                         * Wayland fullscreen toggles change the VSync source
-                         * (compositor → direct display). During the 2-3s transition,
-                         * VSync timing is disrupted, causing frame_timer drift.
-                         * Locking prevents drift accumulation; normal pacing
-                         * resumes once VSync stabilizes. */
-                        ps.fs_settle_until = get_time_sec() + 3.0;
+                        /* Schedule deferred warm-reset (audio reopen + seek).
+                         * Windowed→fullscreen 4K60 on Wayland/RADV triggers a
+                         * sustained ~30Hz swapchain-acquire period after the
+                         * transition. At 1:1 VSync pacing with drops disabled,
+                         * the micro-bias correction caps at ~4ms/s — far below
+                         * the ~500ms/s drift rate that halved consumption
+                         * generates. Only a full pipeline flush (audio close+
+                         * open + demux/codec flush + seek) realigns the clocks.
+                         *
+                         * Fires at T+0.8s: past Wayland's typical transition
+                         * (~100-500ms), short enough residual drift stays
+                         * bounded. Reuses the cold-start warm-reset site at
+                         * the top of the main render loop. */
+                        ps.warm_reset_time = get_time_sec() + 0.8;
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
@@ -1534,132 +1537,6 @@ int main(int argc, char *argv[]) {
                         log_msg("DIAG: frame_timer snapped forward "
                                 "(stall recovery at %.3fs)", ps.video_clock);
                 }
-            }
-
-            /* ── VSync settle: lock timing during fullscreen transition ──
-             * After F-key toggle, Wayland changes the VSync source. During the
-             * 2-3s transition, frame presentation timing is erratic. Lock
-             * frame_timer to wall-clock and continuously re-sync audio clocks
-             * to prevent drift accumulation. */
-            /* DIAG instrumentation — TEMPORARY. Delete when the settle's
-             * root-cause question is closed. Captures main-loop iter time,
-             * decode/display rate, audio-clock race (pre-overwrite value),
-             * and SDL audio queue depth across the 3-second settle window. */
-            static double diag_settle_start  = 0.0;
-            static double diag_last_log      = 0.0;
-            static double diag_max_iter_ms   = 0.0;
-            static double diag_last_iter     = 0.0;
-            static int    diag_iter_count    = 0;
-            static int    diag_dec_start     = 0;
-            static int    diag_disp_start    = 0;
-
-            if (ps.fs_settle_until > 0.0 && now < ps.fs_settle_until) {
-                /* First iteration of this settle: init diag state */
-                if (diag_settle_start == 0.0) {
-                    diag_settle_start = now;
-                    diag_last_log     = now;
-                    diag_last_iter    = now;
-                    diag_max_iter_ms  = 0.0;
-                    diag_iter_count   = 0;
-                    diag_dec_start    = ps.diag_frames_decoded;
-                    diag_disp_start   = ps.diag_frames_displayed;
-                    int q = ps.audio_stream
-                        ? SDL_GetAudioStreamQueued(ps.audio_stream) : 0;
-                    log_msg("DIAG settle START: video=%.3f audio=%.3f "
-                            "audio_sync=%.3f queued=%d",
-                            ps.video_clock, ps.audio_clock,
-                            ps.audio_clock_sync, q);
-                }
-
-                /* Track per-iteration wall-time delta (reveals GPU stalls) */
-                double iter_ms = (now - diag_last_iter) * 1000.0;
-                if (iter_ms > diag_max_iter_ms) diag_max_iter_ms = iter_ms;
-                diag_last_iter = now;
-                diag_iter_count++;
-
-                /* Snapshot audio_clock_sync BEFORE the main-thread overwrite.
-                 * The audio callback (in audio.c) also writes this field on
-                 * its own thread — capturing here reveals the race that the
-                 * overwrite was intended to mask. */
-                double audio_sync_pre = ps.audio_clock_sync;
-
-                /* Existing force-set (unchanged) */
-                ps.frame_timer = now;
-                if (ps.audio_stream) {
-                    ps.audio_clock      = ps.video_clock;
-                    ps.audio_clock_sync = ps.video_clock;
-                }
-
-                /* Periodic snapshot every 250ms of wall time */
-                if (now - diag_last_log > 0.25) {
-                    double elapsed = now - diag_settle_start;
-                    int queued = ps.audio_stream
-                        ? SDL_GetAudioStreamQueued(ps.audio_stream) : 0;
-                    double dec_fps = (elapsed > 0.001)
-                        ? (ps.diag_frames_decoded - diag_dec_start) / elapsed
-                        : 0.0;
-                    double disp_fps = (elapsed > 0.001)
-                        ? (ps.diag_frames_displayed - diag_disp_start) / elapsed
-                        : 0.0;
-                    log_msg("DIAG settle t=%.2fs: iter_peak=%.1fms iters=%d "
-                            "video=%.3f audio_raw=%.3f audio_sync_pre=%.3f "
-                            "queued=%d dec_fps=%.1f disp_fps=%.1f",
-                            elapsed, diag_max_iter_ms, diag_iter_count,
-                            ps.video_clock, ps.audio_clock, audio_sync_pre,
-                            queued, dec_fps, disp_fps);
-                    diag_last_log    = now;
-                    diag_max_iter_ms = 0.0;  /* rolling peak per 250ms window */
-                }
-            } else if (ps.fs_settle_until > 0.0) {
-                /* Settle summary before the warm-reset clears state */
-                if (diag_settle_start > 0.0) {
-                    double total = now - diag_settle_start;
-                    int decoded  = ps.diag_frames_decoded - diag_dec_start;
-                    int displayed = ps.diag_frames_displayed - diag_disp_start;
-                    log_msg("DIAG settle SUMMARY: dur=%.3fs iters=%d "
-                            "decoded=%d(%.1ffps) displayed=%d(%.1ffps)",
-                            total, diag_iter_count,
-                            decoded,   total > 0.001 ? decoded / total   : 0.0,
-                            displayed, total > 0.001 ? displayed / total : 0.0);
-                    diag_settle_start = 0.0;  /* rearm for next F-key */
-                }
-
-                /* Settle period ended — do a full warm-reset (audio_close +
-                 * audio_open + seek), not just a seek. The SDL3 audio stream
-                 * accumulates up to 3 seconds of samples during the settle
-                 * window that player_seek cannot flush — the demux thread
-                 * flushes libavcodec, but the SDL3 stream queue survives,
-                 * and those stale samples play out behind the new position,
-                 * producing persistent A/V drift that snap-forward can only
-                 * bound, not fix. Closing and reopening the stream drops
-                 * the queue. Matches the warm-reset path at line 1273.
-                 * (Per Wren, April 16: "audio stream buffers survive seek.") */
-                ps.fs_settle_until = 0.0;
-                /* Clear any pending cold-start warm-reset to prevent
-                 * double-firing when F-key is pressed before the
-                 * cold-start deadline. Otherwise the cold-start
-                 * warm-reset fires ~100ms after this settle-end one,
-                 * and two audio_close/audio_open cycles in quick
-                 * succession disrupt pipeline reconstitution. */
-                ps.warm_reset_time = 0.0;
-                log_msg("DIAG: VSync settle complete at %.3fs — warm-reset (back-seek)",
-                        ps.video_clock);
-                audio_close(&ps);
-                audio_open(&ps);
-                /* Back-seek 3 seconds instead of seek-to-current.
-                 * Must exceed the 3-second settle window to land in
-                 * the pre-F-key clean region regardless of keyframe
-                 * alignment (AVSEEK_FLAG_BACKWARD rounds further back
-                 * to the nearest earlier keyframe, so effective
-                 * displacement is always >= the requested amount).
-                 * Evidence (April 17 session): -1.0 was insufficient
-                 * — landed inside the settle window's bad state and
-                 * drift continued. Manual seek with displacement ~-3.4s
-                 * cleaned the drift immediately in the same run.
-                 * If this 3s back-seek is visually too noticeable,
-                 * tune down to 2.0 (still outside the settle window
-                 * as long as settle duration is kept at 3s). */
-                player_seek(&ps, -3.0);
             }
 
             /* Display the last decoded frame via GPU */
