@@ -552,8 +552,68 @@ int main(int argc, char *argv[]) {
                     if (ps.playing && !ps.paused && ps.audio_stream)
                         SDL_PauseAudioStreamDevice(ps.audio_stream);
                     ps.fullscreen = !ps.fullscreen;
-                    SDL_SetWindowFullscreen(window,
-                        ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+
+                    /* ── EXCLUSIVE FULLSCREEN (Holden's day-1 intuition) ──
+                     * SDL_WINDOW_FULLSCREEN alone defaults to BORDERLESS
+                     * desktop-mode fullscreen (per SDL3 docs). Every prior
+                     * test this week was borderless. Exclusive fullscreen
+                     * — via SDL_SetWindowFullscreenMode(window, &mode)
+                     * with a concrete SDL_DisplayMode — hands display
+                     * control directly to the app, bypassing KWin's
+                     * compositor path entirely. If the 4K60 windowed→
+                     * fullscreen drift comes from the compositor's
+                     * handling of the transition, exclusive fullscreen
+                     * should route around it.
+                     *
+                     * On entry to fullscreen: pick the display mode
+                     * matching the current desktop (w, h, refresh_rate)
+                     * and set it before the fullscreen toggle. On exit:
+                     * clear the mode (NULL) to return to borderless
+                     * desktop behavior, which is harmless for the
+                     * windowed path. */
+                    if (ps.fullscreen) {
+                        SDL_DisplayID disp = SDL_GetDisplayForWindow(window);
+                        if (disp == 0) disp = SDL_GetPrimaryDisplay();
+                        const SDL_DisplayMode *cur =
+                            SDL_GetCurrentDisplayMode(disp);
+                        int mode_count = 0;
+                        SDL_DisplayMode **modes =
+                            SDL_GetFullscreenDisplayModes(disp, &mode_count);
+                        const SDL_DisplayMode *chosen = NULL;
+                        if (cur && modes) {
+                            /* Exact match on w/h/refresh, then w/h only */
+                            for (int i = 0; i < mode_count && !chosen; i++) {
+                                if (modes[i]->w == cur->w &&
+                                    modes[i]->h == cur->h &&
+                                    modes[i]->refresh_rate == cur->refresh_rate)
+                                    chosen = modes[i];
+                            }
+                            for (int i = 0; i < mode_count && !chosen; i++) {
+                                if (modes[i]->w == cur->w &&
+                                    modes[i]->h == cur->h)
+                                    chosen = modes[i];
+                            }
+                        }
+                        bool mode_ok = false;
+                        if (chosen) {
+                            mode_ok = SDL_SetWindowFullscreenMode(window, chosen);
+                            log_msg("FS-exclusive: mode %dx%d@%.3fHz set=%d",
+                                    chosen->w, chosen->h,
+                                    chosen->refresh_rate, mode_ok);
+                        } else {
+                            log_msg("FS-exclusive: no matching mode found "
+                                    "(have %d modes), falling back to borderless",
+                                    mode_count);
+                        }
+                        if (modes) SDL_free(modes);
+                        SDL_SetWindowFullscreen(window, true);
+                    } else {
+                        /* Return to borderless desktop behavior for
+                         * subsequent windowed→fs cycles. NULL means
+                         * "use desktop mode" per SDL3 docs. */
+                        SDL_SetWindowFullscreenMode(window, NULL);
+                        SDL_SetWindowFullscreen(window, false);
+                    }
 
                     /* Returning to windowed: resize to current video's aspect ratio.
                      * Without this, opening a different-aspect file while fullscreen
@@ -576,18 +636,11 @@ int main(int argc, char *argv[]) {
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
                         /* Schedule deferred warm-reset (audio reopen + seek).
-                         * Windowed→fullscreen 4K60 on Wayland/RADV triggers a
-                         * sustained ~30Hz swapchain-acquire period after the
-                         * transition. At 1:1 VSync pacing with drops disabled,
-                         * the micro-bias correction caps at ~4ms/s — far below
-                         * the ~500ms/s drift rate that halved consumption
-                         * generates. Only a full pipeline flush (audio close+
-                         * open + demux/codec flush + seek) realigns the clocks.
-                         *
-                         * Fires at T+0.8s: past Wayland's typical transition
-                         * (~100-500ms), short enough residual drift stays
-                         * bounded. Reuses the cold-start warm-reset site at
-                         * the top of the main render loop. */
+                         * KEPT as safety net while exclusive fullscreen is
+                         * being validated. If exclusive fullscreen fixes
+                         * the drift on its own, remove this (and the
+                         * warm_reset_time field if unused elsewhere).
+                         * Currently T+1.6s per 4th-instance tuning. */
                         ps.warm_reset_time = get_time_sec() + 1.6;
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
