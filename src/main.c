@@ -1635,25 +1635,31 @@ int main(int argc, char *argv[]) {
                  * the queue. Matches the warm-reset path at line 1273.
                  * (Per Wren, April 16: "audio stream buffers survive seek.") */
                 ps.fs_settle_until = 0.0;
+                /* Clear any pending cold-start warm-reset to prevent
+                 * double-firing when F-key is pressed before the
+                 * cold-start deadline. Otherwise the cold-start
+                 * warm-reset fires ~100ms after this settle-end one,
+                 * and two audio_close/audio_open cycles in quick
+                 * succession disrupt pipeline reconstitution. */
+                ps.warm_reset_time = 0.0;
                 log_msg("DIAG: VSync settle complete at %.3fs — warm-reset (back-seek)",
                         ps.video_clock);
                 audio_close(&ps);
                 audio_open(&ps);
-                /* Back-seek 1 second instead of seek-to-current.
-                 * Evidence (April 17 session): every attempt to fix the
-                 * fullscreen drift via SDL_SetGPUSwapchainParameters at
-                 * this timing either had no effect or actively worsened
-                 * the pipeline (200+ ms video stall from resource orphan
-                 * when the recreation fires ~100ms post-warm-reset).
-                 * Meanwhile a manual seek-BACK by ~23s at 66705.682
-                 * cleanly recovered A/V to near-zero in the same run
-                 * where every swapchain variant had failed.
-                 * Seeking to current position (incr=0) lets the demuxer
-                 * short-circuit if the target keyframe is already loaded.
-                 * A real negative displacement forces AVSEEK_FLAG_BACKWARD
-                 * and a genuine demux/decode restart. One second is the
-                 * smallest value we expect to be enough; tune if needed. */
-                player_seek(&ps, -1.0);
+                /* Back-seek 3 seconds instead of seek-to-current.
+                 * Must exceed the 3-second settle window to land in
+                 * the pre-F-key clean region regardless of keyframe
+                 * alignment (AVSEEK_FLAG_BACKWARD rounds further back
+                 * to the nearest earlier keyframe, so effective
+                 * displacement is always >= the requested amount).
+                 * Evidence (April 17 session): -1.0 was insufficient
+                 * — landed inside the settle window's bad state and
+                 * drift continued. Manual seek with displacement ~-3.4s
+                 * cleaned the drift immediately in the same run.
+                 * If this 3s back-seek is visually too noticeable,
+                 * tune down to 2.0 (still outside the settle window
+                 * as long as settle duration is kept at 3s). */
+                player_seek(&ps, -3.0);
             }
 
             /* Display the last decoded frame via GPU */
