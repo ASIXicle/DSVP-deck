@@ -1528,13 +1528,89 @@ int main(int argc, char *argv[]) {
              * 2-3s transition, frame presentation timing is erratic. Lock
              * frame_timer to wall-clock and continuously re-sync audio clocks
              * to prevent drift accumulation. */
+            /* DIAG instrumentation — TEMPORARY. Delete when the settle's
+             * root-cause question is closed. Captures main-loop iter time,
+             * decode/display rate, audio-clock race (pre-overwrite value),
+             * and SDL audio queue depth across the 3-second settle window. */
+            static double diag_settle_start  = 0.0;
+            static double diag_last_log      = 0.0;
+            static double diag_max_iter_ms   = 0.0;
+            static double diag_last_iter     = 0.0;
+            static int    diag_iter_count    = 0;
+            static int    diag_dec_start     = 0;
+            static int    diag_disp_start    = 0;
+
             if (ps.fs_settle_until > 0.0 && now < ps.fs_settle_until) {
+                /* First iteration of this settle: init diag state */
+                if (diag_settle_start == 0.0) {
+                    diag_settle_start = now;
+                    diag_last_log     = now;
+                    diag_last_iter    = now;
+                    diag_max_iter_ms  = 0.0;
+                    diag_iter_count   = 0;
+                    diag_dec_start    = ps.diag_frames_decoded;
+                    diag_disp_start   = ps.diag_frames_displayed;
+                    int q = ps.audio_stream
+                        ? SDL_GetAudioStreamQueued(ps.audio_stream) : 0;
+                    log_msg("DIAG settle START: video=%.3f audio=%.3f "
+                            "audio_sync=%.3f queued=%d",
+                            ps.video_clock, ps.audio_clock,
+                            ps.audio_clock_sync, q);
+                }
+
+                /* Track per-iteration wall-time delta (reveals GPU stalls) */
+                double iter_ms = (now - diag_last_iter) * 1000.0;
+                if (iter_ms > diag_max_iter_ms) diag_max_iter_ms = iter_ms;
+                diag_last_iter = now;
+                diag_iter_count++;
+
+                /* Snapshot audio_clock_sync BEFORE the main-thread overwrite.
+                 * The audio callback (in audio.c) also writes this field on
+                 * its own thread — capturing here reveals the race that the
+                 * overwrite was intended to mask. */
+                double audio_sync_pre = ps.audio_clock_sync;
+
+                /* Existing force-set (unchanged) */
                 ps.frame_timer = now;
                 if (ps.audio_stream) {
                     ps.audio_clock      = ps.video_clock;
                     ps.audio_clock_sync = ps.video_clock;
                 }
+
+                /* Periodic snapshot every 250ms of wall time */
+                if (now - diag_last_log > 0.25) {
+                    double elapsed = now - diag_settle_start;
+                    int queued = ps.audio_stream
+                        ? SDL_GetAudioStreamQueued(ps.audio_stream) : 0;
+                    double dec_fps = (elapsed > 0.001)
+                        ? (ps.diag_frames_decoded - diag_dec_start) / elapsed
+                        : 0.0;
+                    double disp_fps = (elapsed > 0.001)
+                        ? (ps.diag_frames_displayed - diag_disp_start) / elapsed
+                        : 0.0;
+                    log_msg("DIAG settle t=%.2fs: iter_peak=%.1fms iters=%d "
+                            "video=%.3f audio_raw=%.3f audio_sync_pre=%.3f "
+                            "queued=%d dec_fps=%.1f disp_fps=%.1f",
+                            elapsed, diag_max_iter_ms, diag_iter_count,
+                            ps.video_clock, ps.audio_clock, audio_sync_pre,
+                            queued, dec_fps, disp_fps);
+                    diag_last_log    = now;
+                    diag_max_iter_ms = 0.0;  /* rolling peak per 250ms window */
+                }
             } else if (ps.fs_settle_until > 0.0) {
+                /* Settle summary before the warm-reset clears state */
+                if (diag_settle_start > 0.0) {
+                    double total = now - diag_settle_start;
+                    int decoded  = ps.diag_frames_decoded - diag_dec_start;
+                    int displayed = ps.diag_frames_displayed - diag_disp_start;
+                    log_msg("DIAG settle SUMMARY: dur=%.3fs iters=%d "
+                            "decoded=%d(%.1ffps) displayed=%d(%.1ffps)",
+                            total, diag_iter_count,
+                            decoded,   total > 0.001 ? decoded / total   : 0.0,
+                            displayed, total > 0.001 ? displayed / total : 0.0);
+                    diag_settle_start = 0.0;  /* rearm for next F-key */
+                }
+
                 /* Settle period ended — do a full warm-reset (audio_close +
                  * audio_open + seek), not just a seek. The SDL3 audio stream
                  * accumulates up to 3 seconds of samples during the settle
