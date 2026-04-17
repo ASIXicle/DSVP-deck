@@ -635,13 +635,13 @@ int main(int argc, char *argv[]) {
                     }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
-                        /* Schedule deferred warm-reset (audio reopen + seek).
-                         * KEPT as safety net while exclusive fullscreen is
-                         * being validated. If exclusive fullscreen fixes
-                         * the drift on its own, remove this (and the
-                         * warm_reset_time field if unused elsewhere).
-                         * Currently T+1.6s per 4th-instance tuning. */
-                        ps.warm_reset_time = get_time_sec() + 1.6;
+                        /* ISOLATION TEST (Knot, April 17): F-key
+                         * warm-reset scheduler disabled. Exclusive-
+                         * fullscreen may make this redundant. Restore
+                         * by uncommenting if drift reappears. */
+                        /* ps.warm_reset_time = get_time_sec() + 1.6; */
+                        log_msg("ISO-TEST: F-key warm-reset NEUTERED "
+                                "(fullscreen=%d)", ps.fullscreen);
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
