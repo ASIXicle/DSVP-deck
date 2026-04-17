@@ -574,62 +574,34 @@ int main(int argc, char *argv[]) {
                     if (ps.fullscreen) {
                         SDL_DisplayID disp = SDL_GetDisplayForWindow(window);
                         if (disp == 0) disp = SDL_GetPrimaryDisplay();
+                        const SDL_DisplayMode *cur =
+                            SDL_GetCurrentDisplayMode(disp);
                         int mode_count = 0;
                         SDL_DisplayMode **modes =
                             SDL_GetFullscreenDisplayModes(disp, &mode_count);
                         const SDL_DisplayMode *chosen = NULL;
-
-                        /* Log the full available-mode list on first F-key
-                         * per session. Useful for diagnosing resolution
-                         * reporting on DPI-scaled setups (SteamOS 200%
-                         * scale reports logical mode via
-                         * SDL_GetCurrentDisplayMode, not physical).
-                         * Cheap enough to run every F-key. */
-                        if (modes) {
-                            for (int i = 0; i < mode_count; i++) {
-                                log_msg("FS-exclusive: avail[%d] %dx%d@%.3fHz "
-                                        "pixel_density=%.2f",
-                                        i, modes[i]->w, modes[i]->h,
-                                        modes[i]->refresh_rate,
-                                        modes[i]->pixel_density);
-                            }
-                        }
-
-                        /* Prefer the HIGHEST-RESOLUTION mode at ~60Hz.
-                         * SDL_GetCurrentDisplayMode returns LOGICAL size
-                         * under DPI scaling (e.g. 1920x1080 on a 200%-
-                         * scaled 4K desktop), which would make us pick
-                         * a half-resolution mode and let Wayland upscale
-                         * — defeating the point of reference-quality
-                         * rendering. Iterate modes and pick the largest
-                         * w*h at a refresh rate matching user content
-                         * (48-144Hz). Within that, take the highest
-                         * refresh rate. */
-                        if (modes && mode_count > 0) {
-                            long long best_pixels = 0;
-                            float best_rate = 0.0f;
-                            for (int i = 0; i < mode_count; i++) {
-                                float r = modes[i]->refresh_rate;
-                                if (r < 48.0f || r > 144.0f) continue;
-                                long long px = (long long)modes[i]->w
-                                             * (long long)modes[i]->h;
-                                if (px > best_pixels ||
-                                   (px == best_pixels && r > best_rate)) {
-                                    best_pixels = px;
-                                    best_rate = r;
+                        if (cur && modes) {
+                            /* Exact match on w/h/refresh, then w/h only */
+                            for (int i = 0; i < mode_count && !chosen; i++) {
+                                if (modes[i]->w == cur->w &&
+                                    modes[i]->h == cur->h &&
+                                    modes[i]->refresh_rate == cur->refresh_rate)
                                     chosen = modes[i];
-                                }
+                            }
+                            for (int i = 0; i < mode_count && !chosen; i++) {
+                                if (modes[i]->w == cur->w &&
+                                    modes[i]->h == cur->h)
+                                    chosen = modes[i];
                             }
                         }
-
                         bool mode_ok = false;
                         if (chosen) {
                             mode_ok = SDL_SetWindowFullscreenMode(window, chosen);
-                            log_msg("FS-exclusive: chose %dx%d@%.3fHz set=%d",
+                            log_msg("FS-exclusive: mode %dx%d@%.3fHz set=%d",
                                     chosen->w, chosen->h,
                                     chosen->refresh_rate, mode_ok);
                         } else {
-                            log_msg("FS-exclusive: no suitable mode found "
+                            log_msg("FS-exclusive: no matching mode found "
                                     "(have %d modes), falling back to borderless",
                                     mode_count);
                         }
@@ -662,6 +634,7 @@ int main(int argc, char *argv[]) {
                         SDL_SetWindowSize(window, w, h);
                     }
                     if (ps.playing) {
+                        ps.frame_timer = get_time_sec();
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }

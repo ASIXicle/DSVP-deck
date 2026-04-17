@@ -1544,13 +1544,15 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
             width, height, (get_time_sec() - alloc_start) * 1000.0);
 
     /* Resume audio after GPU allocation. Do NOT force-set audio_clock /
-     * audio_clock_sync OR frame_timer — those are lies-to-the-clock that
-     * cause ~50ms bias accumulation per window-resize event when the
-     * audio callback thread has been running normally during the 1-11ms
-     * alloc. Let all clocks continue from their real values; 1-11ms is
-     * below the vsync window and will self-correct naturally. */
-    if (ps->playing && was_audio_playing && ps->audio_stream) {
-        SDL_ResumeAudioStreamDevice(ps->audio_stream);
+     * audio_clock_sync — that's a lie-to-the-clock that causes ~70ms
+     * drift per window-resize event when the audio callback thread has
+     * been running normally during the 1-11ms alloc. Let the callback
+     * keep writing its own clock truth; frame_timer bump alone is enough. */
+    if (ps->playing) {
+        ps->frame_timer = get_time_sec();
+        if (was_audio_playing && ps->audio_stream) {
+            SDL_ResumeAudioStreamDevice(ps->audio_stream);
+        }
     }
 
     return 0;
