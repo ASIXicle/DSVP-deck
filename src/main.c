@@ -1292,25 +1292,6 @@ int main(int argc, char *argv[]) {
             player_seek(&ps, 0);
         }
 
-        /* ── Deferred VSYNC restore after settle-end MAILBOX recreation ──
-         * Paired with the single MAILBOX call in the settle-end else-if
-         * block. After 1.5s of MAILBOX (enough for the swapchain to heal
-         * without hitting the microsecond double-call stall), switch
-         * back to VSYNC. Only fires if still in fullscreen — if the user
-         * has already toggled out of fullscreen, the windowed swapchain
-         * is fine and we should not touch it. */
-        if (ps.vsync_restore_at > 0.0 && get_time_sec() >= ps.vsync_restore_at) {
-            if (ps.fullscreen) {
-                bool ok = SDL_SetGPUSwapchainParameters(
-                    gpu_device, window,
-                    SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                    SDL_GPU_PRESENTMODE_VSYNC);
-                ps.present_mailbox = ok ? 0 : ps.present_mailbox;
-                log_msg("FS-fix: deferred VSYNC restore (ok=%d)", ok);
-            }
-            ps.vsync_restore_at = 0.0;
-        }
-
         /* ── Render ── */
         if (ps.playing && !ps.paused) {
             /* Decode pending subtitles (still queued for Phase 2) */
@@ -1654,39 +1635,25 @@ int main(int argc, char *argv[]) {
                  * the queue. Matches the warm-reset path at line 1273.
                  * (Per Wren, April 16: "audio stream buffers survive seek.") */
                 ps.fs_settle_until = 0.0;
-                log_msg("DIAG: VSync settle complete at %.3fs — warm-reset",
+                log_msg("DIAG: VSync settle complete at %.3fs — warm-reset (back-seek)",
                         ps.video_clock);
                 audio_close(&ps);
                 audio_open(&ps);
-                player_seek(&ps, 0);
-                /* Swapchain recreation ONLY when going into fullscreen.
-                 * The April 17 evidence is definitive:
-                 *   - SINGLE SDL_SetGPUSwapchainParameters call (different
-                 *     mode from current) fixes the fullscreen drift.
-                 *   - TWO back-to-back calls in microseconds (MAILBOX→VSYNC
-                 *     double-toggle, patch 3 variant) produce a 200ms
-                 *     video stall and prolonged snap-forward cascade — the
-                 *     second call tears down the first recreation before
-                 *     the new swapchain stabilizes, leaving the pipeline
-                 *     worse off than not calling at all.
-                 * Fix: single call to MAILBOX here. Pipeline heals over
-                 * the next ~1 second. Then, via the deferred deadline
-                 * check near the start of the main loop, switch back to
-                 * VSYNC (user's perceptual preference). The wall-time
-                 * gap between the two calls must exceed the microsecond
-                 * window that causes the resource-orphan stall — 1.5s
-                 * is well clear of that and short enough to be
-                 * imperceptible. */
-                if (ps.fullscreen) {
-                    bool ok = SDL_SetGPUSwapchainParameters(
-                        gpu_device, window,
-                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                        SDL_GPU_PRESENTMODE_MAILBOX);
-                    ps.present_mailbox = ok ? 1 : ps.present_mailbox;
-                    ps.vsync_restore_at = ok ? (get_time_sec() + 1.5) : 0.0;
-                    log_msg("FS-fix: post-warm-reset single MAILBOX call "
-                            "(ok=%d, VSYNC restore @+1.5s)", ok);
-                }
+                /* Back-seek 1 second instead of seek-to-current.
+                 * Evidence (April 17 session): every attempt to fix the
+                 * fullscreen drift via SDL_SetGPUSwapchainParameters at
+                 * this timing either had no effect or actively worsened
+                 * the pipeline (200+ ms video stall from resource orphan
+                 * when the recreation fires ~100ms post-warm-reset).
+                 * Meanwhile a manual seek-BACK by ~23s at 66705.682
+                 * cleanly recovered A/V to near-zero in the same run
+                 * where every swapchain variant had failed.
+                 * Seeking to current position (incr=0) lets the demuxer
+                 * short-circuit if the target keyframe is already loaded.
+                 * A real negative displacement forces AVSEEK_FLAG_BACKWARD
+                 * and a genuine demux/decode restart. One second is the
+                 * smallest value we expect to be enough; tune if needed. */
+                player_seek(&ps, -1.0);
             }
 
             /* Display the last decoded frame via GPU */

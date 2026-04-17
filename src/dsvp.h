@@ -328,7 +328,6 @@ typedef struct PlayerState {
     int                 io_error;         /* demux thread hit I/O error (NFS loss etc.) */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
     int                 present_mailbox;  /* 0 = VSYNC (FIFO), 1 = MAILBOX (triple-buf) — V-key toggle state */
-    double              vsync_restore_at; /* wall-time deadline to restore VSYNC after FS settle-end MAILBOX call; 0 = disarmed */
 
     /* ── Gamepad (steamdeck branch) ── */
     SDL_Gamepad        *gamepad;           /* first connected gamepad (NULL if none) */
