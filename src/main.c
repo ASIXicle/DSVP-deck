@@ -554,6 +554,37 @@ int main(int argc, char *argv[]) {
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+                    /* ── Fullscreen transition fix ──
+                     * Windowed → fullscreen on KWin-Wayland leaves the Vulkan
+                     * swapchain in a bad state that presents at ~30fps at 4K
+                     * instead of 60fps. Empirically (multiple logs, April 17),
+                     * any SDL_SetGPUSwapchainParameters call triggers
+                     * swapchain recreation, which fixes the state. Once
+                     * recreated, the new swapchain presents correctly at
+                     * 60fps for the remainder of the session.
+                     * Fix: double-toggle present mode through MAILBOX and
+                     * back to VSYNC. End state is VSYNC (perceptually far
+                     * superior — reference-quality pacing). The MAILBOX
+                     * intermediate is imperceptibly brief (one API call).
+                     * This is the immediate-recreation variant. If the
+                     * Wayland fullscreen transition hasn't completed when
+                     * these calls fire, the recreation may happen against
+                     * a still-windowed window state and not fix it — in
+                     * that case the diag log will show no improvement and
+                     * we defer the calls (to fs_settle_until end or to a
+                     * SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED handler). */
+                    if (ps.fullscreen) {
+                        bool ok_a = SDL_SetGPUSwapchainParameters(
+                            gpu_device, window,
+                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                            SDL_GPU_PRESENTMODE_MAILBOX);
+                        bool ok_b = SDL_SetGPUSwapchainParameters(
+                            gpu_device, window,
+                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                            SDL_GPU_PRESENTMODE_VSYNC);
+                        log_msg("FS-fix: swapchain recreation (MAILBOX=%d VSYNC=%d)",
+                                ok_a, ok_b);
+                    }
                     /* Returning to windowed: resize to current video's aspect ratio.
                      * Without this, opening a different-aspect file while fullscreen
                      * leaves the old window shape (stale black bars). */
@@ -655,29 +686,27 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_V:
-                    /* Toggle VSync mode: FIFO (strict) ↔ MAILBOX (triple-buf).
-                     * MAILBOX prevents deadline-miss cascades at the cost of
-                     * occasional repeated frames instead of hard stalls.
-                     * Falls back if MAILBOX not supported (some Vulkan drivers). */
+                    /* Force swapchain recreation (VSYNC→MAILBOX→VSYNC).
+                     * Manual debug hammer. The F-key transition calls the
+                     * same sequence automatically; this key exists for cases
+                     * where the auto-fix misses (and during current testing
+                     * as a fallback). Stays in VSYNC end-state throughout —
+                     * MAILBOX is intermediate only, present mode is not a
+                     * user-facing setting. */
                 {
-                    int want_mailbox = !ps.present_mailbox;
-                    SDL_GPUPresentMode mode = want_mailbox
-                        ? SDL_GPU_PRESENTMODE_MAILBOX
-                        : SDL_GPU_PRESENTMODE_VSYNC;
-                    if (SDL_SetGPUSwapchainParameters(gpu_device, window,
-                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
-                        ps.present_mailbox = want_mailbox;
-                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "Present: %s",
-                                 want_mailbox ? "MAILBOX" : "VSYNC");
-                        log_msg("Present mode: %s",
-                                want_mailbox ? "MAILBOX" : "VSYNC");
-                    } else {
-                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "MAILBOX not supported");
-                        log_msg("Present mode: MAILBOX not supported (%s)",
-                                SDL_GetError());
-                    }
+                    bool ok_a = SDL_SetGPUSwapchainParameters(
+                        gpu_device, window,
+                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                        SDL_GPU_PRESENTMODE_MAILBOX);
+                    bool ok_b = SDL_SetGPUSwapchainParameters(
+                        gpu_device, window,
+                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                        SDL_GPU_PRESENTMODE_VSYNC);
+                    snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                             "Swapchain refresh%s",
+                             (ok_a && ok_b) ? "" : " (partial)");
+                    log_msg("Swapchain refresh (manual, MAILBOX=%d VSYNC=%d)",
+                            ok_a, ok_b);
                     ps.aud_osd_until = get_time_sec() + 2.0;
                     break;
                 }
