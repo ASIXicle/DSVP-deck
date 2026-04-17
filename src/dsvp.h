@@ -291,7 +291,6 @@ typedef struct PlayerState {
     int                 seek_request;     /* 1 = seek pending           */
     int                 seek_flags;
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
-    double              warm_reset_time;  /* wall-clock time to fire deferred seek (0 = none) */
     double              last_frame_wall;  /* wall-clock of last displayed frame */
     int                 audio_stalled;    /* 1 = audio paused due to video stall */
 
@@ -326,7 +325,6 @@ typedef struct PlayerState {
     int                 eof;              /* demuxer hit end of file    */
     int                 io_error;         /* demux thread hit I/O error (NFS loss etc.) */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
-    int                 present_mailbox;  /* 0 = VSYNC (FIFO), 1 = MAILBOX (triple-buf) — V-key toggle state */
 
     /* ── Gamepad (steamdeck branch) ── */
     SDL_Gamepad        *gamepad;           /* first connected gamepad (NULL if none) */

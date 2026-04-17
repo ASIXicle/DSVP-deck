@@ -1495,13 +1495,13 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     gpu_overlay_destroy(ps);
 
     /* Pause audio during GPU allocation — on shared-memory APUs, creating
-     * 33MB+ textures stalls the CPU for 200-350ms. Without this, audio
-     * advances during the stall while video is blocked, creating permanent
-     * A/V drift that manifests as a snap-forward cascade. */
+     * 33MB+ textures historically stalled the CPU for 200-350ms (pre
+     * exclusive-fullscreen fix). Post-fix, allocation is 1-11ms and the
+     * pause is effectively a no-op, but left in as cheap insurance against
+     * future regressions. */
     int was_audio_playing = (ps->playing && ps->audio_stream && !ps->paused);
     if (was_audio_playing) {
         SDL_PauseAudioStreamDevice(ps->audio_stream);
-        log_msg("GPU: audio PAUSED for overlay alloc (%dx%d)", width, height);
     }
     double alloc_start = get_time_sec();
 
@@ -1543,16 +1543,15 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     log_msg("GPU: overlay texture created (%dx%d RGBA, alloc %.0fms)",
             width, height, (get_time_sec() - alloc_start) * 1000.0);
 
-    /* Resume audio and re-sync after GPU stall */
+    /* Resume audio after GPU allocation. Do NOT force-set audio_clock /
+     * audio_clock_sync — that's a lie-to-the-clock that causes ~70ms
+     * drift per window-resize event when the audio callback thread has
+     * been running normally during the 1-11ms alloc. Let the callback
+     * keep writing its own clock truth; frame_timer bump alone is enough. */
     if (ps->playing) {
         ps->frame_timer = get_time_sec();
         if (was_audio_playing && ps->audio_stream) {
-            SDL_ClearAudioStream(ps->audio_stream);
-            ps->audio_clock      = ps->video_clock;
-            ps->audio_clock_sync = ps->video_clock;
             SDL_ResumeAudioStreamDevice(ps->audio_stream);
-            log_msg("GPU: audio RESUMED after overlay alloc (clocks synced to %.3fs)",
-                    ps->video_clock);
         }
     }
 
@@ -3035,21 +3034,6 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* ── Start decode thread ── */
     ps->decode_thread = SDL_CreateThread(decode_thread_func, "decode", ps);
-
-    /* ISOLATION TEST (Knot, April 17): cold-start warm-reset
-     * scheduler disabled. If exclusive-fullscreen is now the real
-     * fix, this was masking the old compositor bug and is dead code.
-     * Restore by uncommenting the scheduler block below. */
-    {
-        AVStream *vst = ps->fmt_ctx->streams[ps->video_stream_idx];
-        double fps = (vst->avg_frame_rate.den > 0)
-            ? av_q2d(vst->avg_frame_rate) : 0.0;
-        if (fps >= 48.0) {
-            /* ps->warm_reset_time = get_time_sec() + 4.0; */
-            log_msg("ISO-TEST: cold-start warm-reset NEUTERED (fps=%.2f)",
-                    fps);
-        }
-    }
 
     /* Build media info string */
     player_build_media_info(ps);

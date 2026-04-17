@@ -635,13 +635,6 @@ int main(int argc, char *argv[]) {
                     }
                     if (ps.playing) {
                         ps.frame_timer = get_time_sec();
-                        /* ISOLATION TEST (Knot, April 17): F-key
-                         * warm-reset scheduler disabled. Exclusive-
-                         * fullscreen may make this redundant. Restore
-                         * by uncommenting if drift reappears. */
-                        /* ps.warm_reset_time = get_time_sec() + 1.6; */
-                        log_msg("ISO-TEST: F-key warm-reset NEUTERED "
-                                "(fullscreen=%d)", ps.fullscreen);
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
@@ -714,40 +707,6 @@ int main(int argc, char *argv[]) {
                 case SDLK_S:
                     sub_cycle(&ps);
                     break;
-
-                case SDLK_V:
-                    /* Manual MAILBOX/VSYNC present-mode toggle.
-                     * Kept as a debug lever for the fullscreen swapchain
-                     * bug — each press issues one
-                     * SDL_SetGPUSwapchainParameters call (different mode
-                     * from current), which triggers swapchain recreation.
-                     * Historically (April 17 session, mem-ecbece06ab51f06b),
-                     * pressing this shortly after a warm-reset was the
-                     * only reliable way to recover A/V drift when the
-                     * automatic fixes failed. Will be removed once the
-                     * automatic fix is confirmed working. */
-                {
-                    int want_mailbox = !ps.present_mailbox;
-                    SDL_GPUPresentMode mode = want_mailbox
-                        ? SDL_GPU_PRESENTMODE_MAILBOX
-                        : SDL_GPU_PRESENTMODE_VSYNC;
-                    if (SDL_SetGPUSwapchainParameters(gpu_device, window,
-                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
-                        ps.present_mailbox = want_mailbox;
-                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "Present: %s",
-                                 want_mailbox ? "MAILBOX" : "VSYNC");
-                        log_msg("Present mode: %s",
-                                want_mailbox ? "MAILBOX" : "VSYNC");
-                    } else {
-                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "MAILBOX not supported");
-                        log_msg("Present mode: MAILBOX not supported (%s)",
-                                SDL_GetError());
-                    }
-                    ps.aud_osd_until = get_time_sec() + 2.0;
-                    break;
-                }
 
                 case SDLK_A:
                     audio_cycle(&ps);
@@ -1332,20 +1291,6 @@ int main(int argc, char *argv[]) {
                 browser_navigate(&ps, ps.dpad_held_dir);
                 ps.dpad_last_repeat = dnow;
             }
-        }
-
-        /* ── Deferred warm-reset for 60fps cold-start ──
-         * At file open, the decode pipeline takes a few seconds to reach
-         * steady state. Close/reopen the audio stream and seek to reset
-         * A/V sync once the pipeline is warm. The overlay stall drift is
-         * handled separately by pausing audio during gpu_overlay_ensure. */
-        if (ps.warm_reset_time > 0.0 && get_time_sec() >= ps.warm_reset_time) {
-            ps.warm_reset_time = 0.0;
-            log_msg("DIAG: warm-reset at %.3fs (audio reopen + seek)",
-                    ps.video_clock);
-            audio_close(&ps);
-            audio_open(&ps);
-            player_seek(&ps, 0);
         }
 
         /* ── Render ── */
