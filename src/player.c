@@ -3108,6 +3108,13 @@ void player_close(PlayerState *ps) {
         SDL_Delay(200);
     }
 
+    /* Force re-probe on next file open. After multiple HDMI profile
+     * toggles (release/restore cycles), the AMD HDA driver and PipeWire
+     * can accumulate state that causes bitstream static on subsequent
+     * files. Re-probing gets a fresh ELD read, fresh IEC958 mixer index,
+     * and fresh PipeWire card name — no stale state carries over. */
+    ps->bitstream_caps.probed = 0;
+
     /* Close subtitles */
     sub_close_codec(ps);
 
