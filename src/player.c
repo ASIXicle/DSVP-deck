@@ -3064,6 +3064,13 @@ void player_close(PlayerState *ps) {
 
     ps->quit = 1;
 
+    /* Join async audio switch thread if running */
+    if (ps->audio_switch_thread) {
+        SDL_WaitThread(ps->audio_switch_thread, NULL);
+        ps->audio_switch_thread = NULL;
+    }
+    ps->audio_switch_phase = 0;
+
     /* Signal queues to unblock any waiting threads */
     ps->video_pq.abort_request = 1;
     ps->audio_pq.abort_request = 1;

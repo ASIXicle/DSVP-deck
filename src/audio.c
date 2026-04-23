@@ -677,7 +677,11 @@ static void hdmi_restore(PlayerState *ps) {
              ps->bitstream_caps.pa_card_name, profile);
     log_msg("Bitstream: restoring HDMI — %s", cmd);
     system(cmd);
-    SDL_Delay(200);  /* give PipeWire time to reclaim the ALSA device */
+    SDL_Delay(500);  /* PipeWire needs ~750ms+ total (system() latency + this delay)
+                      * to fully reclaim the ALSA device after card profile restore.
+                      * Without this, SDL audio_open connects to a stale PipeWire
+                      * sink → silence on PCM return. Was 200ms, increased after
+                      * Dogma (TrueHD) testing showed PCM silence on mode switch. */
 }
 
 /* ── IEC 60958 AES3 sample rate code ──
@@ -1338,4 +1342,112 @@ void bitstream_stop(PlayerState *ps) {
     }
 
     log_msg("Bitstream: passthrough stopped");
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * bitstream_stop_immediate — Fast stop for async mode switch
+ *
+ * Does everything bitstream_stop does EXCEPT the HBR settle delay
+ * and hdmi_restore (pactl + PipeWire reclaim delay). Those slow
+ * steps are deferred to audio_switch_bg_func running on a background
+ * thread, so the main loop keeps rendering video during transitions.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+void bitstream_stop_immediate(PlayerState *ps) {
+    if (!ps->bitstream_active) return;
+
+    log_msg("Bitstream: stopping passthrough (async)");
+
+    /* Signal thread to exit and wake it from pq_get */
+    ps->bitstream_quit = 1;
+    ps->audio_pq.abort_request = 1;
+    SDL_SignalCondition(ps->audio_pq.cond);
+
+    if (ps->bitstream_thread) {
+        SDL_WaitThread(ps->bitstream_thread, NULL);
+        ps->bitstream_thread = NULL;
+    }
+
+    /* Close ALSA */
+    if (ps->alsa_pcm) {
+        snd_pcm_drop((snd_pcm_t *)ps->alsa_pcm);
+        snd_pcm_close((snd_pcm_t *)ps->alsa_pcm);
+        ps->alsa_pcm = NULL;
+    }
+
+    /* Close spdifenc */
+    if (ps->spdif_ctx) {
+        AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
+        av_write_trailer(spdif);
+        avformat_free_context(spdif);
+        ps->spdif_ctx = NULL;
+    }
+    if (ps->spdif_avio) {
+        AVIOContext *avio = (AVIOContext *)ps->spdif_avio;
+        avio_context_free(&avio);
+        ps->spdif_avio = NULL;
+    }
+
+    if (ps->spdif_buf) {
+        av_free(ps->spdif_buf);
+        ps->spdif_buf = NULL;
+    }
+    ps->spdif_buf_size = 0;
+    ps->spdif_write_pos = 0;
+
+    /* Remember if this was HBR before clearing state */
+    ps->audio_switch_hbr = (ps->bitstream_frame_bytes > 4);
+
+    ps->bitstream_active = 0;
+    ps->bitstream_quit = 0;
+    ps->bitstream_frames_written = 0;
+    ps->bitstream_wall_start = 0;
+
+    /* Reset clocks */
+    ps->audio_clock = ps->video_clock;
+    ps->audio_clock_sync = ps->video_clock;
+    ps->av_bias = 0.0;
+    ps->av_bias_samples = 0;
+
+    /* Reset abort so audio_pq works normally for PCM */
+    ps->audio_pq.abort_request = 0;
+
+    /* Reset IEC958 to PCM mode (fast, no delay needed) */
+    if (ps->bitstream_caps.alsa_device[0]) {
+        int card_num = 0, dev_num = 0;
+        sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
+        set_iec958_pcm(card_num, dev_num);
+    }
+
+    /* NOTE: hdmi_restore NOT called here — deferred to background thread */
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audio_switch_bg_func — Background thread for async mode switch
+ *
+ * Handles the slow parts: HBR settle delay and hdmi_restore (pactl +
+ * PipeWire reclaim delay). Sets audio_switch_phase = 2 when done so
+ * the main loop can complete the switch (audio_open + seek).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+int audio_switch_bg_func(void *arg) {
+    PlayerState *ps = (PlayerState *)arg;
+
+    /* HBR settle: AMD HDA + HDMI link need extra time after TrueHD 192kHz 8ch */
+    if (ps->audio_switch_hbr)
+        SDL_Delay(300);
+
+    /* Restore HDMI card profile so PipeWire reclaims the device */
+    if (ps->hdmi_released) {
+        hdmi_restore(ps);  /* includes pactl + 500ms delay */
+        ps->hdmi_released = 0;
+    }
+
+    log_msg("Bitstream: async restore complete — ready for audio_open");
+
+    /* Signal main loop to complete the switch */
+    ps->audio_switch_phase = 2;
+    return 0;
 }

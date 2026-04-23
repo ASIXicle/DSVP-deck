@@ -226,6 +226,20 @@ typedef struct PlayerState {
     int64_t             bitstream_frames_written; /* cumulative frames sent to ALSA   */
     int                 hdmi_released;   /* 1 = HDMI card profile set to off   */
 
+    /* ── Async audio mode switch ──
+     * P-key mode switch moves pactl + delays to a background thread
+     * so the main loop keeps rendering video during transitions.
+     * audio_switch_phase:
+     *   0 = idle
+     *   1 = background thread running (pactl + delay in progress)
+     *   2 = ready for completion (main loop finishes the switch)
+     */
+    int                 audio_switch_phase;
+    int                 audio_switch_to_mode;   /* target AudioMode */
+    int                 audio_switch_was_truehd; /* 1 = was TrueHD, need track switch */
+    int                 audio_switch_hbr;       /* 1 = was HBR (TrueHD), extra settle */
+    SDL_Thread         *audio_switch_thread;
+
     /* ── Packet queues ── */
     PacketQueue         video_pq;
     PacketQueue         audio_pq;
@@ -491,6 +505,8 @@ void  audio_cycle(PlayerState *ps);
 void  bitstream_probe(PlayerState *ps);
 int   bitstream_start(PlayerState *ps);  /* open ALSA + spdifenc, start thread */
 void  bitstream_stop(PlayerState *ps);   /* close ALSA + spdifenc, join thread */
+void  bitstream_stop_immediate(PlayerState *ps); /* fast stop, no delays — for async switch */
+int   audio_switch_bg_func(void *arg);   /* background thread: HBR settle + hdmi_restore */
 
 /* ── Subtitle API (subtitle.c) ───────────────────────────────────── */
 

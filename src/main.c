@@ -713,6 +713,10 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_P:
                 {
+                    /* Block P during async mode switch — prevents mode counter
+                     * from advancing while the background thread is working */
+                    if (ps.audio_switch_phase != 0) break;
+
                     /* Cycle audio mode: PCM → AUTO → PASSTHROUGH → PCM */
                     int m = (int)ps.audio_mode + 1;
                     if (m > 2) m = 0;
@@ -727,54 +731,44 @@ int main(int argc, char *argv[]) {
                     };
 
                     /* ── Live audio mode switch during playback ──
-                     * Wire the mode change to the audio subsystem so it
-                     * takes effect immediately, not just on next file open.
-                     * After restart, seek to current position to force the
-                     * demux to reposition -- otherwise its 8s read-ahead
-                     * fills the audio queue with future packets. */
-                    if (ps.playing && ps.audio_codec_ctx) {
-                        int did_seek = 0;
+                     * Bitstream→PCM uses async pattern: fast stop, then
+                     * background thread handles pactl + delays so video
+                     * keeps rendering. Completion in main loop below.
+                     * PCM→Bitstream stays synchronous (simpler, audio is
+                     * already silent so the brief freeze is less jarring). */
+                    if (ps.playing && ps.audio_codec_ctx
+                            && ps.audio_switch_phase == 0) {
                         if (ps.audio_mode == AUDIO_MODE_PCM && ps.bitstream_active) {
-                            bitstream_stop(&ps);
-                            /* If current track is TrueHD, we CANNOT PCM-decode it
-                             * on the Deck — 1200 pkt/sec MLP decode starves video
-                             * within 200ms. Switch to the EAC3 compatibility track.
-                             * audio_cycle does its own codec switch + seek. */
-                            if (ps.audio_codec_ctx &&
-                                ps.audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD) {
-                                log_msg("Audio: TrueHD on PCM return — auto-switching to decodable track");
-                                audio_open(&ps);
-                                /* Pause immediately — without this, the audio
-                                 * callback fires while audio_codec_ctx is still
-                                 * the TrueHD context, producing garbage/silence.
-                                 * audio_cycle resumes after switching to EAC3. */
-                                if (ps.audio_stream)
-                                    SDL_PauseAudioStreamDevice(ps.audio_stream);
-                                audio_cycle(&ps);
-                                did_seek = 1;  /* audio_cycle already seeked */
-                            } else {
-                                audio_open(&ps);
-                                /* Resume SDL audio immediately — seek_recovering
-                                 * gate is for initial file open, not mode switch.
-                                 * Without this, audio stays paused until a frame
-                                 * display triggers seek_recovery clear. */
-                                if (ps.audio_stream && !ps.paused)
-                                    SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                            }
+                            /* ── Async bitstream→PCM ── */
+                            ps.audio_switch_was_truehd =
+                                (ps.audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD);
+                            bitstream_stop_immediate(&ps);
+
+                            /* Launch background thread for HBR settle + hdmi_restore */
+                            ps.audio_switch_to_mode = AUDIO_MODE_PCM;
+                            ps.audio_switch_phase = 1;
+                            ps.audio_switch_thread = SDL_CreateThread(
+                                audio_switch_bg_func, "audioswitch", &ps);
+
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "Audio Mode: switching...");
+                            ps.aud_osd_until = get_time_sec() + 3.0;
+
                         } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
                             audio_close(&ps);
                             if (!bitstream_start(&ps))
                                 audio_open(&ps);  /* fallback to PCM */
-                        }
-                        if (!did_seek)
                             player_seek(&ps, 0.0);
+                        }
                     } else if (ps.audio_mode == AUDIO_MODE_PCM) {
                         ps.bitstream_active = 0;
                     }
 
-                    snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                             "Audio Mode: %s", mode_names[ps.audio_mode]);
-                    ps.aud_osd_until = get_time_sec() + 2.0;
+                    if (ps.audio_switch_phase == 0) {
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Audio Mode: %s", mode_names[ps.audio_mode]);
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                    }
                     log_msg("Audio mode: %s (bitstream_active=%d)",
                             mode_names[ps.audio_mode], ps.bitstream_active);
                     break;
@@ -1289,6 +1283,41 @@ int main(int argc, char *argv[]) {
                 browser_navigate(&ps, ps.dpad_held_dir);
                 ps.dpad_last_repeat = dnow;
             }
+        }
+
+        /* ── Async audio mode switch completion ──
+         * Background thread (audio_switch_bg_func) handles HBR settle +
+         * hdmi_restore. When it sets phase=2, we complete the switch here
+         * on the main thread where it's safe to touch audio state. */
+        if (ps.audio_switch_phase == 2) {
+            /* Join the background thread */
+            if (ps.audio_switch_thread) {
+                SDL_WaitThread(ps.audio_switch_thread, NULL);
+                ps.audio_switch_thread = NULL;
+            }
+
+            static const char *mode_names_cpl[] = {
+                "PCM (decode)", "AUTO", "PASSTHROUGH"
+            };
+
+            if (ps.audio_switch_was_truehd) {
+                log_msg("Audio: TrueHD on PCM return — auto-switching to decodable track");
+                audio_open(&ps);
+                if (ps.audio_stream)
+                    SDL_PauseAudioStreamDevice(ps.audio_stream);
+                audio_cycle(&ps);
+            } else {
+                audio_open(&ps);
+                if (ps.audio_stream && !ps.paused)
+                    SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                player_seek(&ps, 0.0);
+            }
+
+            ps.audio_switch_phase = 0;
+            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                     "Audio Mode: %s", mode_names_cpl[ps.audio_mode]);
+            ps.aud_osd_until = get_time_sec() + 2.0;
+            log_msg("Audio mode switch complete: %s", mode_names_cpl[ps.audio_mode]);
         }
 
         /* ── Render ── */
