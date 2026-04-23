@@ -864,6 +864,21 @@ static int bitstream_thread_func(void *arg) {
             need_truehd_sync ? " (waiting for TrueHD major sync)" : "");
 
     while (!ps->bitstream_quit) {
+        /* ── Pause gate ──
+         * In bitstream mode, SDL_PauseAudioStreamDevice has no effect —
+         * we're writing directly to ALSA, bypassing SDL audio entirely.
+         * Without this gate, pressing pause freezes video (main loop
+         * stops consuming decoded frames) but audio keeps playing through
+         * ALSA for 10-15 seconds until the audio packet queue drains.
+         * The resulting A/V desync is catastrophic (10,000+ ms drift).
+         *
+         * Fix: spin-wait here while paused. The audio queue stays fed
+         * (demux thread keeps pushing), so on unpause the bitstream
+         * thread resumes immediately with no warmup gap. */
+        while (ps->paused && !ps->bitstream_quit)
+            SDL_Delay(10);
+        if (ps->bitstream_quit) break;
+
         /* Pop a packet from the audio queue (blocking) */
         AVPacket pkt;
         int ret = pq_get(&ps->audio_pq, &pkt, 1);  /* blocking */
