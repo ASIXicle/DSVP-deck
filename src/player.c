@@ -4889,6 +4889,9 @@ void player_build_debug_info(PlayerState *ps) {
     int   off = 0;
 
     off += snprintf(buf + off, sz - off, "=== DEBUG ===\n");
+    off += snprintf(buf + off, sz - off, "Output:      %dx%d (%s)\n",
+        ps->sc_w, ps->sc_h,
+        ps->fullscreen ? "exclusive" : "windowed");
     off += snprintf(buf + off, sz - off, "Renderer: SDL_GPU\n");
     off += snprintf(buf + off, sz - off, "A/V Bias:    %.1f ms\n",
         ps->av_bias * 1000.0);

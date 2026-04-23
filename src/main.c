@@ -574,26 +574,38 @@ int main(int argc, char *argv[]) {
                     if (ps.fullscreen) {
                         SDL_DisplayID disp = SDL_GetDisplayForWindow(window);
                         if (disp == 0) disp = SDL_GetPrimaryDisplay();
-                        const SDL_DisplayMode *cur =
-                            SDL_GetCurrentDisplayMode(disp);
                         int mode_count = 0;
                         SDL_DisplayMode **modes =
                             SDL_GetFullscreenDisplayModes(disp, &mode_count);
                         const SDL_DisplayMode *chosen = NULL;
-                        if (cur && modes) {
-                            /* Exact match on w/h/refresh, then w/h only */
-                            for (int i = 0; i < mode_count && !chosen; i++) {
-                                if (modes[i]->w == cur->w &&
-                                    modes[i]->h == cur->h &&
-                                    modes[i]->refresh_rate == cur->refresh_rate)
+
+                        /* Pick highest resolution mode. On SteamOS 200% scale,
+                         * SDL_GetCurrentDisplayMode returns LOGICAL 1920x1080,
+                         * not physical 3840x2160. Matching against it picks the
+                         * wrong mode. Instead: iterate all modes, pick max w*h,
+                         * prefer higher refresh within same resolution. */
+                        if (modes) {
+                            int best_pixels = 0;
+                            float best_refresh = 0;
+                            for (int i = 0; i < mode_count; i++) {
+                                int pixels = modes[i]->w * modes[i]->h;
+                                if (pixels > best_pixels ||
+                                    (pixels == best_pixels &&
+                                     modes[i]->refresh_rate > best_refresh)) {
                                     chosen = modes[i];
+                                    best_pixels = pixels;
+                                    best_refresh = modes[i]->refresh_rate;
+                                }
                             }
-                            for (int i = 0; i < mode_count && !chosen; i++) {
-                                if (modes[i]->w == cur->w &&
-                                    modes[i]->h == cur->h)
-                                    chosen = modes[i];
+                            /* Log available modes for diagnostics */
+                            for (int i = 0; i < mode_count; i++) {
+                                log_msg("FS-mode[%d]: %dx%d@%.3fHz%s",
+                                        i, modes[i]->w, modes[i]->h,
+                                        modes[i]->refresh_rate,
+                                        modes[i] == chosen ? " ← CHOSEN" : "");
                             }
                         }
+
                         bool mode_ok = false;
                         if (chosen) {
                             mode_ok = SDL_SetWindowFullscreenMode(window, chosen);
@@ -601,7 +613,7 @@ int main(int argc, char *argv[]) {
                                     chosen->w, chosen->h,
                                     chosen->refresh_rate, mode_ok);
                         } else {
-                            log_msg("FS-exclusive: no matching mode found "
+                            log_msg("FS-exclusive: no modes found "
                                     "(have %d modes), falling back to borderless",
                                     mode_count);
                         }
