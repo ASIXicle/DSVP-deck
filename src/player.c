@@ -3290,6 +3290,17 @@ int demux_thread_func(void *arg) {
             if (ps->audio_stream)
                 SDL_ClearAudioStream(ps->audio_stream);
 
+            /* ── Signal bitstream thread to reset clock state on seek ──
+             * The bitstream thread computes audio_clock_sync from wall-clock
+             * math: submitted_frames / rate - (now - wall_start). After a
+             * seek, both counters are stale. Setting this flag tells the
+             * bitstream thread to drop the ALSA buffer, re-prepare, and
+             * zero the counters on its own thread — avoiding a data race
+             * with the concurrent read/increment in the ALSA write loop. */
+            if (ps->bitstream_active) {
+                ps->bitstream_seek_pending = 1;
+            }
+
             log_msg("Demux: seek complete");
         }
 

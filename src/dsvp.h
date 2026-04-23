@@ -219,6 +219,7 @@ typedef struct PlayerState {
     int                 spdif_write_pos; /* write cursor into spdif_buf (per-frame) */
     SDL_Thread         *bitstream_thread;
     int                 bitstream_quit;  /* signal bitstream thread to exit        */
+    int                 bitstream_seek_pending; /* signal thread to reset clock + ALSA  */
     int                 bitstream_frame_bytes; /* ALSA frame size: channels * 2 (S16) */
     int                 bitstream_alsa_rate;   /* actual ALSA sample rate             */
     double              bitstream_wall_start;  /* wall clock at first ALSA write      */

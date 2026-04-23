@@ -867,21 +867,51 @@ static int bitstream_thread_func(void *arg) {
         /* ── Pause gate ──
          * In bitstream mode, SDL_PauseAudioStreamDevice has no effect —
          * we're writing directly to ALSA, bypassing SDL audio entirely.
-         * Without this gate, pressing pause freezes video (main loop
-         * stops consuming decoded frames) but audio keeps playing through
-         * ALSA for 10-15 seconds until the audio packet queue drains.
-         * The resulting A/V desync is catastrophic (10,000+ ms drift).
-         *
-         * Fix: spin-wait here while paused. The audio queue stays fed
-         * (demux thread keeps pushing), so on unpause the bitstream
-         * thread resumes immediately with no warmup gap. */
-        while (ps->paused && !ps->bitstream_quit)
-            SDL_Delay(10);
-        if (ps->bitstream_quit) break;
+         * Drop the ALSA buffer on pause entry (immediate silence), then
+         * spin-wait. On resume, re-prepare ALSA and reset the wall-clock
+         * counters so the buffered-time estimation restarts clean. */
+        if (ps->paused && !ps->bitstream_quit) {
+            snd_pcm_drop(pcm);  /* immediate silence */
+            while (ps->paused && !ps->bitstream_quit)
+                SDL_Delay(10);
+            if (ps->bitstream_quit) break;
+            snd_pcm_prepare(pcm);
+            /* Reset clock state — wall-clock math is invalid after pause */
+            ps->bitstream_frames_written = 0;
+            ps->bitstream_wall_start = 0;
+        }
 
-        /* Pop a packet from the audio queue (blocking) */
+        /* ── Seek reset gate ──
+         * Demux thread sets bitstream_seek_pending after flushing audio_pq.
+         * We handle the reset HERE on the bitstream thread to avoid a data
+         * race with the concurrent frames_written increment in the ALSA
+         * write loop below. Drop kills stale pre-seek audio in the ALSA
+         * ring buffer; prepare re-arms PCM for the next writei. Zeroing
+         * wall_start causes the clock computation (line ~924) to skip
+         * the buffered-time estimation until the first post-seek write,
+         * letting seek recovery's audio_clock_sync = video_clock stick. */
+        if (ps->bitstream_seek_pending && !ps->bitstream_quit) {
+            snd_pcm_drop(pcm);
+            snd_pcm_prepare(pcm);
+            ps->bitstream_frames_written = 0;
+            ps->bitstream_wall_start = 0;
+            ps->bitstream_seek_pending = 0;
+        }
+
+        /* Pop a packet from the audio queue — non-blocking poll loop.
+         * Using block=0 lets us re-check paused, seek_pending, and quit
+         * every 5ms instead of sleeping indefinitely inside pq_get's
+         * SDL_WaitCondition. This makes pause and seek response instant
+         * without needing condvar broadcast from the main thread. */
         AVPacket pkt;
-        int ret = pq_get(&ps->audio_pq, &pkt, 1);  /* blocking */
+        int ret = 0;
+        while (!ps->bitstream_quit && !ps->paused && !ps->bitstream_seek_pending) {
+            ret = pq_get(&ps->audio_pq, &pkt, 0);  /* non-blocking */
+            if (ret != 0) break;  /* got packet (1) or abort (-1) */
+            SDL_Delay(5);
+        }
+        if (ps->paused || ps->bitstream_seek_pending)
+            continue;  /* re-enter loop → hit pause/seek gate */
         if (ret <= 0 || ps->bitstream_quit) {
             if (ret > 0) av_packet_unref(&pkt);
             break;
