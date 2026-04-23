@@ -1543,13 +1543,11 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     log_msg("GPU: overlay texture created (%dx%d RGBA, alloc %.0fms)",
             width, height, (get_time_sec() - alloc_start) * 1000.0);
 
-    /* Resume audio after GPU allocation. Do NOT force-set audio_clock /
-     * audio_clock_sync — that's a lie-to-the-clock that causes ~70ms
-     * drift per window-resize event when the audio callback thread has
-     * been running normally during the 1-11ms alloc. Let the callback
-     * keep writing its own clock truth; frame_timer bump alone is enough. */
+    /* Resume audio after GPU allocation. Do NOT reset frame_timer or
+     * audio clocks — both are lies-to-the-clock that cause cumulative
+     * drift on every overlay alloc / window resize. The 1-11ms alloc
+     * is within pacing tolerance; let the clocks run undisturbed. */
     if (ps->playing) {
-        ps->frame_timer = get_time_sec();
         if (was_audio_playing && ps->audio_stream) {
             SDL_ResumeAudioStreamDevice(ps->audio_stream);
         }

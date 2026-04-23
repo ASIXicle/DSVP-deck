@@ -227,6 +227,7 @@ int audio_open(PlayerState *ps) {
 
     ps->audio_spec = spec;
 
+    av_free(ps->audio_buf);  /* prevent leak on PCM↔bitstream mode switch */
     ps->audio_buf       = av_malloc(AUDIO_BUF_SIZE);
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;

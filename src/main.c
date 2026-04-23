@@ -634,7 +634,6 @@ int main(int argc, char *argv[]) {
                         SDL_SetWindowSize(window, w, h);
                     }
                     if (ps.playing) {
-                        ps.frame_timer = get_time_sec();
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
@@ -867,7 +866,6 @@ int main(int argc, char *argv[]) {
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
                     if (ps.playing) {
-                        ps.frame_timer = get_time_sec();
                         if (!ps.paused && ps.audio_stream)
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
