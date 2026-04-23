@@ -8,7 +8,9 @@ DSVP sits between VLC and mpv: better quality than VLC (modern FFmpeg, Lanczos s
 
 This repo is for the **Steamdeck** build only, Windows & Debian builds [HERE](https://github.com/ASIXicle/DSVP).
 
-HDR is Coming Soon. Two weeks, tops. Maybe three.
+~~HDR is Coming Soon. Two weeks, tops. Maybe three~~. HDR is busted af on SteamOS 3.8
+
+Priority is new Packages and Flatpak. Bitstream is done but not rolled in yet. You can build it though.
 
 File Explorer:
 
