@@ -49,15 +49,21 @@ SRCS    = main.c player.c audio.c subtitle.c overlay.c browser.c log.c
 OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
 TARGET  = $(BUILDDIR)/dsvp
 
+# Standalone helper invoked by udev to set IEC 61937 non-audio bit on
+# the HDA codec at boot / hwdep change events. Built with no external
+# deps so it can run during early boot before /usr/local/lib paths are
+# fully set up. Installed to /usr/local/sbin by scripts/install-udev-rule.sh.
+HELPER = $(BUILDDIR)/dsvp-arm-iec958
+
 .PHONY: all clean debug profile
 
-all: $(BUILDDIR) $(TARGET)
+all: $(BUILDDIR) $(TARGET) $(HELPER)
 
 debug: CFLAGS += -g -DDSVP_DEBUG
-debug: $(BUILDDIR) $(TARGET)
+debug: $(BUILDDIR) $(TARGET) $(HELPER)
 
 profile: CFLAGS += -O2 -DDSVP_PROFILE
-profile: $(BUILDDIR) $(TARGET)
+profile: $(BUILDDIR) $(TARGET) $(HELPER)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
@@ -68,6 +74,11 @@ $(TARGET): $(OBJS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/dsvp.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Helper has no SDL3/FFmpeg/ALSA deps — just kernel UAPI.
+# Links dynamically against glibc, which is always present on SteamOS.
+$(HELPER): tools/dsvp-arm-iec958.c
+	$(CC) -Wall -Wextra -O2 -o $@ $<
 
 clean:
 	rm -rf $(BUILDDIR)
