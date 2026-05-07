@@ -3094,25 +3094,9 @@ void player_close(PlayerState *ps) {
     bitstream_stop(ps);  /* no-op if not active */
     audio_close(ps);
 
-    /* Ensure HDMI card profile is restored at exit. If DSVP crashed or
-     * was killed during bitstream, the profile may still be "off".
-     * Restoring it lets PipeWire reclaim the HDMI device cleanly.
-     * This is cheap if the profile is already correct. */
-    if (ps->bitstream_caps.probed && ps->bitstream_caps.pa_card_name[0]) {
-        const char *profile = ps->bitstream_caps.pa_saved_profile[0]
-            ? ps->bitstream_caps.pa_saved_profile : "output:hdmi-stereo-extra2";
-        char cmd[384];
-        snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' '%s' 2>/dev/null",
-                 ps->bitstream_caps.pa_card_name, profile);
-        system(cmd);
-        SDL_Delay(200);
-    }
-
-    /* Force re-probe on next file open. After multiple HDMI profile
-     * toggles (release/restore cycles), the AMD HDA driver and PipeWire
-     * can accumulate state that causes bitstream static on subsequent
-     * files. Re-probing gets a fresh ELD read, fresh IEC958 mixer index,
-     * and fresh PipeWire card name — no stale state carries over. */
+    /* Force re-probe on next file open. ELD index and IEC958 mixer
+     * index can shift when HDMI sinks come and go between files;
+     * a fresh probe avoids stale state. */
     ps->bitstream_caps.probed = 0;
 
     /* Close subtitles */

@@ -756,7 +756,7 @@ int main(int argc, char *argv[]) {
                                 (ps.audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD);
                             bitstream_stop_immediate(&ps);
 
-                            /* Launch background thread for HBR settle + hdmi_restore */
+                            /* Launch background thread (now a thin signaler) */
                             ps.audio_switch_to_mode = AUDIO_MODE_PCM;
                             ps.audio_switch_phase = 1;
                             ps.audio_switch_thread = SDL_CreateThread(
@@ -1298,9 +1298,10 @@ int main(int argc, char *argv[]) {
         }
 
         /* ── Async audio mode switch completion ──
-         * Background thread (audio_switch_bg_func) handles HBR settle +
-         * hdmi_restore. When it sets phase=2, we complete the switch here
-         * on the main thread where it's safe to touch audio state. */
+         * Background thread (audio_switch_bg_func) is a thin signaler
+         * since the profile bounce was removed. When it sets phase=2,
+         * we complete the switch here on the main thread where it's
+         * safe to touch audio state. */
         if (ps.audio_switch_phase == 2) {
             /* Join the background thread */
             if (ps.audio_switch_thread) {

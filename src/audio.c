@@ -566,49 +566,6 @@ void bitstream_probe(PlayerState *ps) {
 
     ps->bitstream_caps.probed = 1;
 
-    /* ── Discover PipeWire/PulseAudio card name and active profile ──
-     * Parse `pactl list cards` to find the PA card corresponding to our
-     * ALSA card number. We need this to toggle the card profile instead
-     * of stopping PipeWire entirely for ALSA exclusive access. */
-    {
-        FILE *p = popen("pactl list cards 2>/dev/null", "r");
-        if (p) {
-            char pline[512];
-            char cur_name[128] = "";
-            int match_card = 0;
-
-            while (fgets(pline, sizeof(pline), p)) {
-                /* Track current card name */
-                char name[128];
-                if (sscanf(pline, " Name: %127s", name) == 1) {
-                    snprintf(cur_name, sizeof(cur_name), "%s", name);
-                    match_card = 0;
-                }
-                /* Check if this card matches our ALSA card number */
-                if (strstr(pline, "api.alsa.card")) {
-                    int acn;
-                    if (sscanf(pline, " api.alsa.card = \"%d\"", &acn) == 1
-                        && acn == card) {
-                        match_card = 1;
-                    }
-                }
-                /* Capture active profile for our card */
-                char prof[128];
-                if (match_card && sscanf(pline, " Active Profile: %127s", prof) == 1) {
-                    snprintf(ps->bitstream_caps.pa_card_name,
-                         sizeof(ps->bitstream_caps.pa_card_name), "%s", cur_name);
-                    snprintf(ps->bitstream_caps.pa_saved_profile,
-                         sizeof(ps->bitstream_caps.pa_saved_profile), "%s", prof);
-                    log_msg("Bitstream: PA card '%s' active profile '%s'",
-                            ps->bitstream_caps.pa_card_name,
-                            ps->bitstream_caps.pa_saved_profile);
-                    break;
-                }
-            }
-            pclose(p);
-        }
-    }
-
     log_msg("Bitstream: probed %s via ELD (card%d, eld#0.%d)",
             monitor[0] ? monitor : "unknown", card, eld_idx);
     log_msg("Bitstream: AC3=%d EAC3=%d TrueHD=%d DTS=%d DTS-HD=%d "
@@ -637,52 +594,6 @@ void bitstream_probe(PlayerState *ps) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define SPDIF_MAX_BUF  65536   /* max IEC 61937 burst (TrueHD HBR=61440) */
-
-/* ── HDMI card profile release/restore ──
- * Instead of stopping PipeWire entirely (which breaks Game Mode audio
- * and causes restart instability), we set the HDMI sound card's
- * PulseAudio/PipeWire profile to "off". This releases the ALSA device
- * for exclusive access while keeping PipeWire running and healthy.
- * The internal speaker/headphone card is unaffected.
- *
- * SteamOS 3.8.1 + PipeWire 1.4.10: card profiles are exposed and
- * iec958.codecs.detected is populated from ELD, making this reliable. */
-
-static void hdmi_release(PlayerState *ps) {
-    if (!ps->bitstream_caps.pa_card_name[0]) {
-        log_msg("Bitstream: no PA card name — falling back to PipeWire stop");
-        system("systemctl --user stop wireplumber pipewire-pulse.socket pipewire.socket pipewire 2>/dev/null");
-        SDL_Delay(100);
-        return;
-    }
-    char cmd[384];
-    snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' off 2>/dev/null",
-             ps->bitstream_caps.pa_card_name);
-    log_msg("Bitstream: releasing HDMI — %s", cmd);
-    system(cmd);
-    SDL_Delay(200);  /* give PipeWire time to close the ALSA device */
-}
-
-static void hdmi_restore(PlayerState *ps) {
-    if (!ps->bitstream_caps.pa_card_name[0]) {
-        log_msg("Bitstream: no PA card name — falling back to PipeWire start");
-        system("systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber 2>/dev/null");
-        SDL_Delay(300);
-        return;
-    }
-    const char *profile = ps->bitstream_caps.pa_saved_profile[0]
-        ? ps->bitstream_caps.pa_saved_profile : "output:hdmi-stereo-extra2";
-    char cmd[384];
-    snprintf(cmd, sizeof(cmd), "pactl set-card-profile '%s' '%s' 2>/dev/null",
-             ps->bitstream_caps.pa_card_name, profile);
-    log_msg("Bitstream: restoring HDMI — %s", cmd);
-    system(cmd);
-    SDL_Delay(500);  /* PipeWire needs ~750ms+ total (system() latency + this delay)
-                      * to fully reclaim the ALSA device after card profile restore.
-                      * Without this, SDL audio_open connects to a stale PipeWire
-                      * sink → silence on PCM return. Was 200ms, increased after
-                      * Dogma (TrueHD) testing showed PCM silence on mode switch. */
-}
 
 /* ── IEC 60958 AES3 sample rate code ──
  * Maps ALSA sample rate to IEC 60958 channel status byte 3 value. */
@@ -1131,15 +1042,13 @@ int bitstream_start(PlayerState *ps) {
     ps->spdif_avio = avio;
 
     /* ── Open ALSA device for passthrough ──
-     * 1. Stop PipeWire (always holds HDMI devices exclusively)
-     * 2. Set IEC958 channel status via snd_ctl (non-audio bit)
-     * 3. Open the raw hw device */
+     * 1. Set IEC958 channel status via snd_ctl (non-audio bit)
+     * 2. Open the raw hw device — kernel ALSA gives us exclusive access;
+     *    PipeWire yields and reclaims automatically on close. No
+     *    profile bounce required. */
     int card_num = 0, dev_num = 0;
     sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
     int aes3 = iec958_rate_code(rate);
-
-    hdmi_release(ps);
-    ps->hdmi_released = 1;
 
     /* Set non-audio bit BEFORE opening PCM (some drivers latch on open) */
     set_iec958_nonpcm(card_num, dev_num, aes3);
@@ -1150,7 +1059,6 @@ int bitstream_start(PlayerState *ps) {
     if (ret < 0) {
         log_msg("Bitstream: ALSA open '%s' failed: %s",
                 ps->bitstream_caps.alsa_device, snd_strerror(ret));
-        hdmi_restore(ps); ps->hdmi_released = 0;
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1187,7 +1095,6 @@ int bitstream_start(PlayerState *ps) {
     if (ret < 0) {
         log_msg("Bitstream: ALSA hw_params failed: %s", snd_strerror(ret));
         snd_pcm_close(pcm);
-        if (ps->hdmi_released) { hdmi_restore(ps); ps->hdmi_released = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1244,7 +1151,6 @@ int bitstream_start(PlayerState *ps) {
         snd_pcm_close(pcm);
         ps->alsa_pcm = NULL;
         ps->bitstream_active = 0;
-        if (ps->hdmi_released) { hdmi_restore(ps); ps->hdmi_released = 0; }
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1330,17 +1236,6 @@ void bitstream_stop(PlayerState *ps) {
         set_iec958_pcm(card_num, dev_num);
     }
 
-    /* Restore HDMI card profile so PipeWire reclaims the device.
-     * After TrueHD HBR (192kHz 8ch), the AMD HDA driver and HDMI link
-     * need extra time to fully reset before PipeWire can reopen at
-     * 48kHz 2ch. Without this, PipeWire may open a stale device. */
-    if (ps->hdmi_released) {
-        if (ps->bitstream_frame_bytes > 4)  /* HBR: 16 bytes (8ch) */
-            SDL_Delay(300);  /* extra settle time for HBR → PCM */
-        hdmi_restore(ps);
-        ps->hdmi_released = 0;
-    }
-
     log_msg("Bitstream: passthrough stopped");
 }
 
@@ -1348,12 +1243,11 @@ void bitstream_stop(PlayerState *ps) {
 /* ═══════════════════════════════════════════════════════════════════
  * bitstream_stop_immediate — Fast stop for async mode switch
  *
- * Does everything bitstream_stop does EXCEPT the HBR settle delay
- * and hdmi_restore (pactl + PipeWire reclaim delay). Those slow
- * steps are deferred to audio_switch_bg_func running on a background
- * thread, so the main loop keeps rendering video during transitions.
+ * Identical to bitstream_stop now that the profile bounce is gone.
+ * Kept as a separate symbol because main.c's async-switch flow still
+ * launches audio_switch_bg_func after this returns; collapsing the
+ * two would require touching the caller too. Subtractive patch only.
  * ═══════════════════════════════════════════════════════════════════ */
-
 void bitstream_stop_immediate(PlayerState *ps) {
     if (!ps->bitstream_active) return;
 
@@ -1396,9 +1290,6 @@ void bitstream_stop_immediate(PlayerState *ps) {
     ps->spdif_buf_size = 0;
     ps->spdif_write_pos = 0;
 
-    /* Remember if this was HBR before clearing state */
-    ps->audio_switch_hbr = (ps->bitstream_frame_bytes > 4);
-
     ps->bitstream_active = 0;
     ps->bitstream_quit = 0;
     ps->bitstream_frames_written = 0;
@@ -1420,30 +1311,25 @@ void bitstream_stop_immediate(PlayerState *ps) {
         set_iec958_pcm(card_num, dev_num);
     }
 
-    /* NOTE: hdmi_restore NOT called here — deferred to background thread */
+    /* NOTE: nothing else to defer — profile bounce removed entirely */
 }
 
 
 /* ═══════════════════════════════════════════════════════════════════
  * audio_switch_bg_func — Background thread for async mode switch
  *
- * Handles the slow parts: HBR settle delay and hdmi_restore (pactl +
- * PipeWire reclaim delay). Sets audio_switch_phase = 2 when done so
- * the main loop can complete the switch (audio_open + seek).
+ * Thin signaler. The slow parts (profile bounce, HBR settle) were
+ * deleted. Sets audio_switch_phase = 2 immediately so the main loop
+ * can complete the switch (audio_open + seek).
  * ═══════════════════════════════════════════════════════════════════ */
 
 int audio_switch_bg_func(void *arg) {
     PlayerState *ps = (PlayerState *)arg;
 
-    /* HBR settle: AMD HDA + HDMI link need extra time after TrueHD 192kHz 8ch */
-    if (ps->audio_switch_hbr)
-        SDL_Delay(300);
-
-    /* Restore HDMI card profile so PipeWire reclaims the device */
-    if (ps->hdmi_released) {
-        hdmi_restore(ps);  /* includes pactl + 500ms delay */
-        ps->hdmi_released = 0;
-    }
+    /* Profile bounce was deleted; nothing slow to do here.
+     * Kept as a thread for caller-API compatibility — main.c launches
+     * this and waits for audio_switch_phase == 2 before completing
+     * the switch (audio_open + seek). Just signal completion. */
 
     log_msg("Bitstream: async restore complete — ready for audio_open");
 

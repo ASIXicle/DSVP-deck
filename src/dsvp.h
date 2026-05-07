@@ -99,8 +99,6 @@ typedef struct BitstreamCaps {
     int  max_channels;     /* max channel count reported by sink       */
     int  probed;           /* 1 = caps have been queried this session   */
     char alsa_device[32];  /* ALSA hw device for passthrough (e.g. "hw:0,8") */
-    char pa_card_name[128];     /* PulseAudio/PipeWire card name             */
-    char pa_saved_profile[128]; /* profile to restore after bitstream        */
 } BitstreamCaps;
 
 /* ── Packet Queue ───────────────────────────────────────────────────
@@ -224,20 +222,18 @@ typedef struct PlayerState {
     int                 bitstream_alsa_rate;   /* actual ALSA sample rate             */
     double              bitstream_wall_start;  /* wall clock at first ALSA write      */
     int64_t             bitstream_frames_written; /* cumulative frames sent to ALSA   */
-    int                 hdmi_released;   /* 1 = HDMI card profile set to off   */
 
     /* ── Async audio mode switch ──
-     * P-key mode switch moves pactl + delays to a background thread
-     * so the main loop keeps rendering video during transitions.
+     * P-key mode switch uses a background thread for caller-API
+     * compatibility, even though the slow pactl/delay work is gone.
      * audio_switch_phase:
      *   0 = idle
-     *   1 = background thread running (pactl + delay in progress)
+     *   1 = background thread running
      *   2 = ready for completion (main loop finishes the switch)
      */
     int                 audio_switch_phase;
     int                 audio_switch_to_mode;   /* target AudioMode */
     int                 audio_switch_was_truehd; /* 1 = was TrueHD, need track switch */
-    int                 audio_switch_hbr;       /* 1 = was HBR (TrueHD), extra settle */
     SDL_Thread         *audio_switch_thread;
 
     /* ── Packet queues ── */
@@ -506,7 +502,7 @@ void  bitstream_probe(PlayerState *ps);
 int   bitstream_start(PlayerState *ps);  /* open ALSA + spdifenc, start thread */
 void  bitstream_stop(PlayerState *ps);   /* close ALSA + spdifenc, join thread */
 void  bitstream_stop_immediate(PlayerState *ps); /* fast stop, no delays — for async switch */
-int   audio_switch_bg_func(void *arg);   /* background thread: HBR settle + hdmi_restore */
+int   audio_switch_bg_func(void *arg);   /* async-switch signaler thread */
 
 /* ── Subtitle API (subtitle.c) ───────────────────────────────────── */
 
