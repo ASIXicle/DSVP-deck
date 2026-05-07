@@ -616,131 +616,37 @@ static int iec958_rate_code(int rate) {
  * compressed audio. Without the non-audio bit set, the TV receives
  * IEC 61937 bursts but interprets them as PCM → static noise.
  *
- * AMD HDA HDMI driver uses MIXER interface with INDEX (not DEVICE).
- * The IEC958 controls are indexed by HDMI port order (0,1,2,3),
- * not by PCM device number (3,7,8,9 on Steam Deck). We discover
- * the correct index by enumerating "HDMI/DP,pcm=N Jack" controls. */
+ * We embed AES channel status as parameters in the ALSA device string
+ * (e.g. "hw:0,8,AES0=6,AES1=130,AES2=0,AES3=14"). The HDA driver reads
+ * the AES bits at snd_pcm_open time and configures the HDMI infoframe
+ * before any frames are written. Same approach as mpv ao_alsa.c.
+ *
+ * Why not snd_ctl_elem_write on "IEC958 Playback Default"? Wireplumber
+ * 1.6.4 asserts ownership of mixer state and rejects mixer-control
+ * IEC958 writes with EPERM. Even when the write is permitted on older
+ * stacks, the legacy mixer-control path triggers wireplumber's
+ * deprecated-client behavior — wireplumber refuses to yield hw:N,M to
+ * the subsequent snd_pcm_open. Device-string AES bypasses wireplumber
+ * entirely; the HDA kernel driver handles it. */
 
-static void set_iec958_nonpcm(int card, int dev, int aes3) {
-    char ctl_name[32];
-    snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
-
-    snd_ctl_t *ctl;
-    int err = snd_ctl_open(&ctl, ctl_name, 0);
-    if (err < 0) {
-        log_msg("Bitstream: IEC958 control open failed: %s", snd_strerror(err));
-        return;
-    }
-
-    /* ── Find mixer index for our PCM device ──
-     * Enumerate HDMI/DP Jack controls in device order.
-     * The position of our device in the list = the IEC958 mixer index. */
-    snd_ctl_elem_id_t *id;
-    snd_ctl_elem_value_t *val;
-    snd_ctl_elem_id_alloca(&id);
-    snd_ctl_elem_value_alloca(&val);
-
-    int iec958_idx = -1;
-    int idx_count = 0;
-    for (int d = 0; d < 16; d++) {
-        char jack_name[64];
-        snprintf(jack_name, sizeof(jack_name), "HDMI/DP,pcm=%d Jack", d);
-        snd_ctl_elem_id_clear(id);
-        snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_CARD);
-        snd_ctl_elem_id_set_name(id, jack_name);
-        snd_ctl_elem_value_set_id(val, id);
-        if (snd_ctl_elem_read(ctl, val) >= 0) {
-            if (d == dev) {
-                iec958_idx = idx_count;
-                log_msg("Bitstream: pcm device %d → IEC958 mixer index %d", dev, iec958_idx);
-            }
-            idx_count++;
-        }
-    }
-
-    if (iec958_idx < 0) {
-        log_msg("Bitstream: could not find IEC958 index for pcm device %d", dev);
-        snd_ctl_close(ctl);
-        return;
-    }
-
-    /* ── Set channel status: non-audio + sample rate ── */
-    snd_ctl_elem_id_clear(id);
-    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
-    snd_ctl_elem_id_set_name(id, "IEC958 Playback Default");
-    snd_ctl_elem_id_set_index(id, iec958_idx);
-    snd_ctl_elem_value_set_id(val, id);
-
-    snd_aes_iec958_t iec958;
-    memset(&iec958, 0, sizeof(iec958));
-    iec958.status[0] = 0x06;  /* non-audio + no copyright */
-    iec958.status[1] = 0x82;  /* digital-digital converter */
-    iec958.status[2] = 0x00;
-    iec958.status[3] = aes3;  /* sample rate */
-    snd_ctl_elem_value_set_iec958(val, &iec958);
-
-    err = snd_ctl_elem_write(ctl, val);
-    if (err < 0)
-        log_msg("Bitstream: IEC958 set failed (idx=%d): %s", iec958_idx, snd_strerror(err));
-    else
-        log_msg("Bitstream: IEC958 non-audio set (idx=%d, AES0=0x06 AES3=0x%02x)",
-                iec958_idx, aes3);
-
-    snd_ctl_close(ctl);
-}
-
-/* ── Reset IEC958 channel status to PCM mode ──
- * Clears the non-audio bit so PipeWire reclaims the device cleanly.
- * Without this, PipeWire may misinterpret the device state on restart. */
-
-static void set_iec958_pcm(int card, int dev) {
-    char ctl_name[32];
-    snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
-
-    snd_ctl_t *ctl;
-    if (snd_ctl_open(&ctl, ctl_name, 0) < 0) return;
-
-    snd_ctl_elem_id_t *id;
-    snd_ctl_elem_value_t *val;
-    snd_ctl_elem_id_alloca(&id);
-    snd_ctl_elem_value_alloca(&val);
-
-    /* Find mixer index (same logic as set_iec958_nonpcm) */
-    int iec958_idx = -1, idx_count = 0;
-    for (int d = 0; d < 16; d++) {
-        char jack_name[64];
-        snprintf(jack_name, sizeof(jack_name), "HDMI/DP,pcm=%d Jack", d);
-        snd_ctl_elem_id_clear(id);
-        snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_CARD);
-        snd_ctl_elem_id_set_name(id, jack_name);
-        snd_ctl_elem_value_set_id(val, id);
-        if (snd_ctl_elem_read(ctl, val) >= 0) {
-            if (d == dev) { iec958_idx = idx_count; }
-            idx_count++;
-        }
-    }
-    if (iec958_idx < 0) { snd_ctl_close(ctl); return; }
-
-    snd_ctl_elem_id_clear(id);
-    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
-    snd_ctl_elem_id_set_name(id, "IEC958 Playback Default");
-    snd_ctl_elem_id_set_index(id, iec958_idx);
-    snd_ctl_elem_value_set_id(val, id);
-
-    snd_aes_iec958_t iec958;
-    memset(&iec958, 0, sizeof(iec958));
-    iec958.status[0] = 0x04;  /* consumer, audio (non-audio bit CLEAR), no copyright */
-    iec958.status[3] = 0x02;  /* 48 kHz — explicit rate helps HDMI TX after HBR */
-    snd_ctl_elem_value_set_iec958(val, &iec958);
-
-    int err = snd_ctl_elem_write(ctl, val);
-    if (err < 0)
-        log_msg("Bitstream: IEC958 PCM reset failed (idx=%d): %s",
-                iec958_idx, snd_strerror(err));
-    else
-        log_msg("Bitstream: IEC958 reset to PCM mode (idx=%d)", iec958_idx);
-
-    snd_ctl_close(ctl);
+/* Build "<device>,AES0=...,AES1=...,AES2=0,AES3=<rate_code>" for snd_pcm_open.
+ * Note: AES0 bit pattern 0x06 = consumer mode, non-audio, copy-permit.
+ * The IEC958_AES0_PRO_EMPHASIS_NONE macro name is misleading (PRO_ prefix
+ * suggests pro mode); the bit is correct for consumer subframes too.
+ *
+ * out must be at least 64 bytes; the formatted string fits in ~50.
+ * Returns out for caller convenience. */
+static const char *build_iec958_device(char *out, size_t out_sz,
+                                       const char *base_dev, int aes3) {
+    snprintf(out, out_sz,
+             "%s,AES0=%d,AES1=%d,AES2=0,AES3=%d",
+             base_dev,
+             /* AES0: bit1=non-audio, bit2=consumer copy-permit */
+             0x06,
+             /* AES1: bit7=original, bit1=PCM coder */
+             0x82,
+             aes3);
+    return out;
 }
 
 static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
@@ -1042,23 +948,25 @@ int bitstream_start(PlayerState *ps) {
     ps->spdif_avio = avio;
 
     /* ── Open ALSA device for passthrough ──
-     * 1. Set IEC958 channel status via snd_ctl (non-audio bit)
-     * 2. Open the raw hw device — kernel ALSA gives us exclusive access;
-     *    PipeWire yields and reclaims automatically on close. No
-     *    profile bounce required. */
-    int card_num = 0, dev_num = 0;
-    sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
+     * Build a device string with AES channel-status parameters, then
+     * snd_pcm_open. The HDA driver reads AES at open time and configures
+     * the HDMI infoframe before any frames are written. Kernel ALSA
+     * gives us exclusive access; PipeWire yields and reclaims
+     * automatically on close. No mixer-control writes, no profile
+     * bounce, no system state mutation. */
     int aes3 = iec958_rate_code(rate);
 
-    /* Set non-audio bit BEFORE opening PCM (some drivers latch on open) */
-    set_iec958_nonpcm(card_num, dev_num, aes3);
+    char dev_with_aes[64];
+    build_iec958_device(dev_with_aes, sizeof(dev_with_aes),
+                        ps->bitstream_caps.alsa_device, aes3);
+    log_msg("Bitstream: opening %s", dev_with_aes);
 
     snd_pcm_t *pcm = NULL;
-    ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
+    ret = snd_pcm_open(&pcm, dev_with_aes,
                         SND_PCM_STREAM_PLAYBACK, 0);
     if (ret < 0) {
         log_msg("Bitstream: ALSA open '%s' failed: %s",
-                ps->bitstream_caps.alsa_device, snd_strerror(ret));
+                dev_with_aes, snd_strerror(ret));
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
@@ -1229,12 +1137,9 @@ void bitstream_stop(PlayerState *ps) {
     /* Reset abort so audio_pq works normally for PCM fallback */
     ps->audio_pq.abort_request = 0;
 
-    /* Reset IEC958 to PCM mode before PipeWire reclaims the device */
-    if (ps->bitstream_caps.alsa_device[0]) {
-        int card_num = 0, dev_num = 0;
-        sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
-        set_iec958_pcm(card_num, dev_num);
-    }
+    /* No IEC958 mixer reset needed — AES bits were embedded in the
+     * device string at snd_pcm_open time and clear naturally when the
+     * device closes. PipeWire reopens hw:N,M with default (PCM) AES. */
 
     log_msg("Bitstream: passthrough stopped");
 }
@@ -1304,12 +1209,9 @@ void bitstream_stop_immediate(PlayerState *ps) {
     /* Reset abort so audio_pq works normally for PCM */
     ps->audio_pq.abort_request = 0;
 
-    /* Reset IEC958 to PCM mode (fast, no delay needed) */
-    if (ps->bitstream_caps.alsa_device[0]) {
-        int card_num = 0, dev_num = 0;
-        sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
-        set_iec958_pcm(card_num, dev_num);
-    }
+    /* No IEC958 mixer reset needed — AES bits were embedded in the
+     * device string at snd_pcm_open time and clear when the device
+     * closes. */
 
     /* NOTE: nothing else to defer — profile bounce removed entirely */
 }
