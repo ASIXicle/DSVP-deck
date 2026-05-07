@@ -16,6 +16,12 @@
 
 #include "dsvp.h"
 #include <alsa/asoundlib.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Decode
@@ -616,38 +622,134 @@ static int iec958_rate_code(int rate) {
  * compressed audio. Without the non-audio bit set, the TV receives
  * IEC 61937 bursts but interprets them as PCM → static noise.
  *
- * We embed AES channel status as parameters in the ALSA device string
- * (e.g. "hw:0,8,AES0=6,AES1=130,AES2=0,AES3=14"). The HDA driver reads
- * the AES bits at snd_pcm_open time and configures the HDMI infoframe
- * before any frames are written. Same approach as mpv ao_alsa.c.
+ * On SteamOS 3.8.3 + kernel 6.16, every userspace path that should
+ * deliver this bit is broken:
+ *   - "IEC958 Playback Default" mixer control: kernel silently discards
+ *     writes (cset returns 0, cget shows defaults regardless of WP state)
+ *   - hw:N,M,AES=... device string: libasound has no per-card alias
+ *     chain, snd_pcm_open returns ENOENT
+ *   - iec958:CARD=N,DEV=M plugin device: same — no per-card definition
  *
- * Why not snd_ctl_elem_write on "IEC958 Playback Default"? Wireplumber
- * 1.6.4 asserts ownership of mixer state and rejects mixer-control
- * IEC958 writes with EPERM. Even when the write is permitted on older
- * stacks, the legacy mixer-control path triggers wireplumber's
- * deprecated-client behavior — wireplumber refuses to yield hw:N,M to
- * the subsequent snd_pcm_open. Device-string AES bypasses wireplumber
- * entirely; the HDA kernel driver handles it. */
+ * The one working path is the HDA hwdep ioctl: open /dev/snd/hwC<n>D0
+ * and issue SET_DIGI_CONVERT_1 (verb 0x70D) directly to the converter
+ * widget. The codec accepts the verb, the bit persists across
+ * snd_pcm_open, and the HDMI infoframe carries the right Non-Audio
+ * designation. Verified empirically on May 2026.
+ *
+ * Inlining the minimal HDA UAPI here so the build doesn't depend on
+ * <sound/hda_hwdep.h> being installed; the structure layout is stable
+ * kernel UAPI. */
 
-/* Build "<device>,AES0=...,AES1=...,AES2=0,AES3=<rate_code>" for snd_pcm_open.
- * Note: AES0 bit pattern 0x06 = consumer mode, non-audio, copy-permit.
- * The IEC958_AES0_PRO_EMPHASIS_NONE macro name is misleading (PRO_ prefix
- * suggests pro mode); the bit is correct for consumer subframes too.
- *
- * out must be at least 64 bytes; the formatted string fits in ~50.
- * Returns out for caller convenience. */
-static const char *build_iec958_device(char *out, size_t out_sz,
-                                       const char *base_dev, int aes3) {
-    snprintf(out, out_sz,
-             "%s,AES0=%d,AES1=%d,AES2=0,AES3=%d",
-             base_dev,
-             /* AES0: bit1=non-audio, bit2=consumer copy-permit */
-             0x06,
-             /* AES1: bit7=original, bit1=PCM coder */
-             0x82,
-             aes3);
-    return out;
+/* HDA UAPI definitions (subset of <sound/hda_hwdep.h>) */
+#ifndef HDA_HWDEP_VERSION
+#define HDA_HWDEP_VERSION   ((1 << 16) | (0 << 8) | (0 << 0))  /* 1.0.0 */
+struct hda_verb_ioctl {
+    uint32_t verb;   /* nid << 24 | verb << 8 | param */
+    uint32_t res;
+};
+#define HDA_IOCTL_PVERSION   _IOR('H', 0x10, int)
+#define HDA_IOCTL_VERB_WRITE _IOWR('H', 0x11, struct hda_verb_ioctl)
+#endif
+
+#define HDA_VERB_PACK(nid, verb, param) \
+    (((uint32_t)(nid) << 24) | ((uint32_t)(verb) << 8) | (uint32_t)(param))
+
+/* HDA verbs we use */
+#define HDA_VERB_SET_DIGI_CONVERT_1 0x70d
+#define HDA_VERB_SET_DIGI_CONVERT_2 0x70e
+#define HDA_VERB_GET_DIGI_CONVERT   0x0f0d
+
+/* DIGI_CONVERT_1 byte 1 bits */
+#define HDA_DIG1_ENABLE   0x01  /* bit 0: digital output enable */
+#define HDA_DIG1_V        0x02  /* bit 1: validity */
+#define HDA_DIG1_NAUDIO   0x20  /* bit 5: non-audio (IEC 61937) */
+
+/* Steam Deck OLED (Rembrandt Radeon HDMI HDA) converter NIDs:
+ *   PCM device 3 → converter 0x02
+ *   PCM device 5 → converter 0x04
+ *   PCM device 8 → converter 0x06   (HBR-capable, our target)
+ *   PCM device 9 → converter 0x08
+ * Other AMD HDA codecs may differ; if/when DSVP runs on other hardware,
+ * add a probe step that maps PCM device → converter NID via
+ * /proc/asound/card<N>/codec#0 widget connectivity. */
+static int hda_converter_nid_for_pcm_dev(int dev) {
+    switch (dev) {
+        case 3:  return 0x02;
+        case 5:  return 0x04;
+        case 8:  return 0x06;
+        case 9:  return 0x08;
+        default: return -1;
+    }
 }
+
+/* Set the IEC 61937 non-audio bit on the codec converter feeding the
+ * given PCM device, via the HDA hwdep ioctl. Also writes the sample
+ * rate into the IEC 60958 channel status byte 2 (DIGI_CONVERT_2) so
+ * the receiver can correctly frame IEC 61937 bursts. Returns 0 on
+ * success, negative on failure. Logs progress. */
+static int set_iec958_nonpcm_via_hda_verb(int card, int dev, int rate) {
+    int nid = hda_converter_nid_for_pcm_dev(dev);
+    if (nid < 0) {
+        log_msg("Bitstream: no converter NID known for pcm device %d", dev);
+        return -1;
+    }
+
+    char hwdep_path[32];
+    snprintf(hwdep_path, sizeof(hwdep_path), "/dev/snd/hwC%dD0", card);
+
+    int fd = open(hwdep_path, O_RDWR);
+    if (fd < 0) {
+        log_msg("Bitstream: open(%s) failed: %s", hwdep_path, strerror(errno));
+        log_msg("Bitstream: HDA hwdep needs deck user in audio group OR "
+                "udev rule granting access (see scripts/install-udev-rule.sh)");
+        return -2;
+    }
+
+    int version = 0;
+    if (ioctl(fd, HDA_IOCTL_PVERSION, &version) < 0) {
+        log_msg("Bitstream: HDA_IOCTL_PVERSION failed: %s", strerror(errno));
+        close(fd);
+        return -3;
+    }
+    if (version < HDA_HWDEP_VERSION) {
+        log_msg("Bitstream: HDA hwdep version 0x%x too old (need 0x%x)",
+                version, HDA_HWDEP_VERSION);
+        close(fd);
+        return -4;
+    }
+
+    /* Write SET_DIGI_CONVERT_1 with DIGEN | V | NAUDIO (byte 1: format flags) */
+    struct hda_verb_ioctl val;
+    val.verb = HDA_VERB_PACK(nid, HDA_VERB_SET_DIGI_CONVERT_1,
+                             HDA_DIG1_ENABLE | HDA_DIG1_V | HDA_DIG1_NAUDIO);
+    val.res = 0;
+    if (ioctl(fd, HDA_IOCTL_VERB_WRITE, &val) < 0) {
+        log_msg("Bitstream: HDA_IOCTL_VERB_WRITE (DIGI_CONVERT_1) failed: %s",
+                strerror(errno));
+        close(fd);
+        return -5;
+    }
+
+    /* Write SET_DIGI_CONVERT_2 with sample rate code (byte 2: AES3 rate field).
+     * Codec ignores the high bits of the param; only the rate-code nibble
+     * matters here. Failing this verb isn't fatal — the byte-1 NAUDIO is
+     * the load-bearing bit; rate may be inferred from snd_pcm_hw_params. */
+    int aes3 = iec958_rate_code(rate);
+    val.verb = HDA_VERB_PACK(nid, HDA_VERB_SET_DIGI_CONVERT_2, aes3);
+    val.res = 0;
+    if (ioctl(fd, HDA_IOCTL_VERB_WRITE, &val) < 0) {
+        log_msg("Bitstream: HDA_IOCTL_VERB_WRITE (DIGI_CONVERT_2) failed "
+                "(non-fatal): %s", strerror(errno));
+        /* fall through — non-audio bit was set, that's the critical part */
+    }
+
+    log_msg("Bitstream: HDA verb path → nid=0x%02x DIGI1=0x%02x DIGI2=0x%02x",
+            nid, HDA_DIG1_ENABLE | HDA_DIG1_V | HDA_DIG1_NAUDIO, aes3);
+
+    close(fd);
+    return 0;
+}
+
 
 static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
     PlayerState *ps = (PlayerState *)opaque;
@@ -948,25 +1050,33 @@ int bitstream_start(PlayerState *ps) {
     ps->spdif_avio = avio;
 
     /* ── Open ALSA device for passthrough ──
-     * Build a device string with AES channel-status parameters, then
-     * snd_pcm_open. The HDA driver reads AES at open time and configures
-     * the HDMI infoframe before any frames are written. Kernel ALSA
-     * gives us exclusive access; PipeWire yields and reclaims
-     * automatically on close. No mixer-control writes, no profile
-     * bounce, no system state mutation. */
-    int aes3 = iec958_rate_code(rate);
+     * 1. Set IEC 61937 non-audio bit on the HDA codec converter via
+     *    direct hwdep ioctl. This is the ONLY userspace path that
+     *    actually delivers the bit on SteamOS 3.8.3 + kernel 6.16
+     *    (see comment on set_iec958_nonpcm_via_hda_verb above).
+     * 2. Open the raw hw device — kernel ALSA gives us exclusive access;
+     *    PipeWire yields and reclaims automatically on close.
+     * The codec retains the non-audio bit across snd_pcm_open, so
+     * setting it before open is correct (verified empirically). */
+    int card_num = 0, dev_num = 0;
+    sscanf(ps->bitstream_caps.alsa_device, "hw:%d,%d", &card_num, &dev_num);
 
-    char dev_with_aes[64];
-    build_iec958_device(dev_with_aes, sizeof(dev_with_aes),
-                        ps->bitstream_caps.alsa_device, aes3);
-    log_msg("Bitstream: opening %s", dev_with_aes);
+    int verb_ret = set_iec958_nonpcm_via_hda_verb(card_num, dev_num, rate);
+    if (verb_ret < 0) {
+        log_msg("Bitstream: HDA verb path failed (ret=%d) — proceeding anyway, "
+                "TV will likely interpret as PCM and produce static",
+                verb_ret);
+        /* Don't fail the open — let the user hear noise rather than
+         * silence; that signals the verb path needs udev/permissions
+         * fix more clearly than a silent fallback would. */
+    }
 
     snd_pcm_t *pcm = NULL;
-    ret = snd_pcm_open(&pcm, dev_with_aes,
+    ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
                         SND_PCM_STREAM_PLAYBACK, 0);
     if (ret < 0) {
         log_msg("Bitstream: ALSA open '%s' failed: %s",
-                dev_with_aes, snd_strerror(ret));
+                ps->bitstream_caps.alsa_device, snd_strerror(ret));
         av_write_trailer(spdif);
         avio_context_free(&avio);
         avformat_free_context(spdif);
