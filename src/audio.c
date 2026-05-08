@@ -16,6 +16,7 @@
 
 #include "dsvp.h"
 #include <alsa/asoundlib.h>
+#include <systemd/sd-bus.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Decode
@@ -830,6 +831,112 @@ static int bitstream_rate_for_codec(enum AVCodecID id) {
  * Returns 1 on success, 0 on failure (caller should fall back to PCM).
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* ── ReserveDevice1 — ask WirePlumber to yield HDMI audio device ──
+ *
+ * PipeWire 1.6.x wraps hw:N,M in a loopback sink and holds the ALSA
+ * device exclusively.  snd_pcm_open returns EBUSY unless WP releases.
+ * The freedesktop ReserveDevice1 D-Bus protocol is the standard way
+ * for ALSA-direct apps (JACK, mpv, us) to request this politely.
+ *
+ * WP advertises org.freedesktop.ReserveDevice1.Audio<card> on the
+ * session bus.  We call RequestRelease(priority=1), WP returns true
+ * and drops the loopback.  We then CLAIM the bus name ourselves so
+ * WP won't try to reclaim mid-playback.  On bitstream_stop we release
+ * the name and WP reclaims automatically.
+ *
+ * Process death (crash, SIGKILL) auto-releases D-Bus names, so no
+ * leaked reservation on abnormal exit.
+ *
+ * Non-fatal: if the D-Bus call fails, bitstream_start proceeds anyway —
+ * snd_pcm_open may succeed on its own (WP not holding the device)
+ * or fail with EBUSY (handled by PCM fallback). */
+
+static sd_bus *reserve_bus = NULL;
+static int     reserve_card = -1;
+
+static int reserve_hdmi_device(int card) {
+    int r;
+
+    char dest[80], path[80];
+    snprintf(dest, sizeof(dest),
+             "org.freedesktop.ReserveDevice1.Audio%d", card);
+    snprintf(path, sizeof(path),
+             "/org/freedesktop/ReserveDevice1/Audio%d", card);
+
+    /* Open session bus (reuse across P-key toggles) */
+    if (!reserve_bus) {
+        r = sd_bus_open_user(&reserve_bus);
+        if (r < 0) {
+            log_msg("Bitstream: sd_bus_open_user failed: %s", strerror(-r));
+            return -1;
+        }
+    }
+
+    /* Step 1: ask WP to release the device */
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int released = 0;
+
+    r = sd_bus_call_method(reserve_bus, dest, path,
+                           "org.freedesktop.ReserveDevice1",
+                           "RequestRelease",
+                           &error, &reply,
+                           "i", (int32_t)1);
+    if (r < 0) {
+        /* NameHasNoOwner = no one holds the reservation, proceed */
+        if (sd_bus_error_has_name(&error,
+                "org.freedesktop.DBus.Error.NameHasNoOwner")) {
+            log_msg("Bitstream: Audio%d has no owner — claiming directly",
+                    card);
+        } else {
+            log_msg("Bitstream: RequestRelease failed: %s",
+                    error.message ? error.message : strerror(-r));
+            sd_bus_error_free(&error);
+            return -1;
+        }
+        sd_bus_error_free(&error);
+    } else {
+        sd_bus_message_read(reply, "b", &released);
+        sd_bus_message_unref(reply);
+        if (!released) {
+            log_msg("Bitstream: WirePlumber refused to release Audio%d",
+                    card);
+            return -1;
+        }
+        log_msg("Bitstream: WirePlumber released Audio%d", card);
+    }
+
+    /* Step 2: claim the reservation name so WP doesn't reclaim mid-play.
+     * REPLACE_EXISTING handles the race between RequestRelease returning
+     * true and WP actually dropping the name.  ALLOW_REPLACEMENT lets
+     * other ReserveDevice1 clients (mpv, JACK) replace us cleanly. */
+    r = sd_bus_request_name(reserve_bus, dest,
+                            SD_BUS_NAME_REPLACE_EXISTING |
+                            SD_BUS_NAME_ALLOW_REPLACEMENT);
+    if (r < 0) {
+        log_msg("Bitstream: failed to claim %s: %s — proceeding anyway",
+                dest, strerror(-r));
+        /* Non-fatal: RequestRelease already made WP yield */
+    } else {
+        log_msg("Bitstream: claimed reservation %s", dest);
+        reserve_card = card;
+    }
+
+    return 0;
+}
+
+static void release_hdmi_device(void) {
+    if (!reserve_bus || reserve_card < 0) return;
+
+    char name[80];
+    snprintf(name, sizeof(name),
+             "org.freedesktop.ReserveDevice1.Audio%d", reserve_card);
+
+    sd_bus_release_name(reserve_bus, name);
+    log_msg("Bitstream: released reservation %s", name);
+    reserve_card = -1;
+}
+
 int bitstream_start(PlayerState *ps) {
     if (!ps->audio_codec_ctx || !ps->bitstream_caps.alsa_device[0]) {
         log_msg("Bitstream: no codec or no ALSA device — cannot start");
@@ -928,6 +1035,12 @@ int bitstream_start(PlayerState *ps) {
      * automatically on close. If the user hasn't run install-udev-rule.sh,
      * the codec will be in PCM mode and the TV will interpret IEC 61937
      * bursts as PCM (audible static) — that's the diagnostic signal. */
+
+     /* Ask WirePlumber to release the HDMI audio device */
+    int card_num = 0;
+    sscanf(ps->bitstream_caps.alsa_device, "hw:%d", &card_num);
+    reserve_hdmi_device(card_num);
+
     snd_pcm_t *pcm = NULL;
     ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
                         SND_PCM_STREAM_PLAYBACK, 0);
@@ -1065,6 +1178,9 @@ void bitstream_stop(PlayerState *ps) {
         ps->alsa_pcm = NULL;
     }
 
+    /* Release HDMI reservation so WirePlumber can reclaim */
+    release_hdmi_device();
+
     /* Close spdifenc */
     if (ps->spdif_ctx) {
         AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
@@ -1141,6 +1257,9 @@ void bitstream_stop_immediate(PlayerState *ps) {
         snd_pcm_close((snd_pcm_t *)ps->alsa_pcm);
         ps->alsa_pcm = NULL;
     }
+
+    /* Release HDMI reservation so WirePlumber can reclaim */
+    release_hdmi_device();
 
     /* Close spdifenc */
     if (ps->spdif_ctx) {
