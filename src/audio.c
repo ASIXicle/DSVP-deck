@@ -17,6 +17,9 @@
 #include "dsvp.h"
 #include <alsa/asoundlib.h>
 #include <systemd/sd-bus.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <errno.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Decode
@@ -1116,6 +1119,28 @@ int bitstream_start(PlayerState *ps) {
     log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
             ps->bitstream_caps.alsa_device, actual_rate, channels,
             buffer_size, period_size);
+
+    /* Set non-audio bit via HDA verb AFTER snd_pcm_prepare.
+     * snd_pcm_prepare latches IEC958 Default (0x04) to the codec,
+     * overwriting any boot-time verb arming. We must re-arm here. */
+    {
+        char hwpath[32];
+        snprintf(hwpath, sizeof(hwpath), "/dev/snd/hwC%dD0", card_num);
+        int hwfd = open(hwpath, O_RDWR);
+        if (hwfd >= 0) {
+            struct { uint32_t verb; uint32_t res; } hda;
+            hda.verb = (0x06 << 20) | (0x70D << 8) | 0x23;
+            hda.res = 0;
+            if (ioctl(hwfd, (int)0xC008480B, &hda) == 0)
+                log_msg("Bitstream: armed non-audio bit on NID 0x06 (verb 0x%08x)", hda.verb);
+            else
+                log_msg("Bitstream: HDA verb write failed: %s", strerror(errno));
+            close(hwfd);
+        } else {
+            log_msg("Bitstream: open(%s) failed: %s — non-audio bit not set",
+                    hwpath, strerror(errno));
+        }
+    }
 
     /* ── Launch output thread ── */
     ps->bitstream_quit = 0;
