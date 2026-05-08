@@ -889,10 +889,8 @@ static int reserve_hdmi_device(int card) {
             log_msg("Bitstream: Audio%d has no owner — claiming directly",
                     card);
         } else {
-            log_msg("Bitstream: RequestRelease failed: %s",
+            log_msg("Bitstream: RequestRelease failed: %s — proceeding to claim",
                     error.message ? error.message : strerror(-r));
-            sd_bus_error_free(&error);
-            return -1;
         }
         sd_bus_error_free(&error);
     } else {
