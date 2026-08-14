@@ -1,0 +1,4 @@
+# Shell scripts and the Makefile MUST be LF — a CRLF package.sh is a syntax
+# error on Linux ("do\r": unexpected token) and silently un-runnable on the Deck.
+*.sh text eol=lf
+Makefile text eol=lf

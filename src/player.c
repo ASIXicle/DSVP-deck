@@ -176,7 +176,10 @@ static const char hlsl_yuv_planar_frag[] =
     "    float hdr_midtone_gain;\n"
     "    float is_dovi;\n"
     "    float is_semiplanar;\n"
-    "    float _pad0;\n"
+    "    float out_gamma;\n"
+    "    float is_hlg;\n"
+    "    float hdr_pass;\n"
+    "    float2 _pad1;\n"
     "    float4 dovi_num_pieces;\n"
     "    float4 dovi_pivots[9];\n"
     "    float4 dovi_c0[8];\n"
@@ -188,6 +191,9 @@ static const char hlsl_yuv_planar_frag[] =
     "    float4 dovi_out_r0;\n"
     "    float4 dovi_out_r1;\n"
     "    float4 dovi_out_r2;\n"
+    "    float4 dovi_mmr_meta;\n"
+    "    float4 dovi_mmr_ct[6];\n"
+    "    float4 dovi_mmr_cp[6];\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -202,6 +208,48 @@ static const char hlsl_yuv_planar_frag[] =
     "\n"
     "float sample_lanczos(Texture2D<float> tex, SamplerState samp,\n"
     "                     float2 uv, float2 tex_size) {\n"
+    "#if DSVP_DILATE\n"
+    "    /* Downscale dilation: when one output pixel spans df > 1 source\n"
+    "     * texels, a fixed 4-tap kernel undersamples high frequencies and\n"
+    "     * aliases (moire on 4K content in a small window / the internal\n"
+    "     * panel). Stretch the kernel by the pixel footprint, measured\n"
+    "     * from screen-space derivatives — exact under letterboxing and\n"
+    "     * aspect scaling. This variant is only BOUND when downscaling:\n"
+    "     * its dynamic [loop] bounds cost real GPU time even at df == 1\n"
+    "     * (field-measured: broke 4K60 under software-decode UMA\n"
+    "     * contention), so 1:1/upscale binds the fixed variant below. */\n"
+    "    float2 df = float2(max(1.0, abs(ddx(uv.x)) * tex_size.x),\n"
+    "                       max(1.0, abs(ddy(uv.y)) * tex_size.y));\n"
+    "    df = min(df, 4.0);  /* 16 taps/axis cap — total work stays\n"
+    "                           bounded because output pixels shrink as\n"
+    "                           fast as taps grow */\n"
+    "    float2 pos  = uv * tex_size - 0.5;\n"
+    "    float2 base = floor(pos);\n"
+    "    float2 fr   = pos - base;\n"
+    "\n"
+    "    int2 jmin = int2(floor(fr - 2.0 * df)) + 1;\n"
+    "    int2 jmax = int2(floor(fr + 2.0 * df));\n"
+    "\n"
+    "    float result  = 0.0;\n"
+    "    float wsum    = 0.0;\n"
+    "    float tap_min = 1e9;\n"
+    "    float tap_max = -1e9;\n"
+    "\n"
+    "    [loop] for (int j = jmin.y; j <= jmax.y; j++) {\n"
+    "        float wy = lanczos2((float(j) - fr.y) / df.y);\n"
+    "        [loop] for (int i = jmin.x; i <= jmax.x; i++) {\n"
+    "            float w  = lanczos2((float(i) - fr.x) / df.x) * wy;\n"
+    "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
+    "                        / tex_size;\n"
+    "            float s  = tex.SampleLevel(samp, tc, 0).r;\n"
+    "            tap_min  = min(tap_min, s);\n"
+    "            tap_max  = max(tap_max, s);\n"
+    "            result  += s * w;\n"
+    "            wsum    += w;\n"
+    "        }\n"
+    "    }\n"
+    "#else\n"
+    "    /* Fixed 4x4 — the proven-fast unrolled path (84ffc54). */\n"
     "    float2 pos  = uv * tex_size - 0.5;\n"
     "    float2 base = floor(pos);\n"
     "    float2 f    = pos - base;\n"
@@ -225,6 +273,7 @@ static const char hlsl_yuv_planar_frag[] =
     "            wsum    += w;\n"
     "        }\n"
     "    }\n"
+    "#endif\n"
     "\n"
     "    float filtered = (wsum > 0.0) ? result / wsum : 0.0;\n"
     "    /* Anti-ringing: clamp to local tap range. Strength 0.8 per\n"
@@ -233,70 +282,170 @@ static const char hlsl_yuv_planar_frag[] =
     "    return lerp(filtered, clamped, 0.8);\n"
     "}\n"
     "\n"
-    "/* Catmull-Rom (bicubic) 4x4 tap filter for chroma planes.\n"
+    "/* Catmull-Rom weight for |t| in [0,2]. The dilated loop bounds\n"
+    " * guarantee |t| <= 2 by construction, so no outside-range clamp\n"
+    " * is needed. */\n"
+    "float catmull_w(float t) {\n"
+    "    t = abs(t);\n"
+    "    return (t <= 1.0)\n"
+    "        ? (1.5 * t * t * t - 2.5 * t * t + 1.0)\n"
+    "        : (-0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0);\n"
+    "}\n"
+    "\n"
+    "/* Catmull-Rom (bicubic) tap filter for chroma planes.\n"
     " * Smoother than bilinear without the ringing of Lanczos.\n"
     " * Standard for chroma upscaling in quality video players (mpv). */\n"
     "float sample_catmull(Texture2D<float2> tex, SamplerState samp,\n"
     "                     float2 uv, float2 tex_size) {\n"
+    "#if DSVP_DILATE\n"
+    "    /* Same footprint dilation as sample_lanczos — chroma aliases on\n"
+    "     * downscale just like luma. df == 1 reproduces the original. */\n"
+    "    float2 df = float2(max(1.0, abs(ddx(uv.x)) * tex_size.x),\n"
+    "                       max(1.0, abs(ddy(uv.y)) * tex_size.y));\n"
+    "    df = min(df, 4.0);\n"
+    "    float2 pos  = uv * tex_size - 0.5;\n"
+    "    float2 base = floor(pos);\n"
+    "    float2 fr   = pos - base;\n"
+    "\n"
+    "    int2 jmin = int2(floor(fr - 2.0 * df)) + 1;\n"
+    "    int2 jmax = int2(floor(fr + 2.0 * df));\n"
+    "\n"
+    "    float result = 0.0;\n"
+    "    float wsum   = 0.0;\n"
+    "    float tap_min = 1e9;\n"
+    "    float tap_max = -1e9;\n"
+    "\n"
+    "    [loop] for (int j = jmin.y; j <= jmax.y; j++) {\n"
+    "        float wy = catmull_w((float(j) - fr.y) / df.y);\n"
+    "        [loop] for (int i = jmin.x; i <= jmax.x; i++) {\n"
+    "            float w = catmull_w((float(i) - fr.x) / df.x) * wy;\n"
+    "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
+    "                        / tex_size;\n"
+    "            float sm = tex.SampleLevel(samp, tc, 0).r;\n"
+    "            tap_min  = min(tap_min, sm);\n"
+    "            tap_max  = max(tap_max, sm);\n"
+    "            result  += sm * w;\n"
+    "            wsum   += w;\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    float out_c = (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "    /* Anti-ring, HDR files only: clamp to tap range, strength\n"
+    "     * 0.8 — parity with luma (Artoriuz benchmarks). PQ + wide\n"
+    "     * gamut make chroma overshoot visible as edge color bleed;\n"
+    "     * the SDR path is untouched. */\n"
+    "    if (is_hdr > 0.5)\n"
+    "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
+    "    return out_c;\n"
+    "#else\n"
+    "    /* Fixed 4x4 — the proven-fast unrolled path (84ffc54). */\n"
     "    float2 pos  = uv * tex_size - 0.5;\n"
     "    float2 base = floor(pos);\n"
     "    float2 f    = pos - base;\n"
     "\n"
     "    float result = 0.0;\n"
     "    float wsum   = 0.0;\n"
+    "    float tap_min = 1e9;\n"
+    "    float tap_max = -1e9;\n"
     "\n"
     "    [unroll] for (int j = -1; j <= 2; j++) {\n"
-    "        float t = abs(float(j) - f.y);\n"
-    "        float wy = (t <= 1.0)\n"
-    "            ? (1.5 * t * t * t - 2.5 * t * t + 1.0)\n"
-    "            : (-0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0);\n"
+    "        float wy = catmull_w(float(j) - f.y);\n"
     "        [unroll] for (int i = -1; i <= 2; i++) {\n"
-    "            float s = abs(float(i) - f.x);\n"
-    "            float wx = (s <= 1.0)\n"
-    "                ? (1.5 * s * s * s - 2.5 * s * s + 1.0)\n"
-    "                : (-0.5 * s * s * s + 2.5 * s * s - 4.0 * s + 2.0);\n"
-    "            float w = wx * wy;\n"
+    "            float w = catmull_w(float(i) - f.x) * wy;\n"
     "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
     "                        / tex_size;\n"
-    "            result += tex.SampleLevel(samp, tc, 0).r * w;\n"
+    "            float sm = tex.SampleLevel(samp, tc, 0).r;\n"
+    "            tap_min  = min(tap_min, sm);\n"
+    "            tap_max  = max(tap_max, sm);\n"
+    "            result  += sm * w;\n"
     "            wsum   += w;\n"
     "        }\n"
     "    }\n"
     "\n"
-    "    return (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "    float out_c = (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "    /* Anti-ring, HDR files only: clamp to tap range, strength\n"
+    "     * 0.8 — parity with luma (Artoriuz benchmarks). PQ + wide\n"
+    "     * gamut make chroma overshoot visible as edge color bleed;\n"
+    "     * the SDR path is untouched. */\n"
+    "    if (is_hdr > 0.5)\n"
+    "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
+    "    return out_c;\n"
+    "#endif\n"
     "}\n"
     "\n"
     "/* Catmull-Rom returning float2 — for semi-planar UV (R16G16_UNORM).\n"
-    " * Reads .rg from each tap: .r = U (Cb), .g = V (Cr).\n"
-    " * Same filter weights as sample_catmull, just operates on 2 channels. */\n"
+    " * Reads .rg from each tap: .r = U (Cb), .g = V (Cr). Same dilated\n"
+    " * weights as sample_catmull — this is the sampler the zero-copy\n"
+    " * P010 path uses, i.e. exactly what runs when 4K DV/HDR content is\n"
+    " * downscaled on the internal panel. */\n"
     "float2 sample_catmull_rg(Texture2D<float2> tex, SamplerState samp,\n"
     "                         float2 uv, float2 tex_size) {\n"
+    "#if DSVP_DILATE\n"
+    "    float2 df = float2(max(1.0, abs(ddx(uv.x)) * tex_size.x),\n"
+    "                       max(1.0, abs(ddy(uv.y)) * tex_size.y));\n"
+    "    df = min(df, 4.0);\n"
+    "    float2 pos  = uv * tex_size - 0.5;\n"
+    "    float2 base = floor(pos);\n"
+    "    float2 fr   = pos - base;\n"
+    "\n"
+    "    int2 jmin = int2(floor(fr - 2.0 * df)) + 1;\n"
+    "    int2 jmax = int2(floor(fr + 2.0 * df));\n"
+    "\n"
+    "    float2 result = float2(0.0, 0.0);\n"
+    "    float wsum   = 0.0;\n"
+    "    float2 tap_min = float2(1e9, 1e9);\n"
+    "    float2 tap_max = float2(-1e9, -1e9);\n"
+    "\n"
+    "    [loop] for (int j = jmin.y; j <= jmax.y; j++) {\n"
+    "        float wy = catmull_w((float(j) - fr.y) / df.y);\n"
+    "        [loop] for (int i = jmin.x; i <= jmax.x; i++) {\n"
+    "            float w = catmull_w((float(i) - fr.x) / df.x) * wy;\n"
+    "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
+    "                        / tex_size;\n"
+    "            float2 sm = tex.SampleLevel(samp, tc, 0).rg;\n"
+    "            tap_min   = min(tap_min, sm);\n"
+    "            tap_max   = max(tap_max, sm);\n"
+    "            result   += sm * w;\n"
+    "            wsum   += w;\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    float2 out_c = (wsum > 0.0) ? result / wsum : float2(0.0, 0.0);\n"
+    "    /* Anti-ring, HDR files only — see sample_catmull. */\n"
+    "    if (is_hdr > 0.5)\n"
+    "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
+    "    return out_c;\n"
+    "#else\n"
+    "    /* Fixed 4x4 — the proven-fast unrolled path (84ffc54). */\n"
     "    float2 pos  = uv * tex_size - 0.5;\n"
     "    float2 base = floor(pos);\n"
     "    float2 f    = pos - base;\n"
     "\n"
     "    float2 result = float2(0.0, 0.0);\n"
     "    float wsum   = 0.0;\n"
+    "    float2 tap_min = float2(1e9, 1e9);\n"
+    "    float2 tap_max = float2(-1e9, -1e9);\n"
     "\n"
     "    [unroll] for (int j = -1; j <= 2; j++) {\n"
-    "        float t = abs(float(j) - f.y);\n"
-    "        float wy = (t <= 1.0)\n"
-    "            ? (1.5 * t * t * t - 2.5 * t * t + 1.0)\n"
-    "            : (-0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0);\n"
+    "        float wy = catmull_w(float(j) - f.y);\n"
     "        [unroll] for (int i = -1; i <= 2; i++) {\n"
-    "            float s = abs(float(i) - f.x);\n"
-    "            float wx = (s <= 1.0)\n"
-    "                ? (1.5 * s * s * s - 2.5 * s * s + 1.0)\n"
-    "                : (-0.5 * s * s * s + 2.5 * s * s - 4.0 * s + 2.0);\n"
-    "            float w = wx * wy;\n"
+    "            float w = catmull_w(float(i) - f.x) * wy;\n"
     "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
     "                        / tex_size;\n"
-    "            result += tex.SampleLevel(samp, tc, 0).rg * w;\n"
+    "            float2 sm = tex.SampleLevel(samp, tc, 0).rg;\n"
+    "            tap_min   = min(tap_min, sm);\n"
+    "            tap_max   = max(tap_max, sm);\n"
+    "            result   += sm * w;\n"
     "            wsum   += w;\n"
     "        }\n"
     "    }\n"
     "\n"
-    "    return (wsum > 0.0) ? result / wsum : float2(0.0, 0.0);\n"
+    "    float2 out_c = (wsum > 0.0) ? result / wsum : float2(0.0, 0.0);\n"
+    "    /* Anti-ring, HDR files only — see sample_catmull. */\n"
+    "    if (is_hdr > 0.5)\n"
+    "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
+    "    return out_c;\n"
+    "#endif\n"
     "}\n"
     "\n"
     "/* PQ EOTF (SMPTE ST 2084 inverse): PQ code values [0,1] → linear\n"
@@ -313,17 +462,72 @@ static const char hlsl_yuv_planar_frag[] =
     "    return 10000.0 * pow(max(num / den, 0.0), 1.0 / m1);\n"
     "}\n"
     "\n"
+    "/* PQ OETF (exact inverse of pq_eotf): linear light as a fraction\n"
+    " * of 10,000 nits → PQ code values. Used by the passthrough paths\n"
+    " * that re-encode display-linear results into the HDR10 container\n"
+    " * (DV-after-reshape, HLG-after-OOTF). */\n"
+    "float3 pq_oetf(float3 lin) {\n"
+    "    float m1 = 0.1593017578125;\n"
+    "    float m2 = 78.84375;\n"
+    "    float c1 = 0.8359375;\n"
+    "    float c2 = 18.8515625;\n"
+    "    float c3 = 18.6875;\n"
+    "    float3 Np = pow(max(lin, 0.0), m1);\n"
+    "    return pow((c1 + c2 * Np) / (1.0 + c3 * Np), m2);\n"
+    "}\n"
+    "\n"
     "/* BT.2390 EETF: Hermite spline shoulder rolloff for tone mapping.\n"
     " * Maps normalized luminance [0,1] through a soft knee at ks,\n"
     " * compressing highlights to maxLum. Below ks is linear passthrough. */\n"
     "float bt2390_eetf(float e, float ks, float maxLum) {\n"
     "    if (e <= ks) return e;\n"
+    /* Clamp to the normalized range before the spline. Pixels brighter
+     * than the detected/declared peak gave t > 1, and the cubic then
+     * EXTRAPOLATES above maxLum instead of rolling off to it — the
+     * final saturate was left to hide it, which clips rather than
+     * tone maps. */
+    "    e = min(e, 1.0);\n"
     "    float t = (e - ks) / (1.0 - ks);\n"
     "    float t2 = t * t;\n"
     "    float t3 = t2 * t;\n"
     "    return (2.0*t3 - 3.0*t2 + 1.0) * ks\n"
     "         + (t3 - 2.0*t2 + t) * (1.0 - ks)\n"
     "         + (-2.0*t3 + 3.0*t2) * maxLum;\n"
+    "}\n"
+    "\n"
+    "/* Encode tone-mapped display-linear output for the display's EOTF.\n"
+    " * out_gamma == 0 selects the sRGB piecewise curve; otherwise a pure\n"
+    " * power law (2.2 default, 2.4 = BT.1886 dark-room). The sRGB linear\n"
+    " * toe lifts shadows slightly on a display decoding ~2.2, so power is\n"
+    " * the reference-faithful default (DSVP_OUTPUT_GAMMA overrides). */\n"
+    "float3 encode_output(float3 lin) {\n"
+    "    lin = max(lin, 0.0);\n"
+    "    if (out_gamma < 0.5) {\n"
+    "        return float3(\n"
+    "            lin.r <= 0.0031308 ? 12.92*lin.r : 1.055*pow(lin.r, 1.0/2.4) - 0.055,\n"
+    "            lin.g <= 0.0031308 ? 12.92*lin.g : 1.055*pow(lin.g, 1.0/2.4) - 0.055,\n"
+    "            lin.b <= 0.0031308 ? 12.92*lin.b : 1.055*pow(lin.b, 1.0/2.4) - 0.055);\n"
+    "    }\n"
+    "    return pow(lin, 1.0 / out_gamma);\n"
+    "}\n"
+    "\n"
+    "/* HLG (ARIB STD-B67): inverse OETF to scene-linear, then the\n"
+    " * BT.2100 OOTF at nominal Lw=1000 (system gamma 1.2) to display\n"
+    " * light in nits — from there the shared BT.2390 path takes over.\n"
+    " * (DSVP main fdbb489.) */\n"
+    "float3 hlg_oetf_inv(float3 e) {\n"
+    "    const float a = 0.17883277, b = 0.28466892, c = 0.55991073;\n"
+    "    float3 lo = (e * e) / 3.0;\n"
+    "    float3 hi = (exp((e - c) / a) + b) / 12.0;\n"
+    "    return float3(e.r <= 0.5 ? lo.r : hi.r,\n"
+    "                  e.g <= 0.5 ? lo.g : hi.g,\n"
+    "                  e.b <= 0.5 ? lo.b : hi.b);\n"
+    "}\n"
+    "\n"
+    "float3 hlg_to_nits(float3 sig) {\n"
+    "    float3 s = hlg_oetf_inv(saturate(sig));\n"
+    "    float ys = dot(s, float3(0.2627, 0.6780, 0.0593));\n"
+    "    return 1000.0 * pow(max(ys, 1e-6), 0.2) * s;\n"
     "}\n"
     "\n"
     "/* Select component from float4: 0=x(I), 1=y(Ct), 2=z(Cp) */\n"
@@ -333,16 +537,54 @@ static const char hlsl_yuv_planar_frag[] =
     "    return v.z;\n"
     "}\n"
     "\n"
-    "/* Piecewise polynomial reshape for one DV component.\n"
-    " * Searches pivot array to find the active piece, then evaluates\n"
-    " * c0 + c1*x + c2*x*x. Falls back to identity if no pieces. */\n"
-    "float dovi_reshape(float x, int comp) {\n"
+    "/* DV MMR (Multivariate Multiple Regression) reshape for one chroma\n"
+    " * component: a cross-channel polynomial over the coded (I,Ct,Cp)\n"
+    " * triple. Terms per order o (1..3): I, Ct, Cp, I*Ct, I*Cp, Ct*Cp,\n"
+    " * I*Ct*Cp — each raised to the o-th power, 7 coefficients per\n"
+    " * order plus one constant. comp: 1 = Ct, 2 = Cp. */\n"
+    "float dovi_mmr_eval(float3 sig, int comp) {\n"
+    "    int   order = (int)((comp == 1) ? dovi_mmr_meta.x : dovi_mmr_meta.y);\n"
+    "    float s     =        (comp == 1) ? dovi_mmr_meta.z : dovi_mmr_meta.w;\n"
+    "    float t[7];\n"
+    "    t[0] = sig.x; t[1] = sig.y; t[2] = sig.z;\n"
+    "    t[3] = sig.x * sig.y;\n"
+    "    t[4] = sig.x * sig.z;\n"
+    "    t[5] = sig.y * sig.z;\n"
+    "    t[6] = t[3] * sig.z;\n"
+    "    float p[7];\n"
+    "    [unroll] for (int k = 0; k < 7; k++) p[k] = t[k];\n"
+    "    [loop] for (int o = 0; o < 3; o++) {\n"
+    "        if (o >= order) break;\n"
+    "        [unroll] for (int i = 0; i < 7; i++) {\n"
+    "            int idx = o * 7 + i;\n"
+    "            float4 bank = (comp == 1) ? dovi_mmr_ct[idx >> 2]\n"
+    "                                      : dovi_mmr_cp[idx >> 2];\n"
+    "            s += bank[idx & 3] * p[i];\n"
+    "        }\n"
+    "        [unroll] for (int k2 = 0; k2 < 7; k2++) p[k2] *= t[k2];\n"
+    "    }\n"
+    "    return s;\n"
+    "}\n"
+    "\n"
+    "/* Reshape one DV component: pivot search selects the active piece,\n"
+    " * THEN the piece's method dispatches — polynomial c0 + c1*x + c2*x*x,\n"
+    " * or MMR for a chroma piece 0 flagged in dovi_mmr_meta (the CPU side\n"
+    " * only ever packs MMR for piece 0). Dispatching the method before\n"
+    " * the pivot search routed EVERY pixel of a multi-piece curve through\n"
+    " * piece 0's MMR coefficients; for the universal single-piece case\n"
+    " * the two orders are identical. Falls back to identity if no\n"
+    " * pieces. */\n"
+    "float dovi_reshape(float3 sig, int comp) {\n"
+    "    float x = sel3(float4(sig, 0.0), comp);\n"
     "    int n = (int)sel3(dovi_num_pieces, comp);\n"
     "    if (n <= 0) return x;\n"
     "    for (int p = 0; p < 8; p++) {\n"
     "        if (p >= n) break;\n"
     "        float hi = sel3(dovi_pivots[p + 1], comp);\n"
     "        if (x < hi || p == n - 1) {\n"
+    "            if (p == 0 && comp != 0 &&\n"
+    "                ((comp == 1) ? dovi_mmr_meta.x : dovi_mmr_meta.y) > 0.5)\n"
+    "                return dovi_mmr_eval(sig, comp);\n"
     "            float c0v = sel3(dovi_c0[p], comp);\n"
     "            float c1v = sel3(dovi_c1[p], comp);\n"
     "            float c2v = sel3(dovi_c2[p], comp);\n"
@@ -385,10 +627,12 @@ static const char hlsl_yuv_planar_frag[] =
     "         * 3. PQ EOTF → linear light (nits)\n"
     "         * 4. Output matrix → BT.2020 linear RGB\n"
     "         * 5. BT.2390 tone mapping (shared with HDR10 path) */\n"
-    "        float3 ipt = float3(y, cb, cr);\n"
-    "        ipt.x = dovi_reshape(ipt.x, 0);\n"
-    "        ipt.y = dovi_reshape(ipt.y, 1);\n"
-    "        ipt.z = dovi_reshape(ipt.z, 2);\n"
+    "        float3 sig = float3(y, cb, cr);\n"
+    "        float3 ipt;\n"
+    "        ipt.x = dovi_reshape(sig, 0);\n"
+    "        ipt.y = dovi_reshape(sig, 1);\n"
+    "        ipt.z = dovi_reshape(sig, 2);\n"
+    "        ipt = saturate(ipt);\n"
     "\n"
     "        float3 centered = ipt - float3(dovi_ycc_r0.w, dovi_ycc_r1.w, dovi_ycc_r2.w);\n"
     "        float3 pq_sig;\n"
@@ -404,6 +648,15 @@ static const char hlsl_yuv_planar_frag[] =
     "        bt2020.b = dot(dovi_out_r2.xyz, lin);\n"
     "        bt2020 = max(bt2020, 0.0);\n"
     "\n"
+    "        if (hdr_pass > 0.5) {\n"
+    "            /* DV-as-HDR10 (docs/TODO-HDR.md item 5): the per-frame\n"
+    "             * RPU reshape above IS Dolby Vision's dynamic metadata,\n"
+    "             * applied by us — the same processing an LLDV player\n"
+    "             * does internally. Re-encode the display-linear BT.2020\n"
+    "             * result (nits, from pq_eotf) into the PQ container and\n"
+    "             * let the display tone-map. */\n"
+    "            rgb = pq_oetf(bt2020 / 10000.0);\n"
+    "        } else {\n"
     "        /* BT.2390 tone mapping — always BT.2020 gamut for DV */\n"
     "        float3 E = bt2020 / hdr_peak_nits;\n"
     "        float target = (hdr_debug > 0.5 && hdr_debug < 1.5)\n"
@@ -428,10 +681,8 @@ static const char hlsl_yuv_planar_frag[] =
     "            float inv = 1.0 / hdr_midtone_gain;\n"
     "            rgb_tm = float3(pow(rgb_tm.r, inv), pow(rgb_tm.g, inv), pow(rgb_tm.b, inv));\n"
     "        }\n"
-    "        rgb = float3(\n"
-    "            rgb_tm.r <= 0.0031308 ? 12.92*rgb_tm.r : 1.055*pow(rgb_tm.r, 1.0/2.4) - 0.055,\n"
-    "            rgb_tm.g <= 0.0031308 ? 12.92*rgb_tm.g : 1.055*pow(rgb_tm.g, 1.0/2.4) - 0.055,\n"
-    "            rgb_tm.b <= 0.0031308 ? 12.92*rgb_tm.b : 1.055*pow(rgb_tm.b, 1.0/2.4) - 0.055);\n"
+    "        rgb = encode_output(rgb_tm);\n"
+    "        } /* end DV SDR tone map */\n"
     "\n"
     "    } else {\n"
     "        /* Standard path (SDR + HDR10) */\n"
@@ -442,24 +693,38 @@ static const char hlsl_yuv_planar_frag[] =
     "     * Debug modes (H key): 0=normal, 1=target 300, 2=PQ bypass, 3=luma viz */\n"
     "    if (is_hdr > 0.5) {\n"
     "\n"
+    "        /* HDR passthrough (docs/TODO-HDR.md): the swapchain is\n"
+    "         * HDR10/ST2084 — rgb already holds range-expanded PQ code\n"
+    "         * values in BT.2020, which is exactly the payload the\n"
+    "         * display wants. No tone map, no gamut squeeze, no output\n"
+    "         * encode: the most correct path is the code we skip. The\n"
+    "         * debug modes and T/G/E controls are SDR-render tools. */\n"
+    "        if (hdr_pass > 0.5) {\n"
+    "            /* PQ content ships as-is. HLG rides the same HDR10\n"
+    "             * container (item 4): inverse OETF + BT.2100 OOTF to\n"
+    "             * display light at the 1000-nit nominal, then\n"
+    "             * PQ-encode — the display tone-maps from there. */\n"
+    "            if (is_hlg > 0.5)\n"
+    "                rgb = pq_oetf(hlg_to_nits(rgb) / 10000.0);\n"
+    "        }\n"
     "        /* Mode 2: PQ bypass — raw PQ code values straight to display.\n"
     "         * Shows what the stream actually contains. If this looks\n"
     "         * reasonably bright, PQ values are valid and the issue\n"
     "         * is in tone mapping. If dark, values themselves are wrong. */\n"
-    "        if (hdr_debug > 1.5 && hdr_debug < 2.5) {\n"
+    "        else if (hdr_debug > 1.5 && hdr_debug < 2.5) {\n"
     "            /* rgb already holds PQ code values [0,1] — skip everything */\n"
     "        }\n"
     "        /* Mode 3: luminance visualization — EOTF output with sRGB gamma.\n"
     "         * Grayscale showing actual nit distribution in the frame. */\n"
     "        else if (hdr_debug > 2.5) {\n"
-    "            float3 lin = pq_eotf(rgb);\n"
+    "            float3 lin = (is_hlg > 0.5) ? hlg_to_nits(rgb) : pq_eotf(rgb);\n"
     "            float lum = lin.r * 0.2627 + lin.g * 0.6780 + lin.b * 0.0593;\n"
     "            float v = lum / hdr_peak_nits;\n"
     "            v = (v <= 0.0031308) ? 12.92*v : 1.055*pow(v, 1.0/2.4) - 0.055;\n"
     "            rgb = float3(v, v, v);\n"
     "        }\n"
     "        else {\n"
-    "            float3 lin = pq_eotf(rgb);\n"
+    "            float3 lin = (is_hlg > 0.5) ? hlg_to_nits(rgb) : pq_eotf(rgb);\n"
     "            float3 E = lin / hdr_peak_nits;\n"
     "\n"
     "            /* Target comes from T-key toggle (203/300/400 nits).\n"
@@ -493,11 +758,22 @@ static const char hlsl_yuv_planar_frag[] =
     "                float inv = 1.0 / hdr_midtone_gain;\n"
     "                rgb_tm = float3(pow(rgb_tm.r, inv), pow(rgb_tm.g, inv), pow(rgb_tm.b, inv));\n"
     "            }\n"
-    "            rgb = float3(\n"
-    "                rgb_tm.r <= 0.0031308 ? 12.92*rgb_tm.r : 1.055*pow(rgb_tm.r, 1.0/2.4) - 0.055,\n"
-    "                rgb_tm.g <= 0.0031308 ? 12.92*rgb_tm.g : 1.055*pow(rgb_tm.g, 1.0/2.4) - 0.055,\n"
-    "                rgb_tm.b <= 0.0031308 ? 12.92*rgb_tm.b : 1.055*pow(rgb_tm.b, 1.0/2.4) - 0.055);\n"
+    "            rgb = encode_output(rgb_tm);\n"
     "        }\n"
+    "    }\n"
+    "    else if (hdr_gamut > 0.5) {\n"
+    "        /* SDR tagged BT.2020 (rare but legal): the 2020 YCbCr matrix\n"
+    "         * above produced BT.2020 RGB, but the swapchain is 709/sRGB —\n"
+    "         * displaying it unconverted is visibly desaturated. Convert\n"
+    "         * primaries in LINEAR light (BT.1886-ish 2.4 for SDR video),\n"
+    "         * then re-encode with the same curve (transfer unchanged —\n"
+    "         * this is a gamut conversion, not a tone map). */\n"
+    "        float3 lin = pow(max(rgb, 0.0), 2.4);\n"
+    "        float3 l7 = float3(\n"
+    "             1.6605*lin.r - 0.5877*lin.g - 0.0728*lin.b,\n"
+    "            -0.1246*lin.r + 1.1330*lin.g - 0.0084*lin.b,\n"
+    "            -0.0182*lin.r - 0.1006*lin.g + 1.1187*lin.b);\n"
+    "        rgb = pow(max(l7, 0.0), 1.0/2.4);\n"
     "    }\n"
     "    } /* end else (standard path) */\n"
     "\n"
@@ -507,21 +783,53 @@ static const char hlsl_yuv_planar_frag[] =
     "     * averages out over ~4 frames — perceived bit depth increases. */\n"
     "    uint fc = (uint)frameCount;\n"
     "    float2 ditherCoord = pos.xy + float2(fc % 4u, (fc / 4u) % 4u);\n"
-    "    float d = (texNoise.SampleLevel(sampNoise, frac(ditherCoord / 64.0), 0).r - 0.5) / 255.0;\n"
+    "    /* LSB matches the output surface: 10-bit in HDR passthrough. */\n"
+    "    float dith_lsb = (hdr_pass > 0.5) ? 1023.0 : 255.0;\n"
+    "    float d = (texNoise.SampleLevel(sampNoise, frac(ditherCoord / 64.0), 0).r - 0.5) / dith_lsb;\n"
     "    rgb += float3(d, d, d);\n"
     "\n"
     "    return float4(saturate(rgb), 1.0);\n"
     "}\n";
 
-/* RGBA overlay fragment shader — simple passthrough with alpha.
- * Used for compositing debug overlays, seek bar, subtitles, etc.
- * over the video frame. One texture, one sampler, no uniforms. */
+/* Frame-blit fragment shader: copies the intermediate frame texture
+ * to the swapchain 1:1. Pure fetch — the video shader already did
+ * all colour math and dither into the UNORM16 intermediate; the
+ * store into the swapchain quantises by rounding exactly as the
+ * direct path's float→UNORM store did. */
+static const char hlsl_blit_frag[] =
+    "Texture2D<float4> texFrame : register(t0, space2);\n"
+    "SamplerState sampFrame : register(s0, space2);\n"
+    "\n"
+    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    return texFrame.Sample(sampFrame, uv);\n"
+    "}\n";
+
+/* RGBA overlay fragment shader — compositing debug overlays, seek
+ * bar, subtitles, etc. over the video frame. One texture, one
+ * sampler, one small uniform: when the swapchain is HDR10/PQ, the
+ * overlay's SDR-authored pixels must be re-encoded to PQ at
+ * reference white (203 nits, BT.2408) — drawn raw, "white" would
+ * mean 10,000 nits and every subtitle would be a flashbang. */
 static const char hlsl_overlay_frag[] =
     "Texture2D<float4> texOverlay : register(t0, space2);\n"
     "SamplerState sampOverlay : register(s0, space2);\n"
     "\n"
+    "cbuffer OvParams : register(b0, space3) {\n"
+    "    float ov_pq;\n"
+    "    float3 _pad;\n"
+    "};\n"
+    "\n"
     "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
-    "    return texOverlay.Sample(sampOverlay, uv);\n"
+    "    float4 c = texOverlay.Sample(sampOverlay, uv);\n"
+    "    if (ov_pq > 0.5) {\n"
+    "        /* SDR (2.2) → linear → 203-nit reference white → PQ OETF */\n"
+    "        float3 lin = pow(max(c.rgb, 0.0), 2.2) * (203.0 / 10000.0);\n"
+    "        float m1 = 0.1593017578125, m2 = 78.84375;\n"
+    "        float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+    "        float3 Np = pow(lin, m1);\n"
+    "        c.rgb = pow((c1 + c2 * Np) / (1.0 + c3 * Np), m2);\n"
+    "    }\n"
+    "    return c;\n"
     "}\n";
 
 
@@ -537,12 +845,41 @@ static const char hlsl_overlay_frag[] =
  * Note: CompileGraphicsShaderFromHLSL does NOT exist in 3.0.0.
  */
 
+static SDL_GPUShader *compile_shader_pfx(
+    SDL_GPUDevice *device,
+    const char *source,
+    const char *entrypoint,
+    SDL_ShaderCross_ShaderStage stage,
+    const char *prefix);
+
 static SDL_GPUShader *compile_shader(
     SDL_GPUDevice *device,
     const char *source,
     const char *entrypoint,
     SDL_ShaderCross_ShaderStage stage)
 {
+    return compile_shader_pfx(device, source, entrypoint, stage, NULL);
+}
+
+/* Compile with an optional #define prefix prepended to the source —
+ * the shader-variant mechanism (e.g. "#define DSVP_DILATE 1\n"). */
+static SDL_GPUShader *compile_shader_pfx(
+    SDL_GPUDevice *device,
+    const char *source,
+    const char *entrypoint,
+    SDL_ShaderCross_ShaderStage stage,
+    const char *prefix)
+{
+    char *combined = NULL;
+    if (prefix) {
+        size_t pl = strlen(prefix), sl = strlen(source);
+        combined = malloc(pl + sl + 1);
+        if (!combined) return NULL;
+        memcpy(combined, prefix, pl);
+        memcpy(combined + pl, source, sl + 1);
+        source = combined;
+    }
+
     const char *stage_name =
         (stage == SDL_SHADERCROSS_SHADERSTAGE_VERTEX) ? "vert" : "frag";
 
@@ -558,6 +895,7 @@ static SDL_GPUShader *compile_shader(
 
     size_t spirv_size = 0;
     void *spirv = SDL_ShaderCross_CompileSPIRVFromHLSL(&hlsl_info, &spirv_size);
+    free(combined);   /* HLSL consumed — prefix copy no longer needed */
     if (!spirv) {
         log_msg("ERROR: HLSL->SPIRV failed (%s): %s", stage_name, SDL_GetError());
         return NULL;
@@ -628,16 +966,23 @@ int gpu_create_pipelines(PlayerState *ps) {
         SDL_SHADERCROSS_SHADERSTAGE_VERTEX);
     if (!vert) return -1;
 
-    /* ── Compile planar YUV fragment shader ── */
-    SDL_GPUShader *frag_yuv = compile_shader(
+    /* ── Compile planar YUV fragment shader, BOTH sampler variants ──
+     * Fixed (unrolled 4x4, DSVP_DILATE=0): bound at 1:1/upscale — the
+     * proven-fast path; the dilated kernels' dynamic [loop] bounds
+     * cost real GPU time even at df == 1 (field-measured: broke 4K60
+     * under software-decode UMA contention). Dilated (DSVP_DILATE=1):
+     * bound only when actually downscaling, where it is the correct
+     * filter (anti-moire, Tier 3b item 8). At 1:1 both produce
+     * identical pixels, so selection never changes the picture. */
+    SDL_GPUShader *frag_yuv = compile_shader_pfx(
         ps->gpu_device, hlsl_yuv_planar_frag, "main",
-        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
+        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, "#define DSVP_DILATE 0\n");
     if (!frag_yuv) {
         SDL_ReleaseGPUShader(ps->gpu_device, vert);
         return -1;
     }
 
-    /* ── Create YUV planar pipeline ── */
+    /* ── Create YUV planar pipelines ── */
     SDL_GPUColorTargetDescription color_desc;
     SDL_zero(color_desc);
     color_desc.format = SDL_GetGPUSwapchainTextureFormat(
@@ -654,16 +999,57 @@ int gpu_create_pipelines(PlayerState *ps) {
     ps->gpu_pipeline_yuv = SDL_CreateGPUGraphicsPipeline(
         ps->gpu_device, &pipe_info);
 
+    /* Second variant targeting the RGBA16 intermediate: a pipeline's
+     * color-target format must match the attachment it renders into,
+     * and the default path draws into gpu_tex_frame
+     * (R16G16B16A16_UNORM), not the swapchain. Binding the
+     * swapchain-format pipeline there was spec-undefined (RADV
+     * happened to tolerate it — review P1-6). */
+    color_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+    ps->gpu_pipeline_yuv_frame = SDL_CreateGPUGraphicsPipeline(
+        ps->gpu_device, &pipe_info);
+    color_desc.format = SDL_GetGPUSwapchainTextureFormat(
+        ps->gpu_device, ps->window);
+
     /* Shaders are baked into the pipeline — release the objects */
     SDL_ReleaseGPUShader(ps->gpu_device, frag_yuv);
 
-    if (!ps->gpu_pipeline_yuv) {
+    if (!ps->gpu_pipeline_yuv || !ps->gpu_pipeline_yuv_frame) {
         log_msg("ERROR: Failed to create YUV pipeline: %s", SDL_GetError());
         SDL_ReleaseGPUShader(ps->gpu_device, vert);
         return -1;
     }
     log_msg("GPU: swapchain format = %d", (int)color_desc.format);
-    log_msg("GPU: YUV planar pipeline created");
+    log_msg("GPU: YUV planar pipelines created (fixed 4x4, swapchain + frame)");
+
+    /* Dilated variant — non-fatal: without it, downscale falls back to
+     * the fixed kernels (pre-item-8 quality, full speed).
+     * DSVP_NO_DILATE=1 skips it entirely — the one-run falsification
+     * switch for "is the dilated sampler the problem". */
+    if (!SDL_getenv("DSVP_NO_DILATE")) {
+        SDL_GPUShader *frag_dil = compile_shader_pfx(
+            ps->gpu_device, hlsl_yuv_planar_frag, "main",
+            SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, "#define DSVP_DILATE 1\n");
+        if (frag_dil) {
+            pipe_info.fragment_shader = frag_dil;
+            ps->gpu_pipeline_yuv_dilated = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &pipe_info);
+            /* Intermediate-target variant (see fixed-kernel pair above).
+             * Non-fatal like the swapchain dilated: a frame-target
+             * downscale just falls back to the fixed frame pipeline. */
+            color_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+            ps->gpu_pipeline_yuv_dilated_frame = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &pipe_info);
+            color_desc.format = SDL_GetGPUSwapchainTextureFormat(
+                ps->gpu_device, ps->window);
+            SDL_ReleaseGPUShader(ps->gpu_device, frag_dil);
+        }
+        if (ps->gpu_pipeline_yuv_dilated)
+            log_msg("GPU: YUV planar pipeline created (dilated, for downscale)");
+        else
+            log_msg("WARN: dilated YUV pipeline unavailable (%s) — "
+                    "fixed kernels for downscale too", SDL_GetError());
+    }
 
     /* Vertex shader done — safe to release now */
     SDL_ReleaseGPUShader(ps->gpu_device, vert);
@@ -727,6 +1113,42 @@ int gpu_create_pipelines(PlayerState *ps) {
             return -1;
         }
         log_msg("GPU: overlay pipeline created (alpha blend)");
+    }
+
+    /* ── Create frame-blit pipeline (no blend — blit covers the target) ── */
+    {
+        SDL_GPUShader *vert_blit = compile_shader(
+            ps->gpu_device, hlsl_fullscreen_vert, "main",
+            SDL_SHADERCROSS_SHADERSTAGE_VERTEX);
+        SDL_GPUShader *frag_blit = compile_shader(
+            ps->gpu_device, hlsl_blit_frag, "main",
+            SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
+        if (vert_blit && frag_blit) {
+            SDL_GPUColorTargetDescription blit_desc;
+            SDL_zero(blit_desc);
+            blit_desc.format = SDL_GetGPUSwapchainTextureFormat(
+                ps->gpu_device, ps->window);
+
+            SDL_GPUGraphicsPipelineCreateInfo blit_pipe;
+            SDL_zero(blit_pipe);
+            blit_pipe.vertex_shader   = vert_blit;
+            blit_pipe.fragment_shader = frag_blit;
+            blit_pipe.primitive_type  = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP;
+            blit_pipe.target_info.num_color_targets         = 1;
+            blit_pipe.target_info.color_target_descriptions = &blit_desc;
+
+            ps->gpu_pipeline_blit = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &blit_pipe);
+        }
+        if (vert_blit) SDL_ReleaseGPUShader(ps->gpu_device, vert_blit);
+        if (frag_blit) SDL_ReleaseGPUShader(ps->gpu_device, frag_blit);
+        if (ps->gpu_pipeline_blit) {
+            log_msg("GPU: frame-blit pipeline created");
+        } else {
+            /* Not fatal: the direct render path works without it. */
+            log_msg("WARN: frame-blit pipeline unavailable (%s) — "
+                    "direct render path", SDL_GetError());
+        }
     }
 
     /* ── Create sampler (linear filtering, no anisotropy) ──
@@ -836,6 +1258,210 @@ int gpu_create_pipelines(PlayerState *ps) {
     return 0;
 }
 
+/* ── System-level display HDR (docs/TODO-HDR.md) ──
+ *
+ * KWin's Wayland color management ACCEPTS a PQ surface without ever
+ * switching the DISPLAY into HDR — it tone-maps to SDR itself
+ * (verified 2026-08-07: no HDR infoframe, colorspace=Default on the
+ * DRM connector). The per-output HDR switch is compositor policy
+ * with no client protocol — but it IS scriptable: kscreen-doctor
+ * output.<name>.hdr.enable flips the same property as the KDE GUI,
+ * instantly, and the kernel confirms with colorspace=BT2020_RGB +
+ * an HDR_OUTPUT_METADATA blob on the wire. So DSVP orchestrates it:
+ * enable while an HDR file plays fullscreen (the desktop is covered
+ * the whole time), restore on close/quit. DSVP_NO_SYS_HDR=1 opts
+ * out; every failure path falls back to the compositor-rendered
+ * behaviour, which is today's baseline. */
+
+/* kscreen-doctor colours its output with ANSI escapes even into a
+ * pipe — the first field-test parse failed on exactly that (matched
+ * "Output:" against "\x1b[1mOutput:"). Strip CSI sequences in place
+ * before any matching. */
+static void strip_ansi(char *s) {
+    char *w = s;
+    for (char *r = s; *r; ) {
+        if (*r == 0x1b && r[1] == '[') {
+            r += 2;
+            while (*r && !(*r >= '@' && *r <= '~')) r++;
+            if (*r) r++;   /* consume the final byte */
+        } else *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+/* Find the connected, enabled output whose HDR capability is real
+ * ("HDR: enabled|disabled" — the internal panel says "incapable").
+ * Records the output name and its CURRENT HDR state so revert can
+ * restore rather than blindly disable. Returns 1 if found.
+ * Parser is host-unit-tested against coloured, plain, and
+ * prior-enabled fixtures built from real kscreen-doctor output. */
+static int hdr_sys_detect(PlayerState *ps) {
+    ps->hdr_sys_output[0] = '\0';
+    if (SDL_getenv("DSVP_NO_SYS_HDR")) return 0;
+
+    FILE *fp = popen("kscreen-doctor -o 2>/dev/null", "r");
+    if (!fp) {
+        log_msg("HDR sys: popen(kscreen-doctor) failed");
+        return 0;
+    }
+
+    char line[512];
+    char cur_name[32] = "";
+    int  cur_enabled = 0;
+    int  lines_seen = 0, outputs_seen = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lines_seen++;
+        strip_ansi(line);
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+
+        if (strncmp(s, "Output:", 7) == 0) {
+            /* "Output: 2 DP-1 <uuid>" — name is the third token */
+            outputs_seen++;
+            cur_name[0] = '\0';
+            cur_enabled = 0;
+            char idx[16];
+            if (sscanf(s, "Output: %15s %31s", idx, cur_name) != 2)
+                cur_name[0] = '\0';
+        } else if (strncmp(s, "enabled", 7) == 0 &&
+                   (s[7]=='\n' || s[7]=='\0' || s[7]=='\r' || s[7]==' ')) {
+            cur_enabled = 1;
+        } else if (strncmp(s, "HDR: ", 5) == 0) {
+            if (cur_enabled && cur_name[0] && !strstr(s, "incapable")) {
+                /* Sanitize before this ever reaches a shell */
+                int ok = 1;
+                for (const char *c = cur_name; *c; c++)
+                    if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||
+                          (*c>='0'&&*c<='9')||*c=='-')) { ok = 0; break; }
+                if (ok) {
+                    snprintf(ps->hdr_sys_output, sizeof(ps->hdr_sys_output),
+                             "%s", cur_name);
+                    ps->hdr_sys_prior_hdr = (strstr(s, "enabled") != NULL);
+                    pclose(fp);
+                    log_msg("HDR sys: output %s is HDR-capable (currently %s)",
+                            ps->hdr_sys_output,
+                            ps->hdr_sys_prior_hdr ? "enabled" : "disabled");
+                    return 1;
+                }
+            }
+        }
+    }
+    pclose(fp);
+    log_msg("HDR sys: no HDR-capable enabled output found "
+            "(read %d lines, %d outputs) — compositor-rendered fallback",
+            lines_seen, outputs_seen);
+    return 0;
+}
+
+/* Flip the output's HDR + wide-gamut state. Best-effort: a failure
+ * leaves us on the compositor-rendered path, which still works. */
+static void hdr_sys_set(PlayerState *ps, int on) {
+    if (!ps->hdr_sys_output[0]) return;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "kscreen-doctor output.%s.hdr.%s output.%s.wcg.%s "
+             ">/dev/null 2>&1",
+             ps->hdr_sys_output, on ? "enable" : "disable",
+             ps->hdr_sys_output, on ? "enable" : "disable");
+    int rc = system(cmd);
+    log_msg("HDR sys: display HDR %s on %s (rc=%d)",
+            on ? "ENABLED" : "restored to disabled",
+            ps->hdr_sys_output, rc);
+}
+
+/* Restore the display if we quit while an HDR file was playing.
+ * player_close covers normal file close; this covers app exit. */
+void hdr_output_shutdown(PlayerState *ps) {
+    if (ps->hdr_sys_enabled_by_us) {
+        hdr_sys_set(ps, 0);
+        ps->hdr_sys_enabled_by_us = 0;
+    }
+}
+
+/* ── HDR output switching (docs/TODO-HDR.md) ──
+ * Reconcile the swapchain with (mode, content, display support).
+ * The DESKTOP is never touched: we request an HDR10/ST2084 surface
+ * for our window only; the compositor engages display HDR while we
+ * present and reverts when we stop. Pipelines are format-bound to
+ * the swapchain, so a switch recreates them (the ~400 ms shader
+ * recompile hides behind the TV's own 1-2 s HDR mode-switch blank;
+ * the recreated overlay texture is safe by the fresh-texture
+ * full-upload rule). Called at file open, file close, and Z. */
+void hdr_output_apply(PlayerState *ps) {
+    if (!ps->gpu_device || !ps->window) return;
+
+    int want = ps->hdr_out_mode == 1
+            && ps->hdr_pass_content
+            && SDL_WindowSupportsGPUSwapchainComposition(ps->gpu_device,
+                   ps->window, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084);
+
+    if (want == ps->hdr_out_active) {
+        ps->gpu_uniforms.hdr_pass = want ? 1.0f : 0.0f;
+        return;
+    }
+
+    /* Engage the DISPLAY first: without this, KWin accepts the PQ
+     * surface but tone-maps it to an SDR output itself. The TV's own
+     * mode switch overlaps our pipeline recreation below. */
+    if (want) {
+        if (hdr_sys_detect(ps) && !ps->hdr_sys_prior_hdr) {
+            hdr_sys_set(ps, 1);
+            ps->hdr_sys_enabled_by_us = 1;
+        }
+    }
+
+    SDL_WaitForGPUIdle(ps->gpu_device);
+    if (!SDL_SetGPUSwapchainParameters(ps->gpu_device, ps->window,
+            want ? SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
+                 : SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+            SDL_GPU_PRESENTMODE_VSYNC)) {
+        log_msg("HDR out: swapchain switch failed (%s) — staying %s",
+                SDL_GetError(), ps->hdr_out_active ? "HDR" : "SDR");
+        ps->gpu_uniforms.hdr_pass = ps->hdr_out_active ? 1.0f : 0.0f;
+        if (want && ps->hdr_sys_enabled_by_us) {
+            hdr_sys_set(ps, 0);   /* don't leave the TV in HDR for SDR */
+            ps->hdr_sys_enabled_by_us = 0;
+        }
+        return;
+    }
+
+    gpu_destroy_pipelines(ps);
+    if (gpu_create_pipelines(ps) < 0) {
+        /* Limp back to SDR — an SDR-format pipeline set is the known-
+         * good configuration from startup. */
+        log_msg("ERROR: pipeline recreation after HDR switch failed — "
+                "reverting to SDR");
+        SDL_SetGPUSwapchainParameters(ps->gpu_device, ps->window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
+        /* The failed attempt has no self-cleanup — destroy whatever it
+         * did create before retrying, or the retry's unconditional
+         * assignments orphan those GPU objects (review P2-26). */
+        gpu_destroy_pipelines(ps);
+        if (gpu_create_pipelines(ps) < 0)
+            log_msg("FATAL: SDR pipeline recreation also failed");
+        ps->hdr_out_active = 0;
+        ps->gpu_uniforms.hdr_pass = 0.0f;
+        if (ps->hdr_sys_enabled_by_us) {
+            hdr_sys_set(ps, 0);
+            ps->hdr_sys_enabled_by_us = 0;
+        }
+        return;
+    }
+
+    ps->hdr_out_active = want;
+    ps->gpu_uniforms.hdr_pass = want ? 1.0f : 0.0f;
+    ps->frame_render_dirty = 1;   /* render state changed */
+    log_msg("HDR out: %s", want
+            ? "PASSTHROUGH — HDR10/ST2084 swapchain, display tone-maps"
+            : "SDR — tone-mapped output");
+
+    /* Leaving passthrough: restore the display to its prior state. */
+    if (!want && ps->hdr_sys_enabled_by_us) {
+        hdr_sys_set(ps, 0);
+        ps->hdr_sys_enabled_by_us = 0;
+    }
+}
+
 void gpu_destroy_pipelines(PlayerState *ps) {
     if (!ps->gpu_device) return;
 
@@ -857,10 +1483,76 @@ void gpu_destroy_pipelines(PlayerState *ps) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv);
         ps->gpu_pipeline_yuv = NULL;
     }
+    if (ps->gpu_pipeline_yuv_dilated) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_dilated);
+        ps->gpu_pipeline_yuv_dilated = NULL;
+    }
+    if (ps->gpu_pipeline_yuv_frame) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_frame);
+        ps->gpu_pipeline_yuv_frame = NULL;
+    }
+    if (ps->gpu_pipeline_yuv_dilated_frame) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_dilated_frame);
+        ps->gpu_pipeline_yuv_dilated_frame = NULL;
+    }
     if (ps->gpu_pipeline_overlay) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_overlay);
         ps->gpu_pipeline_overlay = NULL;
     }
+    if (ps->gpu_pipeline_blit) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_blit);
+        ps->gpu_pipeline_blit = NULL;
+    }
+    if (ps->gpu_tex_frame) {
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_frame);
+        ps->gpu_tex_frame = NULL;
+        ps->frame_tex_w = ps->frame_tex_h = 0;
+        ps->frame_tex_valid = 0;
+        ps->frame_render_dirty = 1;
+    }
+}
+
+/* Ensure the intermediate frame texture matches the swapchain size.
+ * Recreation invalidates contents — the caller re-renders before any
+ * blit (same fresh-texture rule as the overlay). Returns 0 on
+ * success, -1 if unavailable (caller falls back to direct render). */
+static int gpu_frame_tex_ensure(PlayerState *ps, int w, int h) {
+    if (!ps->gpu_pipeline_blit || w <= 0 || h <= 0) return -1;
+    if (ps->gpu_tex_frame && ps->frame_tex_w == w && ps->frame_tex_h == h)
+        return 0;
+
+    if (ps->gpu_tex_frame) {
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_frame);
+        ps->gpu_tex_frame = NULL;
+    }
+
+    SDL_GPUTextureCreateInfo info;
+    SDL_zero(info);
+    info.type                  = SDL_GPU_TEXTURETYPE_2D;
+    info.format                = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+    info.width                 = (Uint32)w;
+    info.height                = (Uint32)h;
+    info.layer_count_or_depth  = 1;
+    info.num_levels            = 1;
+    info.usage                 = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET
+                               | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+
+    ps->gpu_tex_frame = SDL_CreateGPUTexture(ps->gpu_device, &info);
+    if (!ps->gpu_tex_frame) {
+        /* Latch the fallback: retrying per frame would spam the log
+         * and re-fail; the direct path is the known-good baseline. */
+        log_msg("WARN: frame texture create failed (%s) — direct render "
+                "path for this session", SDL_GetError());
+        ps->frame_tex_w = ps->frame_tex_h = 0;
+        ps->no_intermediate = 1;
+        return -1;
+    }
+    ps->frame_tex_w = w;
+    ps->frame_tex_h = h;
+    ps->frame_tex_valid = 0;
+    ps->frame_render_dirty = 1;
+    log_msg("GPU: frame texture created (%dx%d UNORM16)", w, h);
+    return 0;
 }
 
 
@@ -880,11 +1572,19 @@ void gpu_destroy_pipelines(PlayerState *ps) {
 static int gpu_create_video_textures(PlayerState *ps) {
     int w = ps->vid_w;
     int h = ps->vid_h;
-    int cw = w / 2;  /* chroma width  (4:2:0) */
-    int ch = h / 2;  /* chroma height (4:2:0) */
+    /* ceil — FFmpeg allocates ceil(w/2) chroma for odd dimensions;
+     * truncating dropped the last chroma column/row and skewed the
+     * chroma texture geometry by half a texel across the frame
+     * (DSVP main fdbb489). */
+    int cw = (w + 1) / 2;  /* chroma width  (4:2:0) */
+    int ch = (h + 1) / 2;  /* chroma height (4:2:0) */
 
+    /* Key on the UPLOAD format, not the codec format: deep sources on
+     * the swscale path land in yuv420p10le and need R16 too. */
     int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
-                    || (ps->vaapi_active && !ps->vaapi_nv12));
+                    && !ps->sws_ctx)
+                   || (ps->vaapi_active && !ps->vaapi_nv12)
+                   || (ps->sws_ctx && ps->sws_out_10bit);
 
     SDL_GPUTextureFormat fmt = is_10bit
         ? SDL_GPU_TEXTUREFORMAT_R16_UNORM
@@ -1064,7 +1764,13 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         if (is_full_range) {
             ps->gpu_uniforms.rangeY[0]  = 0.0f;
             ps->gpu_uniforms.rangeY[1]  = 65535.0f / 65472.0f;
-            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            /* Half-LSB chroma-neutral offset, same correction as every
+             * other full-range branch below: neutral code 512 is stored
+             * as 32768, and without the offset the shader lands at
+             * +32/65472 above true neutral — a constant color cast
+             * (review Q-4). 32 = half of one 10-bit LSB in the <<6
+             * P010 representation. */
+            ps->gpu_uniforms.rangeUV[0] = 32.0f / 65535.0f;
             ps->gpu_uniforms.rangeUV[1] = 65535.0f / 65472.0f;
         } else {
             ps->gpu_uniforms.rangeY[0]  = 4096.0f / 65535.0f;
@@ -1086,7 +1792,12 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         if (is_full_range) {
             ps->gpu_uniforms.rangeY[0]  = 0.0f;
             ps->gpu_uniforms.rangeY[1]  = 1.0f;
-            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            /* Full-range chroma neutral is (2^n)/2, i.e. code 128 of 0..255,
+             * but the shader computes code/(2^n - 1) - 0.5, which puts the
+             * neutral half a code low (H.273: E_Cb = (code - 2^(n-1))/(2^n - 1)).
+             * Offsetting by half an LSB removes a constant colour cast on
+             * full-range (JPEG-range) content. Limited range is already exact. */
+            ps->gpu_uniforms.rangeUV[0] = 0.5f / 255.0f;
             ps->gpu_uniforms.rangeUV[1] = 1.0f;
         } else {
             ps->gpu_uniforms.rangeY[0]  = 16.0f / 255.0f;
@@ -1104,7 +1815,8 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         if (is_full_range) {
             ps->gpu_uniforms.rangeY[0]  = 0.0f;
             ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
-            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            /* half-LSB full-range chroma neutral, see note above */
+            ps->gpu_uniforms.rangeUV[0] = 0.5f / 65535.0f;
             ps->gpu_uniforms.rangeUV[1] = 65535.0f / 1023.0f;
         } else {
             ps->gpu_uniforms.rangeY[0]  = 64.0f / 65535.0f;
@@ -1122,7 +1834,12 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         if (is_full_range) {
             ps->gpu_uniforms.rangeY[0]  = 0.0f;
             ps->gpu_uniforms.rangeY[1]  = 1.0f;
-            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            /* Full-range chroma neutral is (2^n)/2, i.e. code 128 of 0..255,
+             * but the shader computes code/(2^n - 1) - 0.5, which puts the
+             * neutral half a code low (H.273: E_Cb = (code - 2^(n-1))/(2^n - 1)).
+             * Offsetting by half an LSB removes a constant colour cast on
+             * full-range (JPEG-range) content. Limited range is already exact. */
+            ps->gpu_uniforms.rangeUV[0] = 0.5f / 255.0f;
             ps->gpu_uniforms.rangeUV[1] = 1.0f;
         } else {
             ps->gpu_uniforms.rangeY[0]  = 16.0f / 255.0f;
@@ -1133,6 +1850,19 @@ static void gpu_setup_uniforms(PlayerState *ps) {
 
         log_msg("GPU: uniforms set (%s, 8-bit %s range → shader)",
                 cs_name, is_full_range ? "full" : "limited");
+
+    } else if (ps->sws_ctx && ps->sws_out_10bit) {
+        /* swscale fallback, 10-bit destination — full-range yuv420p10le
+         * through the R16 path. Same math as 10-bit full-range
+         * passthrough: codes 0..1023 in 16-bit words, half-LSB chroma
+         * neutral (see note above). */
+        ps->gpu_uniforms.rangeY[0]  = 0.0f;
+        ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
+        ps->gpu_uniforms.rangeUV[0] = 0.5f / 65535.0f;
+        ps->gpu_uniforms.rangeUV[1] = 65535.0f / 1023.0f;
+
+        log_msg("GPU: uniforms set (%s, full range 10-bit via swscale)",
+                cs_name);
 
     } else {
         /* swscale fallback — outputs full-range YUV420P, identity range */
@@ -1180,8 +1910,8 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      * UV planes are half (4:2:0 chroma subsampling). */
     ps->gpu_uniforms.texSizeY[0]  = (float)ps->vid_w;
     ps->gpu_uniforms.texSizeY[1]  = (float)ps->vid_h;
-    ps->gpu_uniforms.texSizeUV[0] = (float)(ps->vid_w / 2);
-    ps->gpu_uniforms.texSizeUV[1] = (float)(ps->vid_h / 2);
+    ps->gpu_uniforms.texSizeUV[0] = (float)((ps->vid_w + 1) / 2);
+    ps->gpu_uniforms.texSizeUV[1] = (float)((ps->vid_h + 1) / 2);
 
     /* ── Chroma siting correction ──
      *
@@ -1196,40 +1926,78 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      * chroma texels away from center. Shader applies: uv + offset / texSizeUV.
      */
     enum AVChromaLocation chroma_loc = AVCHROMA_LOC_LEFT; /* safe default */
-    if (ps->fmt_ctx) {
+    if (ps->sws_ctx) {
+        /* swscale path: the OUTPUT siting was pinned explicitly via
+         * dst_chr_pos at context creation (source siting for 4:2:0
+         * inputs — same-geometry conversions don't move chroma — LEFT
+         * for genuinely resampled 422/444/RGB inputs). Reconstruct at
+         * that siting. Replaces the old blanket zero-offset, whose
+         * "sws re-sites to center" premise is false for unscaled depth
+         * conversions (DSVP main df16dc8). */
+        chroma_loc = (enum AVChromaLocation)ps->sws_dst_siting;
+    } else if (ps->fmt_ctx) {
         AVCodecParameters *par =
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
         if (par->chroma_location != AVCHROMA_LOC_UNSPECIFIED)
             chroma_loc = par->chroma_location;
+        else if (par->color_primaries == AVCOL_PRI_BT2020)
+            /* BT.2020 sites 4:2:0 chroma TOP-LEFT by spec; the LEFT
+             * default is the BT.709-era convention. Re-encodes often
+             * strip the VUI siting flag, so unspecified BT.2020 gets
+             * the spec default — a quarter-texel VERTICAL correction
+             * that SDR files never see. */
+            chroma_loc = AVCHROMA_LOC_TOPLEFT;
     }
     ps->chroma_location = (int)chroma_loc;
 
+    /* SIGN NOTE (fixed 2026-07-31): these were all negated, which moved
+     * chroma a full luma pixel the WRONG way instead of correcting a half
+     * pixel — and since LEFT is both the default and the siting of nearly
+     * all H.264/HEVC content, it was active on essentially every file.
+     *
+     * Derivation for LEFT at 1:1 (W=4 luma, CW=2 chroma): chroma sample 0
+     * is co-sited with luma column 0. Output pixel 0 samples at uv=0.125,
+     * so in chroma space pos = 0.125*2 - 0.5 = -0.25 — the kernel lands a
+     * quarter texel left of sample 0. To center it on the sample the
+     * lookup must move +0.25 texels, not -0.25. The -0.25 figure is the
+     * swscale FILTER-PHASE convention, which is the negative of a
+     * coordinate offset; the shader applies it as a coordinate.
+     * CENTER=0 is self-consistent either way, which is why this survived.
+     *
+     * Vertical: LEFT/CENTER are vertically centered (0). The vertical
+     * signs below follow the same derivation in the vertex shader's
+     * top-left-origin uv space, but only apply to the rare TOP and BOTTOM
+     * sitings - worth a synthetic-pattern check if such a file turns up. */
     switch (chroma_loc) {
         case AVCHROMA_LOC_CENTER:
             ps->gpu_uniforms.chromaOffset[0] =  0.0f;
             ps->gpu_uniforms.chromaOffset[1] =  0.0f;
             break;
         case AVCHROMA_LOC_TOPLEFT:
-            ps->gpu_uniforms.chromaOffset[0] = -0.25f;
-            ps->gpu_uniforms.chromaOffset[1] = -0.25f;
+            ps->gpu_uniforms.chromaOffset[0] =  0.25f;
+            ps->gpu_uniforms.chromaOffset[1] =  0.25f;
             break;
         case AVCHROMA_LOC_TOP:
             ps->gpu_uniforms.chromaOffset[0] =  0.0f;
-            ps->gpu_uniforms.chromaOffset[1] = -0.25f;
+            ps->gpu_uniforms.chromaOffset[1] =  0.25f;
             break;
         case AVCHROMA_LOC_BOTTOMLEFT:
-            ps->gpu_uniforms.chromaOffset[0] = -0.25f;
-            ps->gpu_uniforms.chromaOffset[1] =  0.25f;
+            ps->gpu_uniforms.chromaOffset[0] =  0.25f;
+            ps->gpu_uniforms.chromaOffset[1] = -0.25f;
             break;
         case AVCHROMA_LOC_BOTTOM:
             ps->gpu_uniforms.chromaOffset[0] =  0.0f;
-            ps->gpu_uniforms.chromaOffset[1] =  0.25f;
+            ps->gpu_uniforms.chromaOffset[1] = -0.25f;
             break;
         default: /* LEFT and fallback */
-            ps->gpu_uniforms.chromaOffset[0] = -0.25f;
+            ps->gpu_uniforms.chromaOffset[0] =  0.25f;
             ps->gpu_uniforms.chromaOffset[1] =  0.0f;
             break;
     }
+
+    /* (No sws zero-out here anymore: the shader offset above is derived
+     * from the explicitly pinned sws OUTPUT siting when sws is active —
+     * see the chroma_loc selection.) */
 
     ps->gpu_uniforms.frameCount = 0.0f;
 
@@ -1239,7 +2007,8 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      *   1. color_trc == SMPTE2084 (PQ) — catches all HDR10 content
      *   2. DOVI_CONF in coded_side_data — catches DV P5 where color_trc
      *      is often UNSPECIFIED
-     *   3. color_trc == ARIB_STD_B67 (HLG) — flagged but not processed yet
+     *   3. color_trc == ARIB_STD_B67 (HLG) — inverse OETF + BT.2100
+     *      OOTF in the shader, then the shared BT.2390 tone map
      *
      * Primaries classification (separate from HDR detection):
      *   - color_primaries == BT2020 → true BT.2020, needs gamut mapping
@@ -1252,6 +2021,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      *   3. 1000 nit fallback (standard for most HDR10 content)
      */
     int is_hdr = 0;
+    int is_hlg = 0;
     int is_dolby_vision = 0;
     int has_pq_transfer = 0;
     float peak_nits = 0.0f;
@@ -1267,8 +2037,14 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             has_pq_transfer = 1;
             log_msg("HDR: detected PQ transfer (SMPTE ST 2084)");
         } else if (par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
-            /* HLG — flag for future support, don't activate HDR path yet */
-            log_msg("HDR: detected HLG transfer (not yet processed)");
+            /* HLG: the shader converts inverse-OETF + BT.2100 OOTF
+             * (Lw=1000) to display light, then the shared BT.2390 path
+             * tone-maps. Previously detected-but-rendered-as-SDR:
+             * washed out and desaturated on every HLG file
+             * (DSVP main fdbb489). */
+            is_hdr = 1;
+            is_hlg = 1;
+            log_msg("HDR: detected HLG transfer (ARIB STD-B67)");
         }
 
         /* --- Dolby Vision fallback (DV P5 often has UNSPECIFIED trc) --- */
@@ -1340,6 +2116,102 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             }
         }
 
+        /* ── HDR10 static metadata → SDL window properties ──
+         * Consumed by the local SDL patch (tools/sdl-patches/
+         * sdl-3.4.2-hdr-metadata.patch): on the next HDR10 swapchain
+         * (re)creation SDL calls vkSetHdrMetadataEXT and Mesa's WSI
+         * hands the compositor a fully populated parametric image
+         * description — KWin stops tone-mapping our surface blind.
+         * Stock (unpatched) SDL ignores the properties entirely.
+         * Forward only when BOTH primaries and luminance are present
+         * (a zeroed VkHdrMetadataEXT is worse than none); CLL rides
+         * along when available (0 = unknown, per CTA-861). Properties
+         * are re-staged every open, with max_luminance=0 as the
+         * "nothing to forward" state, so SDR files and metadata-less
+         * HDR never inherit stale values. DSVP_NO_HDR_META=1 disables
+         * for A/B. */
+        {
+            SDL_PropertiesID wp = SDL_GetWindowProperties(ps->window);
+            float fw_maxlum = 0.0f;
+            const AVPacketSideData *fw_mdm = av_packet_side_data_get(
+                par->coded_side_data, par->nb_coded_side_data,
+                AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            if (is_hdr && !SDL_getenv("DSVP_NO_HDR_META")
+                    && fw_mdm
+                    && fw_mdm->size >= (int)sizeof(AVMasteringDisplayMetadata)) {
+                const AVMasteringDisplayMetadata *m =
+                    (const AVMasteringDisplayMetadata *)fw_mdm->data;
+                if (m->has_primaries && m->has_luminance
+                        && av_q2d(m->max_luminance) > 0.0) {
+                    fw_maxlum = (float)av_q2d(m->max_luminance);
+                    /* AVMasteringDisplayMetadata primaries order: R,G,B */
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.red_x",
+                        (float)av_q2d(m->display_primaries[0][0]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.red_y",
+                        (float)av_q2d(m->display_primaries[0][1]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.green_x",
+                        (float)av_q2d(m->display_primaries[1][0]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.green_y",
+                        (float)av_q2d(m->display_primaries[1][1]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.blue_x",
+                        (float)av_q2d(m->display_primaries[2][0]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.blue_y",
+                        (float)av_q2d(m->display_primaries[2][1]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.white_x",
+                        (float)av_q2d(m->white_point[0]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.white_y",
+                        (float)av_q2d(m->white_point[1]));
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.min_luminance",
+                        (float)av_q2d(m->min_luminance));
+                    float fw_cll = 0.0f, fw_fall = 0.0f;
+                    const AVPacketSideData *fw_cll_sd =
+                        av_packet_side_data_get(
+                            par->coded_side_data, par->nb_coded_side_data,
+                            AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+                    if (fw_cll_sd && fw_cll_sd->size >=
+                            (int)sizeof(AVContentLightMetadata)) {
+                        const AVContentLightMetadata *c =
+                            (const AVContentLightMetadata *)fw_cll_sd->data;
+                        fw_cll  = (float)c->MaxCLL;
+                        fw_fall = (float)c->MaxFALL;
+                    }
+                    /* Sanitize to the protocol-legal envelope. Disc
+                     * metadata is routinely self-inconsistent (field
+                     * case: a famous 4000-nit-mastered title declaring
+                     * MaxCLL 9918 — authoring-tool artifact), and
+                     * Mesa's Wayland WSI validates hard
+                     * (is_hdr_metadata_legal: max_cll ≤ max_luminance,
+                     * max_fall ≤ max_cll ≤ ...) and silently DROPS all
+                     * metadata on any violation ("MESA: warning: Not
+                     * using HDR metadata to avoid protocol errors").
+                     * Trust the mastering block (measured at the
+                     * facility) over CLL (computed by tools). */
+                    if (fw_cll > fw_maxlum) {
+                        log_msg("HDR: MaxCLL %.0f exceeds mastering "
+                                "peak %.0f — clamped (disc metadata "
+                                "inconsistency; protocol requires "
+                                "CLL ≤ mastering max)",
+                                fw_cll, fw_maxlum);
+                        fw_cll = fw_maxlum;
+                    }
+                    if (fw_fall > 0.0f && fw_cll > 0.0f
+                            && fw_fall > fw_cll) {
+                        log_msg("HDR: MaxFALL %.0f exceeds MaxCLL %.0f "
+                                "— clamped", fw_fall, fw_cll);
+                        fw_fall = fw_cll;
+                    }
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.max_cll",  fw_cll);
+                    SDL_SetFloatProperty(wp, "dsvp.hdr.max_fall", fw_fall);
+                    log_msg("HDR: static metadata staged for swapchain "
+                            "(maxLum=%.0f minLum=%.4f CLL=%.0f FALL=%.0f — "
+                            "patched SDL consumes, stock SDL ignores)",
+                            fw_maxlum, av_q2d(m->min_luminance),
+                            fw_cll, fw_fall);
+                }
+            }
+            SDL_SetFloatProperty(wp, "dsvp.hdr.max_luminance", fw_maxlum);
+        }
+
         /* Fallback: no metadata → 1000 nits (standard HDR10 assumption) */
         if (is_hdr && peak_nits == 0.0f) {
             peak_nits = 1000.0f;
@@ -1363,20 +2235,93 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         /* DV-only (no PQ transfer tag, e.g. Profile 5):
          * Base layer is IPTPQc2 — needs DV reshaping pipeline.
          * The DV decode chain outputs BT.2020, so set gamut accordingly.
-         * DV uniforms will be populated from first decoded frame's RPU. */
-        is_dovi_active = 1;
-        hdr_gamut = 1.0f;
-        log_msg("HDR: Dolby Vision Profile 5 — DV reshape pipeline active");
+         * DV uniforms will be populated from first decoded frame's RPU.
+         *
+         * Spec-conforming P5 is always 10-bit 4:2:0; the full-range
+         * override below hardwires 10-bit scale factors, so a
+         * mistagged/nonconforming stream on any other upload path would
+         * get a 64x range scale — white garbage with no diagnostic
+         * (DSVP main 7f09ae0). Guard on the deck's actual 10-bit
+         * arrival paths: VAAPI P010 or software yuv420p10le — the same
+         * predicate gpu_create_video_textures uses to pick R16. */
+        int is_10bit_path =
+            (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
+             || (ps->vaapi_active && !ps->vaapi_nv12));
+        if (is_10bit_path) {
+            is_dovi_active = 1;
+            hdr_gamut = 1.0f;
+            log_msg("HDR: Dolby Vision Profile 5 — DV reshape pipeline active");
+        } else {
+            log_msg("WARN: DV P5 tagged but not on a 10-bit path "
+                    "(VAAPI P010 / yuv420p10le) — DV pipeline disabled "
+                    "for this file");
+        }
     } else if (is_hdr && has_bt2020_primaries) {
         hdr_gamut = 1.0f;   /* 1.0 = BT.2020 primaries */
+    } else if (!is_hdr && has_bt2020_primaries) {
+        /* SDR tagged BT.2020: shader converts primaries to 709 in
+         * linear light (was displayed unconverted — visibly
+         * desaturated). (DSVP main fdbb489.) */
+        hdr_gamut = 1.0f;
+        log_msg("SDR BT.2020 content — gamut conversion to 709 active");
     }
 
+    /* HLG carries no mastering metadata worth trusting; the OOTF is a
+     * fixed 1000-nit nominal, so pin the peak — a stray MaxCLL from
+     * the container must not stretch the tone map. The PQ scene-peak
+     * histogram is likewise gated off in video_display: its bin→nits
+     * conversion decodes PQ and is meaningless for HLG's relative
+     * signal. */
+    if (is_hlg)
+        peak_nits = 1000.0f;
+
     ps->gpu_uniforms.is_hdr        = is_hdr ? 1.0f : 0.0f;
+    ps->gpu_uniforms.is_hlg        = is_hlg ? 1.0f : 0.0f;
+    ps->gpu_uniforms.hdr_pass      = 0.0f;  /* hdr_output_apply() decides */
     ps->gpu_uniforms.hdr_peak_nits = peak_nits;
+
+    /* HDR passthrough eligibility (docs/TODO-HDR.md): every HDR class
+     * now rides the HDR10 container — HDR10/DV-P8 ship PQ as-is, DV
+     * P5 re-encodes to PQ after the per-frame RPU reshape (item 5,
+     * DV-as-HDR10 — what an LLDV player does internally), HLG
+     * converts via OOTF + PQ OETF in-shader (item 4). */
+    ps->hdr_pass_content = is_hdr;
     ps->gpu_uniforms.hdr_gamut     = hdr_gamut;
     ps->gpu_uniforms.hdr_debug     = 0.0f;
     ps->gpu_uniforms.is_dovi       = is_dovi_active ? 1.0f : 0.0f;
     ps->gpu_uniforms.is_semiplanar = 0.0f;
+
+    /* Output transfer for tone-mapped content. Displays decode ~2.2
+     * regardless of "sRGB support" — the sRGB piecewise toe lifts
+     * shadows on a calibrated screen, so pure power 2.2 is the
+     * reference-faithful default. DSVP_OUTPUT_GAMMA=srgb|2.2|2.4
+     * sets the startup value; the E key cycles live. Deck note: the
+     * internal panel decodes ~2.2; docked to an OLED TV, 2.4 is worth
+     * an eye test both ways. SDR passthrough is untouched (gamma-in =
+     * gamma-out was already faithful). (DSVP main fdbb489.)
+     *
+     * out_gamma_pref survives file opens like hdr_target_nits does:
+     * env parsed only while unset (0), so an E-key choice is not
+     * clobbered by the next open. Pref 1.0 = sRGB (uniform 0.0). */
+    if (ps->out_gamma_pref == 0.0f) {
+        float pref = 2.2f;
+        const char *og = SDL_getenv("DSVP_OUTPUT_GAMMA");
+        if (og) {
+            if (SDL_strcasecmp(og, "srgb") == 0) pref = 1.0f;
+            else {
+                double v = SDL_atof(og);
+                if (v >= 1.0 && v <= 3.0) pref = (float)v;
+                else log_msg("WARN: DSVP_OUTPUT_GAMMA='%s' ignored", og);
+            }
+        }
+        ps->out_gamma_pref = pref;
+    }
+    ps->gpu_uniforms.out_gamma =
+        (ps->out_gamma_pref == 1.0f) ? 0.0f : ps->out_gamma_pref;
+    log_msg("Output transfer: %s",
+            ps->out_gamma_pref == 1.0f ? "sRGB piecewise" :
+            ps->out_gamma_pref == 2.2f ? "gamma 2.2 (default)" :
+                                         "custom gamma");
 
     /* DV P5 range override: container says limited but IPTPQc2 is full-range.
      * Must happen after normal range setup since it overrides those values.
@@ -1419,6 +2364,13 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             ps->gpu_uniforms.dovi_c2[0][c] = 0.0f;
         }
         /* Identity matrices (will be overwritten by first frame) */
+        /* MMR off until the first RPU says otherwise */
+        memset(ps->gpu_uniforms.dovi_mmr_meta, 0,
+               sizeof(ps->gpu_uniforms.dovi_mmr_meta));
+        memset(ps->gpu_uniforms.dovi_mmr_ct, 0,
+               sizeof(ps->gpu_uniforms.dovi_mmr_ct));
+        memset(ps->gpu_uniforms.dovi_mmr_cp, 0,
+               sizeof(ps->gpu_uniforms.dovi_mmr_cp));
         memset(ps->gpu_uniforms.dovi_ycc_r0, 0, 4 * sizeof(float));
         memset(ps->gpu_uniforms.dovi_ycc_r1, 0, 4 * sizeof(float));
         memset(ps->gpu_uniforms.dovi_ycc_r2, 0, 4 * sizeof(float));
@@ -1481,7 +2433,10 @@ static void gpu_setup_uniforms(PlayerState *ps) {
  */
 
 /* Ensure overlay texture and transfer buffer exist at the given size.
- * Recreates if dimensions changed. Returns 0 on success, -1 on error. */
+ * Recreates if dimensions changed. Returns 1 if the texture was
+ * (re)created — its contents are undefined VRAM and the caller must
+ * upload the FULL height before it is drawn — 0 if already the right
+ * size, -1 on error. */
 int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     if (!ps->gpu_device || width <= 0 || height <= 0) return -1;
 
@@ -1539,6 +2494,11 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     ps->overlay_tex_w = width;
     ps->overlay_tex_h = height;
     ps->overlay_dirty = 0;
+    /* Contents are undefined VRAM until a full-height upload lands.
+     * Callers that use the return value handle this themselves; the
+     * player_open pre-alloc discards it — gpu_overlay_upload widens
+     * the first band to full height when this is set (review P1-5). */
+    ps->overlay_tex_undefined = 1;
 
     log_msg("GPU: overlay texture created (%dx%d RGBA, alloc %.0fms)",
             width, height, (get_time_sec() - alloc_start) * 1000.0);
@@ -1553,23 +2513,57 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
         }
     }
 
-    return 0;
+    return 1;
 }
 
 /* Upload RGBA pixel data to the overlay GPU texture.
  * `rgba` must be width×height×4 bytes, tightly packed. */
 void gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba,
-                        int width, int height) {
+                        int width, int height, int y0, int y1) {
     if (!ps->gpu_overlay_xfer || !ps->gpu_overlay_tex) return;
     if (width != ps->overlay_tex_w || height != ps->overlay_tex_h) return;
 
-    /* Map transfer buffer and copy pixel data */
+    /* Fresh texture with no full-height upload yet: widen this band to
+     * cover every row, or the fullscreen composite samples undefined
+     * VRAM in the rows nobody drew (review P1-5; reachable via the
+     * player_open pre-alloc when its size matches the window). The
+     * CPU pixel buffer is always fully initialized, so full-height is
+     * safe from any caller. */
+    if (ps->overlay_tex_undefined) {
+        y0 = 0;
+        y1 = height;
+        ps->overlay_tex_undefined = 0;
+    }
+
+    /* Bound the copy to the changed rows (DSVP main 135914f). A
+     * full-frame upload moved the whole overlay through the transfer
+     * buffer AND the GPU copy every frame just to show a seekbar;
+     * overlay.c already tracks the cleared/drawn row bands. */
+    if (y0 < 0) y0 = 0;
+    if (y1 > height) y1 = height;
+    if (y1 <= y0) return;
+
+    /* Union with any pending not-yet-copied window FIRST: map with
+     * cycle=true may hand a fresh buffer, so every row the pending GPU
+     * region will read must be rewritten from the persistent CPU-side
+     * pixel buffer. */
+    if (ps->overlay_dirty) {
+        if (ps->overlay_up_y0 < y0) y0 = ps->overlay_up_y0;
+        if (ps->overlay_up_y1 > y1) y1 = ps->overlay_up_y1;
+    }
+
     uint8_t *dst = SDL_MapGPUTransferBuffer(ps->gpu_device,
                                              ps->gpu_overlay_xfer, true);
-    if (!dst) return;
-    memcpy(dst, rgba, (size_t)width * height * 4);
+    if (!dst) {
+        log_msg("ERROR: overlay transfer map failed: %s", SDL_GetError());
+        return;
+    }
+    size_t off = (size_t)y0 * width * 4;
+    memcpy(dst + off, rgba + off, (size_t)(y1 - y0) * width * 4);
     SDL_UnmapGPUTransferBuffer(ps->gpu_device, ps->gpu_overlay_xfer);
 
+    ps->overlay_up_y0 = y0;
+    ps->overlay_up_y1 = y1;
     ps->overlay_dirty = 1;
 }
 
@@ -1579,6 +2573,18 @@ void gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba,
 void gpu_overlay_copy_cmd(SDL_GPUCommandBuffer *cmd, PlayerState *ps) {
     if (!ps->overlay_dirty || !ps->gpu_overlay_tex) return;
 
+    int cy0 = ps->overlay_up_y0;
+    int cy1 = ps->overlay_up_y1;
+    /* gpu_overlay_upload only sets overlay_dirty for a clamped non-empty
+     * band on the current texture, so this never fires — but the old
+     * "repair" fallback (cy1 = overlay_tex_h) could pair a stale cy0
+     * with it, wrap rows_per_layer negative through Uint32, and issue a
+     * massive over-read. Treat an invalid band as a skip, not a fix. */
+    if (cy0 < 0 || cy1 <= cy0 || cy1 > ps->overlay_tex_h) {
+        ps->overlay_dirty = 0;
+        return;
+    }
+
     SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
     {
         SDL_GPUTextureTransferInfo src_info;
@@ -1587,13 +2593,20 @@ void gpu_overlay_copy_cmd(SDL_GPUCommandBuffer *cmd, PlayerState *ps) {
         SDL_zero(src_info);
         SDL_zero(dst_region);
         src_info.transfer_buffer = ps->gpu_overlay_xfer;
+        src_info.offset          = (Uint32)((size_t)cy0
+                                       * ps->overlay_tex_w * 4);
         src_info.pixels_per_row  = ps->overlay_tex_w;
-        src_info.rows_per_layer  = ps->overlay_tex_h;
+        src_info.rows_per_layer  = cy1 - cy0;
         dst_region.texture = ps->gpu_overlay_tex;
+        dst_region.y = (Uint32)cy0;
         dst_region.w = ps->overlay_tex_w;
-        dst_region.h = ps->overlay_tex_h;
+        dst_region.h = (Uint32)(cy1 - cy0);
         dst_region.d = 1;
-        SDL_UploadToGPUTexture(copy, &src_info, &dst_region, true);
+        /* cycle MUST be false for a partial upload (DSVP main 56f7739):
+         * cycling lets SDL hand back a different backing allocation, so
+         * rows outside this region would hold undefined recycled
+         * content — it strobed the elements not re-uploaded that tick. */
+        SDL_UploadToGPUTexture(copy, &src_info, &dst_region, false);
     }
     SDL_EndGPUCopyPass(copy);
 
@@ -1607,7 +2620,11 @@ void gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
                       PlayerState *ps, Uint32 sc_w, Uint32 sc_h) {
     if (!ps->gpu_overlay_tex || !ps->gpu_pipeline_overlay || !ps->overlay_active)
         return;
-    (void)cmd;  /* uniform push would use cmd, but overlay has none */
+
+    /* SDR-authored overlay pixels need PQ re-encode on an HDR
+     * swapchain (see hlsl_overlay_frag). */
+    float ov_params[4] = { ps->hdr_out_active ? 1.0f : 0.0f, 0, 0, 0 };
+    SDL_PushGPUFragmentUniformData(cmd, 0, ov_params, sizeof(ov_params));
 
     SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_overlay);
 
@@ -1662,8 +2679,13 @@ void pq_init(PacketQueue *q) {
 
 void pq_destroy(PacketQueue *q) {
     pq_flush(q);
-    if (q->mutex) SDL_DestroyMutex(q->mutex);
-    if (q->cond)  SDL_DestroyCondition(q->cond);
+    /* NULL the handles: player_open() can fail BEFORE pq_init() runs on
+     * a re-open, and player_close() then calls pq_destroy() again on
+     * the previous file's already-destroyed (but non-NULL) handles —
+     * a use-after-free without this. SDL_DestroyMutex/Condition and
+     * SDL_LockMutex are NULL-safe, so double-destroy becomes a no-op. */
+    if (q->mutex) { SDL_DestroyMutex(q->mutex);    q->mutex = NULL; }
+    if (q->cond)  { SDL_DestroyCondition(q->cond); q->cond  = NULL; }
 }
 
 /* Push a packet onto the queue. Caller still owns pkt after this call
@@ -1699,6 +2721,21 @@ int pq_put(PacketQueue *q, AVPacket *pkt) {
 /* Pop a packet from the queue. If block=1, waits until data arrives
  * or abort_request is set. Returns 1 on success, 0 if non-blocking
  * and empty, -1 if aborted. */
+/* Unlink and free the head node, keeping the queue accounting exact.
+ * Moves the packet into *out when given, discards it otherwise.
+ * Caller must hold q->mutex and have checked q->first != NULL.
+ * (This five-line unlink used to exist as three inline copies.) */
+static void pq_unlink_head(PacketQueue *q, AVPacket *out) {
+    PacketNode *node = q->first;
+    q->first = node->next;
+    if (!q->first) q->last = NULL;
+    q->nb_packets--;
+    q->size -= node->pkt->size;
+    if (out) av_packet_move_ref(out, node->pkt);
+    av_packet_free(&node->pkt);
+    av_free(node);
+}
+
 int pq_get(PacketQueue *q, AVPacket *pkt, int block) {
     int ret = -1;
 
@@ -1709,16 +2746,8 @@ int pq_get(PacketQueue *q, AVPacket *pkt, int block) {
             break;
         }
 
-        PacketNode *node = q->first;
-        if (node) {
-            q->first = node->next;
-            if (!q->first) q->last = NULL;
-            q->nb_packets--;
-            q->size -= node->pkt->size;
-
-            av_packet_move_ref(pkt, node->pkt);
-            av_packet_free(&node->pkt);
-            av_free(node);
+        if (q->first) {
+            pq_unlink_head(q, pkt);
             ret = 1;
             break;
         } else if (!block) {
@@ -1733,6 +2762,38 @@ int pq_get(PacketQueue *q, AVPacket *pkt, int block) {
 }
 
 /* Flush all packets from the queue. Called on seek or close. */
+/* Drop head packets older than min_pts (stream time base). Keeps the
+ * subtitle queues as rolling windows: every track stays queued so an
+ * S-press has the current moment's packets on hand (an empty queue
+ * only fills from the demux read position, ~10s ahead of playback —
+ * the user-visible "subtitles don't work" delay), while memory stays
+ * bounded instead of accumulating for the whole file. Stops at a
+ * NOPTS head (can't judge it), so max_bytes backstops the tracks the
+ * PTS walk can't police: a NOPTS-emitting track (DVB teletext in TS)
+ * halted pruning permanently, and unselected tracks are never drained
+ * by decode — the queue grew unbounded for the whole file.
+ * Ported from DSVP main 55834d4; byte backstop added in review. */
+void pq_prune_stale(PacketQueue *q, int64_t min_pts, int max_bytes) {
+    SDL_LockMutex(q->mutex);
+    while (q->first && q->first->pkt->pts != AV_NOPTS_VALUE
+           && q->first->pkt->pts < min_pts)
+        pq_unlink_head(q, NULL);
+    while (q->first && q->size > max_bytes)
+        pq_unlink_head(q, NULL);
+    SDL_UnlockMutex(q->mutex);
+}
+
+/* Peek the PTS of the head packet without consuming it. Returns 1 with
+ * *pts_out set when a packet is queued, 0 when empty. Used by the
+ * subtitle drain to avoid consuming display sets before their time. */
+int pq_peek_pts(PacketQueue *q, int64_t *pts_out) {
+    SDL_LockMutex(q->mutex);
+    int have = (q->first != NULL);
+    if (have) *pts_out = q->first->pkt->pts;
+    SDL_UnlockMutex(q->mutex);
+    return have;
+}
+
 void pq_flush(PacketQueue *q) {
     SDL_LockMutex(q->mutex);
     PacketNode *node = q->first;
@@ -1760,12 +2821,19 @@ void pq_flush(PacketQueue *q) {
 static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
                                            const enum AVPixelFormat *pix_fmts)
 {
-    (void)ctx;  /* required by FFmpeg callback signature */
     for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_VAAPI)
             return AV_PIX_FMT_VAAPI;
     }
-    log_msg("VAAPI: hardware format not offered by decoder — software fallback");
+    /* Unsupported profile (HEVC 4:2:2/Rext etc.) — VAAPI not offered.
+     * This fires at first decode, after the whole VAAPI upload
+     * pipeline is already configured, so a mid-stream format switch
+     * is not safe; flag it and let the hard-error escalation abort,
+     * after which main.c reopens the file in software (review P2-17). */
+    PlayerState *ps = (PlayerState *)ctx->opaque;
+    if (ps) ps->vaapi_unsupported = 1;
+    log_msg("VAAPI: hardware format not offered by decoder — "
+            "will reopen in software decode");
     return AV_PIX_FMT_NONE;
 }
 #endif /* __linux__ */
@@ -2098,9 +3166,11 @@ static int import_dmabuf_plane(
     if (vr != VK_SUCCESS) {
         log_msg("ZEROCOPY: vkAllocateMemory failed (DMA-BUF import): %d", vr);
         vkDestroyImage(device, *out_image, NULL);
-        /* fd was consumed by the failed allocate call if VK spec says so,
-         * but to be safe, close dup_fd on allocation failure path.
-         * Actually, Vulkan takes ownership of fd even on failure for DMA_BUF. */
+        /* VK_KHR_external_memory_fd: the implementation takes ownership of
+         * the fd ONLY on success. On failure it is still ours and must be
+         * closed — the previous comment talked itself out of this and leaked
+         * one fd per failed import. */
+        close(dup_fd);
         return -1;
     }
 
@@ -2154,8 +3224,13 @@ static int vaapi_zerocopy_upload(PlayerState *ps)
 
     int w  = ps->vid_w;
     int h  = ps->vid_h;
-    int cw = w / 2;
-    int ch = h / 2;
+    /* ceil, matching gpu_tex_uv's creation dims, texSizeUV, and the
+     * readback deinterleave (the fdbb489 lesson): floor left the last
+     * chroma column/row of the destination unwritten on odd dims.
+     * Unreachable today (HEVC 4:2:0 crops in even units and zero-copy
+     * is HEVC-only) but kept consistent so it stays a non-bug. */
+    int cw = (w + 1) / 2;
+    int ch = (h + 1) / 2;
 
     /* Import Y plane */
     VkImage vk_img_y = VK_NULL_HANDLE;
@@ -2384,6 +3459,9 @@ int player_open(PlayerState *ps, const char *filename) {
 
     strncpy(ps->filepath, filename, sizeof(ps->filepath) - 1);
     ps->io_error = 0;
+    ps->vaapi_unsupported = 0;
+    ps->res_change_logged = 0;
+    ps->frame_tex_valid = 0;      /* stale content from previous file */
     ps->filepath[sizeof(ps->filepath) - 1] = '\0';
     if (log_anon_active()) {
         /* Redact file path — show only codec-relevant info for public logs */
@@ -2402,9 +3480,16 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->fmt_ctx->interrupt_callback.callback = io_interrupt_cb;
     ps->fmt_ctx->interrupt_callback.opaque   = ps;
 
+    /* "No networking whatsoever" is enforced, not just claimed: the
+     * bundled FFmpeg has network protocols compiled in, so without this
+     * whitelist a URL argument would happily demux over the network
+     * (DSVP main fdbb489). */
+    AVDictionary *open_opts = NULL;
+    av_dict_set(&open_opts, "protocol_whitelist", "file", 0);
     ps->io_deadline = get_time_sec() + 10.0;
-    ret = avformat_open_input(&ps->fmt_ctx, filename, NULL, NULL);
+    ret = avformat_open_input(&ps->fmt_ctx, filename, NULL, &open_opts);
     ps->io_deadline = 0.0;
+    av_dict_free(&open_opts);
     if (ret < 0) {
         log_msg("ERROR: avformat_open_input failed: %s", av_err2str(ret));
         return -1;
@@ -2435,10 +3520,21 @@ int player_open(PlayerState *ps, const char *filename) {
      * EAC3 compatibility track. Pick that instead.
      * When bitstream passthrough is active, TrueHD packets go straight to
      * the HDMI wire without decoding — no CPU cost, lossless output. */
+    /* Probe the sink BEFORE the TrueHD-selection decision: on the
+     * first file of a session the caps cache is empty, support_truehd
+     * reads false, and the Atmos track gets silently demoted to the
+     * compatibility track (field case 2026-08-09: Civil War never
+     * attempted TrueHD passthrough; the second file of the session
+     * worked because the first had populated the cache). */
+    if (ps->audio_mode != AUDIO_MODE_PCM && !ps->bitstream_caps.probed)
+        bitstream_probe(ps);
     if (ps->audio_stream_idx >= 0) {
         AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
         if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD &&
-            (ps->audio_mode == AUDIO_MODE_PCM || !ps->bitstream_caps.support_truehd)) {
+            (ps->audio_mode == AUDIO_MODE_PCM ||
+             !ps->bitstream_caps.support_truehd ||
+             bitstream_hd_blocked(AV_CODEC_ID_TRUEHD,
+                                  as->codecpar->sample_rate))) {
             log_msg("Audio: default stream is TrueHD — skipping (PCM mode or passthrough inactive)");
             int fallback = -1;
             for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
@@ -2515,7 +3611,8 @@ int player_open(PlayerState *ps, const char *filename) {
 #ifdef __linux__
         {
             const char *hwdec_env = getenv("DSVP_HWDEC");
-            int hwdec_disabled = (hwdec_env && hwdec_env[0] == '0');
+            int hwdec_disabled = (hwdec_env && hwdec_env[0] == '0')
+                              || ps->force_swdec;  /* P2-17 retry */
             enum AVCodecID cid = vs->codecpar->codec_id;
 
             if (cid == AV_CODEC_ID_HEVC && !hwdec_disabled) {
@@ -2535,6 +3632,7 @@ int player_open(PlayerState *ps, const char *filename) {
                     ps->video_codec_ctx->hw_device_ctx =
                         av_buffer_ref(ps->hw_device_ctx);
                     ps->video_codec_ctx->get_format = vaapi_get_format;
+                    ps->video_codec_ctx->opaque = ps;  /* for get_format */
                     use_vaapi = 1;
                     log_msg("VAAPI: attempting hardware decode for HEVC");
                 }
@@ -2596,6 +3694,11 @@ int player_open(PlayerState *ps, const char *filename) {
             }
             if (ret < 0) {
                 fprintf(stderr, "[DSVP] Cannot open video codec: %s\n", av_err2str(ret));
+                /* Free the codec context here: player_close's
+                 * (!playing && !fmt_ctx) guard makes it unreachable
+                 * after this return, and the next open would orphan
+                 * it (the audio path below already does this). */
+                avcodec_free_context(&ps->video_codec_ctx);
                 avformat_close_input(&ps->fmt_ctx);
                 return -1;
             }
@@ -2745,9 +3848,10 @@ int player_open(PlayerState *ps, const char *filename) {
             return -1;
         }
         /* Semi-planar UV plane: interleaved sample pairs → split into U and V.
-         * NV12: uint8 pairs (1 byte each), P010: uint16 pairs (2 bytes each). */
-        int cw = ps->vid_w / 2;
-        int ch = ps->vid_h / 2;
+         * NV12: uint8 pairs (1 byte each), P010: uint16 pairs (2 bytes each).
+         * ceil — matches texture + FFmpeg chroma allocation for odd dims. */
+        int cw = (ps->vid_w + 1) / 2;
+        int ch = (ps->vid_h + 1) / 2;
         int sample_bytes = ps->vaapi_nv12 ? 1 : 2;
         ps->p010_u_plane = (uint8_t *)av_malloc((size_t)cw * ch * sample_bytes);
         ps->p010_v_plane = (uint8_t *)av_malloc((size_t)cw * ch * sample_bytes);
@@ -2797,13 +3901,26 @@ int player_open(PlayerState *ps, const char *filename) {
             log_msg("swscale: bypassed (8-bit YUV420P, range in shader)");
 
         } else {
-            /* ── swscale path for all other formats ── */
-            enum AVPixelFormat dst_fmt = AV_PIX_FMT_YUV420P;
+            /* ── swscale path for all other formats ──
+             * Deep sources (12-bit HEVC, 10-bit AV1/VP9, 10-bit
+             * 4:2:2/4:4:4) convert to yuv420p10le and ride the R16
+             * upload path — converting to 8-bit here quantized the PQ
+             * signal to 256 codes BEFORE the EETF stretched it,
+             * guaranteeing shadow banding that no output dither can
+             * repair. 8-bit sources keep the 8-bit destination.
+             * (DSVP main df16dc8.) */
+            const AVPixFmtDescriptor *src_desc = av_pix_fmt_desc_get(src_fmt);
+            int src_depth = src_desc ? src_desc->comp[0].depth : 8;
+            ps->sws_out_10bit = (src_depth > 8);
+            enum AVPixelFormat dst_fmt = ps->sws_out_10bit
+                ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
             int dst_w = ps->vid_w;
             int dst_h = ps->vid_h;
 
             int sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
-            const char *sws_mode = "format convert (SWS_LANCZOS + ED dither)";
+            const char *sws_mode = ps->sws_out_10bit
+                ? "format convert to 10-bit (SWS_LANCZOS + ED dither)"
+                : "format convert (SWS_LANCZOS + ED dither)";
 
             ps->sws_ctx = sws_getContext(
                 ps->vid_w, ps->vid_h, src_fmt,
@@ -2861,26 +3978,49 @@ int player_open(PlayerState *ps, const char *filename) {
                     src_range ? "full" : "limited");
             }
 
-            /* ── Chroma siting ── */
+            /* ── Chroma siting ──
+             * Pin BOTH sides explicitly and remember the output siting.
+             * The old pin-dst-to-center approach assumed sws always
+             * re-sites chroma, but same-geometry conversions (420 depth
+             * changes — the common case once deep sources keep 10-bit)
+             * take unscaled per-plane converters that move nothing: the
+             * output keeps the SOURCE siting. Rule: 4:2:0 sources keep
+             * their siting (no resample happens or is needed); formats
+             * that genuinely resample chroma (422/444/RGB → 420) are
+             * pinned to LEFT, the H.264/HEVC convention. The shader
+             * offset is then derived from sws_dst_siting instead of
+             * being zeroed. (DSVP main df16dc8.) */
             {
                 AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
-                const char *chroma_desc = "default";
+                enum AVChromaLocation src_loc = par->chroma_location;
+                if (src_loc == AVCHROMA_LOC_UNSPECIFIED)
+                    src_loc = AVCHROMA_LOC_LEFT;
 
-                if (par->chroma_location == AVCHROMA_LOC_LEFT) {
-                    av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
-                    av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
-                    chroma_desc = "left (MPEG-2)";
-                } else if (par->chroma_location == AVCHROMA_LOC_CENTER) {
-                    av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 128, 0);
-                    av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 128, 0);
-                    chroma_desc = "center (MPEG-1/JPEG)";
-                } else if (par->chroma_location == AVCHROMA_LOC_TOPLEFT) {
-                    av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", 0, 0);
-                    av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", 0, 0);
-                    chroma_desc = "top-left";
-                }
+                /* AVChromaLocation → swscale chr_pos (1/256 luma units):
+                 * h: left=0 center=128; v: top=0 center=128 bottom=256 */
+                static const struct { int h, v; } chr_pos[] = {
+                    [AVCHROMA_LOC_LEFT]       = {   0, 128 },
+                    [AVCHROMA_LOC_CENTER]     = { 128, 128 },
+                    [AVCHROMA_LOC_TOPLEFT]    = {   0,   0 },
+                    [AVCHROMA_LOC_TOP]        = { 128,   0 },
+                    [AVCHROMA_LOC_BOTTOMLEFT] = {   0, 256 },
+                    [AVCHROMA_LOC_BOTTOM]     = { 128, 256 },
+                };
+                int src_is_420 = src_desc
+                    && src_desc->log2_chroma_w == 1
+                    && src_desc->log2_chroma_h == 1;
+                enum AVChromaLocation dst_loc =
+                    src_is_420 ? src_loc : AVCHROMA_LOC_LEFT;
 
-                log_msg("swscale: chroma siting=%s", chroma_desc);
+                av_opt_set_int(ps->sws_ctx, "src_h_chr_pos", chr_pos[src_loc].h, 0);
+                av_opt_set_int(ps->sws_ctx, "src_v_chr_pos", chr_pos[src_loc].v, 0);
+                av_opt_set_int(ps->sws_ctx, "dst_h_chr_pos", chr_pos[dst_loc].h, 0);
+                av_opt_set_int(ps->sws_ctx, "dst_v_chr_pos", chr_pos[dst_loc].v, 0);
+                ps->sws_dst_siting = (int)dst_loc;
+
+                log_msg("swscale: chroma siting src=%s dst=%s",
+                        av_chroma_location_name(src_loc),
+                        av_chroma_location_name(dst_loc));
             }
 
             log_msg("swscale: mode=%s", sws_mode);
@@ -2943,7 +4083,39 @@ int player_open(PlayerState *ps, const char *filename) {
     }
 
     /* ── Set up GPU color uniforms ── */
+    /* ── Intermediate-texture aptness (per file) ──
+     * The render-at-content-rate intermediate only pays when content
+     * rate sits below display refresh — that's when redundant
+     * re-renders exist to skip (24p on 60Hz: 36 of 60). At content ==
+     * refresh (4K60 SDR) it saves zero renders and its ~6GB/s blit
+     * bandwidth pushed the saturated UMA over the edge: present fell
+     * to ~40. Rule: intermediate iff content fps < 75% of refresh —
+     * 24/25/30 qualify, 48/50/60 render direct. Keyed on frame rate,
+     * NOT the HDR flag: 24p SDR film (the bulk of the library) keeps
+     * the benefit, and any 60fps HDR renders direct like it must. */
+    {
+        double content_fps = 0.0;
+        AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
+        if (vs->avg_frame_rate.den > 0)
+            content_fps = av_q2d(vs->avg_frame_rate);
+
+        double refresh = 60.0;
+        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(
+            SDL_GetPrimaryDisplay());
+        if (dm && dm->refresh_rate > 0.0f)
+            refresh = (double)dm->refresh_rate;
+
+        ps->intermediate_apt =
+            (content_fps > 0.0 && content_fps < refresh * 0.75);
+        log_msg("Render: content %.2f fps vs %.0f Hz refresh — %s",
+                content_fps, refresh,
+                ps->intermediate_apt
+                    ? "intermediate (render at content rate)"
+                    : "direct (content at/near refresh — nothing to save)");
+    }
+
     gpu_setup_uniforms(ps);
+    hdr_output_apply(ps);   /* engage/revert HDR swapchain per content */
 
     /* ── Init packet queues ── */
     pq_init(&ps->video_pq);
@@ -2975,6 +4147,25 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->audio_clock_sync = 0.0;
     ps->av_bias = 0.0;
     ps->av_bias_samples = 0;
+    /* Pacing state is per-file: a playlist transition must not
+     * inherit the previous file's display cadence, drift, or drop
+     * history. */
+    ps->drift_resync_ticks = 0;
+    ps->pace_ring_n        = 0;
+    ps->pace_ring_pos      = 0;
+    ps->pace_median        = 0.0;
+    ps->pace_last_present  = 0.0;
+    ps->pace_mode          = PACE_SCHEDULED;
+    ps->pace_enter_streak  = 0;
+    ps->pace_exit_streak   = 0;
+    ps->pace_drift_streak  = 0;
+    ps->last_av_diff       = 0.0;
+    ps->sched_off          = 0.0;
+    ps->sched_off_valid    = 0;
+    ps->sched_chain        = 0;
+    ps->sched_chain_start  = 0.0;
+    ps->pace_bias_ref      = 0.0;
+    ps->hdrwire_logged     = 0;
     ps->video_clock      = 0.0;
 
     /* Suppress frame drops until the first frame is displayed.
@@ -2992,6 +4183,13 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->diag_timer_snaps      = 0;
     ps->diag_max_av_drift     = 0.0;
     ps->diag_last_report      = get_time_sec();
+
+    /* Real-time FPS window */
+    ps->fps_window_start   = 0.0;
+    ps->fps_window_frames  = 0;
+    ps->rfps_window_frames = 0;
+    ps->fps_content        = 0.0;
+    ps->fps_render         = 0.0;
 
     /* ── Probe HDMI sink for bitstream capabilities (once per session) ── */
     if (!ps->bitstream_caps.probed)
@@ -3077,8 +4275,18 @@ void player_close(PlayerState *ps) {
     SDL_SignalCondition(ps->video_pq.cond);
     SDL_SignalCondition(ps->audio_pq.cond);
 
-    /* Wake and wait for decode thread (must exit before codec free) */
-    if (ps->decode_cond)  SDL_SignalCondition(ps->decode_cond);
+    /* Wake and wait for decode thread (must exit before codec free).
+     * The signal must be sent under decode_mutex: the decode thread
+     * checks its predicate and enters SDL_WaitCondition while holding
+     * the mutex — an unlocked signal can land in that window and be
+     * lost, leaving SDL_WaitThread below blocked forever (the other
+     * two signal sites, main.c consume and the demux seek flush, both
+     * hold the mutex; only this path skipped it). */
+    if (ps->decode_cond) {
+        SDL_LockMutex(ps->decode_mutex);
+        SDL_SignalCondition(ps->decode_cond);
+        SDL_UnlockMutex(ps->decode_mutex);
+    }
     if (ps->decode_thread) {
         SDL_WaitThread(ps->decode_thread, NULL);
         ps->decode_thread = NULL;
@@ -3124,13 +4332,16 @@ void player_close(PlayerState *ps) {
 
     /* Free buffers */
     if (ps->rgb_buffer)    { av_free(ps->rgb_buffer);    ps->rgb_buffer    = NULL; }
-    if (ps->audio_buf)     { av_free(ps->audio_buf);     ps->audio_buf     = NULL; }
+    if (ps->audio_buf)     { av_free(ps->audio_buf);     ps->audio_buf     = NULL; ps->audio_buf_cap = 0; }
     if (ps->p010_u_plane)  { av_free(ps->p010_u_plane);  ps->p010_u_plane  = NULL; }
     if (ps->p010_v_plane)  { av_free(ps->p010_v_plane);  ps->p010_v_plane  = NULL; }
 
     /* Free scale/resample contexts */
     if (ps->sws_ctx)      { sws_freeContext(ps->sws_ctx); ps->sws_ctx = NULL; }
+    ps->sws_out_10bit = 0;
+    ps->sws_dst_siting = 0;
     if (ps->swr_ctx)      { swr_free(&ps->swr_ctx); ps->swr_ctx = NULL; }
+    av_channel_layout_uninit(&ps->swr_in_layout);
 
     /* Free codecs */
     if (ps->video_codec_ctx) avcodec_free_context(&ps->video_codec_ctx);
@@ -3178,7 +4389,14 @@ void player_close(PlayerState *ps) {
     ps->sub_is_bitmap      = 0;
     ps->sub_bitmap_count   = 0;
     ps->sub_text[0]        = '\0';
+    sub_text_cues_clear(ps);
     ps->sub_osd[0]         = '\0';
+
+    /* Revert to the SDR swapchain: the browser/idle screen is SDR
+     * content, and the design rule is explicit — desktop-facing state
+     * never stays in HDR past file close. */
+    ps->hdr_pass_content = 0;
+    hdr_output_apply(ps);
 
     /* Reset window (skip resize if fullscreen — actual size is monitor) */
     SDL_SetWindowTitle(ps->window, DSVP_WINDOW_TITLE);
@@ -3206,6 +4424,13 @@ int demux_thread_func(void *arg) {
     while (!ps->quit) {
         /* ── Handle seek requests ── */
         if (ps->seek_request) {
+            /* Clear the request BEFORE latching the target (P2-8): a
+             * player_seek() landing during av_seek_frame re-sets the
+             * flag and the next loop iteration serves it. The old
+             * post-processing clear erased such requests — held-key
+             * seeks on slow media dropped presses. Worst-case
+             * interleaving now duplicates a seek; it never drops one. */
+            ps->seek_request = 0;
             int64_t target = ps->seek_target;
             log_msg("Demux: seeking to %.3f s", (double)target / AV_TIME_BASE);
 
@@ -3215,15 +4440,34 @@ int demux_thread_func(void *arg) {
             SDL_LockMutex(ps->seek_mutex);
             ps->seeking = 1;
 
-            /* Pause audio device so callback can't touch audio codec */
-            if (ps->audio_stream)
+            /* Pause audio device so callback can't touch audio codec.
+             * BARRIER: pause does not wait for an in-flight callback —
+             * SDL holds the stream lock while running the get-callback,
+             * so lock+unlock returns only after any in-flight
+             * audio_decode_frame() has finished. Only then is the codec
+             * safe to flush. */
+            if (ps->audio_stream) {
                 SDL_PauseAudioStreamDevice(ps->audio_stream);
+                SDL_LockAudioStream(ps->audio_stream);
+                SDL_UnlockAudioStream(ps->audio_stream);
+            }
 
             ps->io_deadline = get_time_sec() + 10.0;
             int ret = av_seek_frame(ps->fmt_ctx, -1, target, ps->seek_flags);
             ps->io_deadline = 0.0;
             if (ret < 0) {
-                log_msg("ERROR: Seek failed: %s", av_err2str(ret));
+                /* Failure epilogue (P2-9): the demuxer never moved.
+                 * Do NOT reset clocks to the phantom target, discard
+                 * the decoded frame, clear the audio pipeline, or
+                 * signal a bitstream reset — just resume the audio we
+                 * paused above and carry on at the old position. */
+                log_msg("ERROR: Seek failed: %s — continuing at current "
+                        "position", av_err2str(ret));
+                ps->seeking = 0;
+                SDL_UnlockMutex(ps->seek_mutex);
+                if (ps->audio_stream && !ps->paused)
+                    SDL_ResumeAudioStreamDevice(ps->audio_stream);
+                continue;
             } else {
                 log_msg("Demux: av_seek_frame OK, flushing queues");
                 pq_flush(&ps->video_pq);
@@ -3240,9 +4484,10 @@ int demux_thread_func(void *arg) {
                     avcodec_flush_buffers(ps->sub_codec_ctx);
                 ps->sub_valid = 0;
                 ps->sub_text[0] = '\0';
+                sub_text_cues_clear(ps);  /* seek = clear-all (P2-16) */
                 log_msg("Demux: all codecs flushed");
             }
-            ps->seek_request = 0;
+            /* seek_request was cleared before processing (P2-8) */
             ps->eof = 0;
 
             /* Reset audio decode buffer (safe — callback is paused) */
@@ -3278,8 +4523,15 @@ int demux_thread_func(void *arg) {
              * ~100ms, HEVC with long GOPs may take 5–10 seconds.
              * Cleared in main.c when a frame is actually shown. */
             ps->seek_recovering = 1;
-            ps->av_bias = 0.0;
-            ps->av_bias_samples = 0;
+            /* av_bias is NOT reset here. It models the systematic latency of
+             * the audio pipeline (SDL + device buffering that audio_clock_sync
+             * under-counts), which is a property of the output path, not of
+             * playback position — it is identical either side of a seek.
+             * Zeroing it meant the ~-70ms steady-state offset was measured
+             * raw again after every seek, crossing the -50ms drop threshold
+             * and discarding 2-5 good frames until the EMA re-converged.
+             * That is the entire "frame dropped ... A/V drift: -57..-97ms"
+             * burst that follows every seek in the logs. */
 
             /* Flush any pre-seek audio still queued in SDL pipeline.
              * Audio stays PAUSED until the first video frame is displayed
@@ -3343,17 +4595,54 @@ int demux_thread_func(void *arg) {
             break; /* real error — exit demux loop, player_close will clean up */
         }
 
-        /* Route packet to the correct queue */
+        /* Route packet to the correct queue.
+         * pq_put only takes ownership on success; on node-alloc failure the
+         * packet is still ours and must be unreffed or its payload leaks. */
         if (pkt->stream_index == ps->video_stream_idx) {
-            pq_put(&ps->video_pq, pkt);
+            if (pq_put(&ps->video_pq, pkt) < 0) av_packet_unref(pkt);
         } else if (pkt->stream_index == ps->audio_stream_idx) {
-            pq_put(&ps->audio_pq, pkt);
+            if (pq_put(&ps->audio_pq, pkt) < 0) av_packet_unref(pkt);
         } else {
-            /* Check subtitle streams */
+            /* Check subtitle streams.
+             * Only the SELECTED track is queued. Every catalogued track used
+             * to be queued while only the selected one ever drained, so on a
+             * long remux with many PGS tracks the unread queues grew for the
+             * whole session, and switching to one of them at minute 90 then
+             * decoded its entire backlog synchronously on the main thread.
+             * (Seeks flushed them, so this only bit an uninterrupted watch.)
+             * sub_selection: 0 = off, 1..sub_count = track. Read unsynchronised
+             * from the main thread; the worst case during a switch is one
+             * packet landing in a queue that sub_cycle flushes immediately. */
+            /* REVISED (from DSVP main 55834d4): queue EVERY track, pruned
+             * to a rolling window just behind the playback clock.
+             *
+             * Selected-only queueing (the previous behaviour) made S feel
+             * broken: the fresh queue only fills from the demux read
+             * position, which runs ~10s ahead of playback, so the packets
+             * covering the moment on screen had already been read and
+             * discarded — subtitles appeared only once playback caught up.
+             * Queueing everything unpruned grew unbounded on multi-track
+             * remuxes. The rolling window keeps switching instant AND
+             * memory bounded (SUB_PRUNE_WINDOW_SEC per track, sized just
+             * over the decoder's SUB_STALE_CAP_SEC stale-skip so nothing
+             * prunable would have been decoded anyway; SUB_PQ_MAX_BYTES
+             * backstops NOPTS tracks the PTS walk can't judge). */
             int routed = 0;
             for (int i = 0; i < ps->sub_count; i++) {
                 if (pkt->stream_index == ps->sub_stream_indices[i]) {
-                    pq_put(&ps->sub_pqs[i], pkt);
+                    if (pq_put(&ps->sub_pqs[i], pkt) < 0)
+                        av_packet_unref(pkt);
+                    double now = player_clock(ps);
+                    AVStream *st =
+                        ps->fmt_ctx->streams[ps->sub_stream_indices[i]];
+                    double tb = av_q2d(st->time_base);
+                    if (now > SUB_PRUNE_WINDOW_SEC && tb > 0.0)
+                        pq_prune_stale(&ps->sub_pqs[i],
+                                       (int64_t)((now - SUB_PRUNE_WINDOW_SEC) / tb),
+                                       SUB_PQ_MAX_BYTES);
+                    else
+                        pq_prune_stale(&ps->sub_pqs[i], INT64_MIN,
+                                       SUB_PQ_MAX_BYTES);
                     routed = 1;
                     break;
                 }
@@ -3371,87 +4660,11 @@ int demux_thread_func(void *arg) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * Video Decode & Display
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Decode one video frame from the packet queue.
- * Returns 1 if a frame was decoded, 0 if no packets available, -1 on error. */
-int video_decode_frame(PlayerState *ps) {
-    AVPacket pkt;
-    int ret;
-
-    /* If a seek is in progress, skip decode entirely.
-     * The demux thread holds seek_mutex and is flushing codecs. */
-    if (ps->seeking) return 0;
-
-    /* Lock to prevent demux thread from flushing codecs mid-decode */
-    if (!SDL_TryLockMutex(ps->seek_mutex)) {
-        return 0; /* mutex held by seek — skip this frame */
-    }
-
-    for (;;) {
-        /* Try to receive a decoded frame first (may have buffered frames).
-         * VAAPI path: receive into hw_frame (VAAPI surface), then
-         * av_hwframe_transfer_data to get NV12/P010 in system memory. */
-        AVFrame *recv_frame = ps->vaapi_active ? ps->hw_frame : ps->video_frame;
-        ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
-        if (ret == 0) {
-            /* ── VAAPI: transfer GPU surface → system memory ── */
-            if (ps->vaapi_active) {
-                av_frame_unref(ps->video_frame);
-                ret = av_hwframe_transfer_data(ps->video_frame, ps->hw_frame, 0);
-                if (ret < 0) {
-                    log_msg("ERROR: av_hwframe_transfer_data failed: %s", av_err2str(ret));
-                    av_frame_unref(ps->hw_frame);
-                    SDL_UnlockMutex(ps->seek_mutex);
-                    return -1;
-                }
-                /* Copy timing metadata (PTS, etc.) from hw frame */
-                av_frame_copy_props(ps->video_frame, ps->hw_frame);
-                av_frame_unref(ps->hw_frame);
-            }
-
-            /* Got a frame — compute its PTS in seconds.
-             * best_effort_timestamp is preferred: FFmpeg computes it
-             * from DTS/packet timing even when the codec doesn't set
-             * frame->pts (required for VC-1, some MPEG-2, etc.). */
-            AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
-            double pts = 0.0;
-            int64_t frame_pts = ps->video_frame->best_effort_timestamp;
-            if (frame_pts == AV_NOPTS_VALUE)
-                frame_pts = ps->video_frame->pts;
-            if (frame_pts != AV_NOPTS_VALUE) {
-                pts = (double)frame_pts * av_q2d(vs->time_base);
-            }
-            ps->video_clock = pts;
-            SDL_UnlockMutex(ps->seek_mutex);
-            return 1;
-        }
-        if (ret != AVERROR(EAGAIN)) {
-            log_msg("ERROR: avcodec_receive_frame (video) failed: %s", av_err2str(ret));
-            SDL_UnlockMutex(ps->seek_mutex);
-            return -1; /* decoder error */
-        }
-
-        /* Need to feed more packets to the decoder */
-        ret = pq_get(&ps->video_pq, &pkt, 0);
-        if (ret <= 0) {
-            SDL_UnlockMutex(ps->seek_mutex);
-            return 0;  /* no packets available right now */
-        }
-
-        avcodec_send_packet(ps->video_codec_ctx, &pkt);
-        av_packet_unref(&pkt);
-    }
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
  * Decode Thread
  * ═══════════════════════════════════════════════════════════════════
  *
- * Runs video_decode_frame() logic in a background thread, feeding
- * one decoded frame at a time to the main loop via decoded_frame.
+ * Decodes video frames in a background thread, feeding one decoded
+ * frame at a time to the main loop via decoded_frame.
  *
  * The main loop consumes the frame when frame_timer permits, then
  * signals decode_cond so this thread can decode the next one.
@@ -3463,6 +4676,8 @@ int video_decode_frame(PlayerState *ps) {
 int decode_thread_func(void *arg) {
     PlayerState *ps = (PlayerState *)arg;
     log_msg("Decode thread started");
+
+    int hard_err_streak = 0;  /* consecutive non-EAGAIN receive_frame errors */
 
     /* ── Stall diagnostic state ── */
     double diag_last_frame_time = 0.0;  /* wall time of last decoded frame */
@@ -3500,8 +4715,8 @@ int decode_thread_func(void *arg) {
 
         /* ── Lock seek_mutex to prevent codec flush mid-decode ──
          * TryLock: if the demux thread is seeking (holds the mutex),
-         * we yield instead of blocking — same pattern as the old
-         * synchronous video_decode_frame(). */
+         * we yield instead of blocking — same pattern the old
+         * synchronous main-loop decode used. */
         if (!SDL_TryLockMutex(ps->seek_mutex)) {
             diag_seekmtx_count++;
             SDL_Delay(1);
@@ -3561,8 +4776,17 @@ int decode_thread_func(void *arg) {
                 int64_t frame_pts = ps->decoded_frame->best_effort_timestamp;
                 if (frame_pts == AV_NOPTS_VALUE)
                     frame_pts = ps->decoded_frame->pts;
-                double pts = (frame_pts != AV_NOPTS_VALUE)
-                    ? (double)frame_pts * av_q2d(vs->time_base) : 0.0;
+                /* A PTS-less frame used to be timestamped 0.0, which made the
+                 * clock jump to the start of the file for one frame: a phantom
+                 * multi-second A/V drift, a spurious drop, and a poisoned EMA.
+                 * Extrapolate from the previous frame instead. */
+                double pts;
+                if (frame_pts != AV_NOPTS_VALUE) {
+                    pts = (double)frame_pts * av_q2d(vs->time_base);
+                } else {
+                    pts = ps->decoded_pts + (ps->frame_last_delay > 0.0
+                                             ? ps->frame_last_delay : 0.0);
+                }
 
                 ps->decoded_pts = pts;
                 got_frame = 1;
@@ -3570,10 +4794,28 @@ int decode_thread_func(void *arg) {
             }
             if (ret != AVERROR(EAGAIN)) {
                 /* AVERROR_EOF = decoder fully drained */
-                if (ret == AVERROR_EOF)
+                if (ret == AVERROR_EOF) {
                     ps->decode_eof = 1;
+                    hard_err_streak = 0;
+                } else {
+                    /* A persistent hard error used to be retried forever with
+                     * no log and no flag: video froze on the last frame, the
+                     * stall watchdog paused audio, and there was no route back
+                     * to the browser. vaapi_get_format returning NONE (HEVC
+                     * 4:2:2, unsupported profile) lands here, because it fires
+                     * at first decode rather than at avcodec_open2 where the
+                     * software-retry path lives. Escalate to io_error, which
+                     * main.c already tears down cleanly. */
+                    if (++hard_err_streak >= 30) {
+                        log_msg("ERROR: video decode failing persistently (%s)"
+                                " - aborting playback", av_err2str(ret));
+                        ps->io_error = 1;
+                        hard_err_streak = 0;
+                    }
+                }
                 break;
             }
+            hard_err_streak = 0;
 
             diag_eagain_count++;
 
@@ -3652,9 +4894,16 @@ int decode_thread_func(void *arg) {
 #endif
 
         if (got_frame) {
-            /* Hand off to main loop */
+            /* Hand off to main loop. A seek can complete in the gap
+             * since seek_mutex was released above: its flush unref'd
+             * decoded_frame under decode_mutex. Re-asserting ready
+             * would hand main an empty frame with a stale pre-seek
+             * decoded_pts — video_clock briefly wrong, one-frame
+             * hiccup (review P2-6). Only publish a frame that
+             * survived. */
             SDL_LockMutex(ps->decode_mutex);
-            ps->decode_frame_ready = 1;
+            if (ps->decoded_frame->buf[0])
+                ps->decode_frame_ready = 1;
             SDL_UnlockMutex(ps->decode_mutex);
         } else {
             SDL_Delay(1); /* no packets or error — yield */
@@ -3961,10 +5210,14 @@ static void dovi_log_frame_metadata(PlayerState *ps, const AVFrame *frame)
  * with rgb_to_lms on the CPU to save a shader matrix multiply. */
 
 /* BT.2100 ICtCp inverse cone matrix (LMS → BT.2020 linear RGB) */
+/* Crosstalk-FREE HPE inverse (DSVP main df16dc8). Dolby Vision outputs
+ * BT.2020-referred HPE LMS; inverting the full BT.2100 cone matrix (which
+ * carries the 4% crosstalk term) conjugated an uncompensated crosstalk
+ * through every DV P5 pixel. Constants match libplacebo's dovi_lms2rgb. */
 static const double ictcp_lms_to_bt2020[3][3] = {
-    {  3.43661,  -2.50645,   0.06985 },
-    { -0.79133,   1.98360,  -0.19227 },
-    { -0.02595,  -0.09891,   1.12486 },
+    {  3.06441879, -2.16597676,  0.10155818 },
+    { -0.65612108,  1.78554118, -0.12943749 },
+    {  0.01736321, -0.04725154,  1.03004253 },
 };
 
 static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
@@ -3991,6 +5244,16 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
      * float4 arrays indexed [piece][component] for GPU access. */
     float pivot_scale = (float)((1 << hdr->bl_bit_depth) - 1);
     if (pivot_scale < 1.0f) pivot_scale = 1023.0f; /* safety fallback */
+
+    /* MMR banks default to off (orders 0) — set below if the RPU uses
+     * MMR for a chroma component. Re-zeroed per frame: RPUs can switch
+     * mapping method between scenes. */
+    memset(ps->gpu_uniforms.dovi_mmr_meta, 0,
+           sizeof(ps->gpu_uniforms.dovi_mmr_meta));
+    memset(ps->gpu_uniforms.dovi_mmr_ct, 0,
+           sizeof(ps->gpu_uniforms.dovi_mmr_ct));
+    memset(ps->gpu_uniforms.dovi_mmr_cp, 0,
+           sizeof(ps->gpu_uniforms.dovi_mmr_cp));
 
     for (int c = 0; c < 3; c++) {
         const AVDOVIReshapingCurve *curve = &mapping->curves[c];
@@ -4019,16 +5282,46 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
                     (order >= 2)
                     ? (float)((double)curve->poly_coef[p][2] / coef_scale)
                     : 0.0f;
+            } else if (curve->mapping_idc[p] == AV_DOVI_MAPPING_MMR
+                       && (c == 1 || c == 2) && p == 0) {
+                /* MMR chroma reshaping — the cross-channel polynomial
+                 * nearly all real P5 content uses for Ct/Cp. Uniform
+                 * budget carries ONE MMR bank per chroma component, so
+                 * only piece 0 may be MMR; the shader dispatches the
+                 * method after its pivot search, so on a multi-piece
+                 * curve the remaining pieces still evaluate their own
+                 * (polynomial) coefficients. The poly slot gets
+                 * identity so a stray evaluation is harmless. */
+                int order = curve->mmr_order[p];
+                if (order < 1) order = 1;
+                if (order > 3) order = 3;
+                float *meta = ps->gpu_uniforms.dovi_mmr_meta;
+                float (*bank)[4] = (c == 1) ? ps->gpu_uniforms.dovi_mmr_ct
+                                            : ps->gpu_uniforms.dovi_mmr_cp;
+                meta[c - 1] = (float)order;               /* x=Ct, y=Cp */
+                meta[c + 1] =                             /* z=Ct, w=Cp */
+                    (float)((double)curve->mmr_constant[p] / coef_scale);
+                for (int o = 0; o < order; o++)
+                    for (int t = 0; t < 7; t++) {
+                        int idx = o * 7 + t;
+                        bank[idx / 4][idx % 4] = (float)
+                            ((double)curve->mmr_coef[p][o][t] / coef_scale);
+                    }
+                ps->gpu_uniforms.dovi_c0[p][c] = 0.0f;
+                ps->gpu_uniforms.dovi_c1[p][c] = 1.0f;
+                ps->gpu_uniforms.dovi_c2[p][c] = 0.0f;
             } else {
-                /* MMR or unknown — identity passthrough for this piece */
+                /* MMR on I, or MMR on a piece > 0 (no uniform bank for
+                 * it) — unseen in real content; identity passthrough
+                 * for that piece's range only. */
                 ps->gpu_uniforms.dovi_c0[p][c] = 0.0f;
                 ps->gpu_uniforms.dovi_c1[p][c] = 1.0f;
                 ps->gpu_uniforms.dovi_c2[p][c] = 0.0f;
                 if (ps->dovi_metadata_logged < 2) {
                     const char *comp_names[] = {"I", "Ct", "Cp"};
-                    log_msg("DOVI: WARNING — piece %d comp %s uses MMR "
-                            "(not yet implemented, identity fallback)", p,
-                            comp_names[c]);
+                    log_msg("DOVI: WARNING — piece %d comp %s uses an "
+                            "unsupported mapping shape, identity fallback",
+                            p, comp_names[c]);
                 }
             }
         }
@@ -4129,8 +5422,14 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 /* Scan the Y plane, build histogram, extract percentile peak,
  * convert to nits, smooth, and update the uniform.
  * Called once per frame from video_display() for HDR content only. */
+/* is_p010: 10-bit samples stored shifted left by 6 (VAAPI P010). Raw
+ * yuv420p10le holds unshifted 0-1023 codes and needs a different shift to
+ * reach the top 8 bits — using >>8 on raw 10-bit collapsed the whole
+ * 256-bin histogram into bins 0-3, quantising the detected scene peak to
+ * four possible values and making the tone curve lurch between them.
+ * Reached by 10-bit AV1 HDR (always software-decoded) and DSVP_HWDEC=0. */
 static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
-                                   int is_10bit)
+                                   int is_10bit, int is_p010)
 {
     /* Skip if not HDR or in PQ bypass debug mode */
     if (ps->gpu_uniforms.is_hdr < 0.5f) return;
@@ -4176,7 +5475,7 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
         for (int y = 0; y < h; y += 8) {
             const uint16_t *row = (const uint16_t *)(data + y * stride);
             for (int x = 0; x < w; x += 8) {
-                histogram[row[x] >> 8]++;
+                histogram[row[x] >> (is_p010 ? 8 : 2)]++;
                 total_samples++;
             }
         }
@@ -4211,8 +5510,14 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
      * For 8-bit: (bin + 0.5) / 256 ≈ bin / 255 (close enough). */
     float raw_max_norm;
     if (is_10bit) {
-        /* Bin represents top 8 bits of uint16. Reconstruct midpoint. */
-        raw_max_norm = ((float)percentile_bin + 0.5f) * 256.0f / 65535.0f;
+        /* Invert the binning shift above: P010 stores code<<6 and bins
+         * with >>8 (one bin = 256 uint16 steps); raw 10-bit stores the
+         * bare code and bins with >>2 (one bin = 4 steps). Using the
+         * P010 factor for raw 10-bit read 64x hot — pq_code clamped to
+         * 1.0 every frame and the dynamic peak pinned at the static
+         * ceiling on all software 10-bit HDR (review P1-1). */
+        float bin_step = is_p010 ? 256.0f : 4.0f;
+        raw_max_norm = ((float)percentile_bin + 0.5f) * bin_step / 65535.0f;
     } else {
         raw_max_norm = ((float)percentile_bin + 0.5f) / 256.0f;
     }
@@ -4287,6 +5592,16 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
  *      Range expansion (limited→full) done in fragment shader.
  *   3. All other formats: swscale → upload, 1 byte/sample (R8_UNORM)
  */
+
+/* Defined below video_reblit — shared by both render entry points. */
+static void render_video_pass(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
+                              SDL_GPUTexture *target,
+                              Uint32 sc_w, Uint32 sc_h,
+                              int use_zc_uv, int draw_overlay);
+static void blit_and_overlay(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
+                             SDL_GPUTexture *swapchain_tex,
+                             Uint32 sc_w, Uint32 sc_h);
+
 void video_display(PlayerState *ps) {
     if (!ps->gpu_tex_y || !ps->video_frame) return;
     /* In zero-copy mode, video_frame is a raw VAAPI surface: data[3] = VASurfaceID,
@@ -4294,6 +5609,27 @@ void video_display(PlayerState *ps) {
     if (!ps->vaapi_zerocopy && !ps->video_frame->data[0]) return;
     if (ps->vaapi_zerocopy && !ps->video_frame->data[3]) return;
     if (ps->seeking) return;
+
+    /* ── Mid-stream resolution change guard ──
+     * Every upload path below derives row counts and byte widths from
+     * the open-time vid_w/vid_h: a frame decoded at a different size
+     * would be OVER-READ by the readback deinterleave loops and
+     * sws_scale (heap over-read, not just a wrong picture), or bind
+     * mismatched in the zero-copy import. Skip such frames. Latched
+     * per file, not per process — a static here would silence every
+     * later file's warning (DSVP main 7f09ae0). */
+    if (ps->video_frame->width > 0 && ps->video_frame->height > 0 &&
+        (ps->video_frame->width  != ps->vid_w ||
+         ps->video_frame->height != ps->vid_h)) {
+        if (!ps->res_change_logged) {
+            log_msg("WARN: mid-stream resolution change %dx%d -> %dx%d — "
+                    "frames at the new size are skipped",
+                    ps->vid_w, ps->vid_h,
+                    ps->video_frame->width, ps->video_frame->height);
+            ps->res_change_logged = 1;
+        }
+        return;
+    }
 
     int zerocopy_ok = 0;  /* 1 = zero-copy upload succeeded this frame */
 
@@ -4303,8 +5639,8 @@ void video_display(PlayerState *ps) {
 
     int w  = ps->vid_w;
     int h  = ps->vid_h;
-    int cw = w / 2;
-    int ch = h / 2;
+    int cw = (w + 1) / 2;   /* ceil — matches texture + FFmpeg alloc */
+    int ch = (h + 1) / 2;
 
     /* ── Determine source frame and byte width ── */
     AVFrame *src_frame = NULL;
@@ -4329,6 +5665,14 @@ void video_display(PlayerState *ps) {
                 log_msg("ZEROCOPY: upload failed — disabling, readback fallback next frame");
                 ps->vaapi_zerocopy = 0;
                 ps->gpu_uniforms.is_semiplanar = 0.0f;
+                /* Stop reblitting until real planar data lands. The binding
+                 * rule just flipped from semi-planar (gpu_tex_uv) to planar
+                 * (gpu_tex_u/gpu_tex_v), but those two textures have never
+                 * been uploaded in zero-copy mode — every reblit between here
+                 * and the next decoded frame would sample their creation-time
+                 * contents and paint garbage chroma over a correct picture.
+                 * video_display sets this back to 1 after a real upload. */
+                ps->video_ready = 0;
                 /* Can't recover this frame (no readback data), so return early.
                  * The decode thread will provide readback data on the next frame. */
                 return;
@@ -4400,7 +5744,7 @@ void video_display(PlayerState *ps) {
         src_frame = ps->video_frame;
         bpp = 1;
     } else {
-        /* swscale path — format conversion to YUV420P */
+        /* swscale path — format conversion to yuv420p / yuv420p10le */
         sws_scale(ps->sws_ctx,
             (const uint8_t *const *)ps->video_frame->data,
             ps->video_frame->linesize,
@@ -4408,7 +5752,7 @@ void video_display(PlayerState *ps) {
             ps->rgb_frame->data,
             ps->rgb_frame->linesize);
         src_frame = ps->rgb_frame;
-        bpp = 1;
+        bpp = ps->sws_out_10bit ? 2 : 1;
     }
 
     /* ── Dolby Vision RPU metadata extraction ──
@@ -4427,18 +5771,27 @@ void video_display(PlayerState *ps) {
      * indicates whether it's 10-bit YUV420P10LE. */
     {
         AVFrame *peak_frame = ps->vaapi_active ? ps->video_frame : src_frame;
-        int peak_is_10bit = ps->vaapi_active ? !ps->vaapi_nv12 : is_10bit_passthrough;
+        /* Software side: 10-bit whenever the upload is 10-bit — the
+         * sws-10le path scans the converted frame, not the source. */
+        int peak_is_10bit = ps->vaapi_active ? !ps->vaapi_nv12 : (bpp == 2);
 #ifdef DSVP_PROFILE
         double t_before_peak = get_time_sec();
 #endif
-        if (zerocopy_ok) {
+        if (ps->gpu_uniforms.is_hlg > 0.5f) {
+            /* HLG: fixed 1000-nit OOTF, peak pinned at open. The
+             * histogram converts bins through the PQ EOTF — meaningless
+             * for HLG's relative signal — so it must not run
+             * (DSVP main fdbb489). */
+        } else if (zerocopy_ok) {
             /* Zero-copy: no CPU pixel data for luma histogram.
              * Use static metadata peak (from container or DV RPU).
              * DV P5 already uses static peak regardless. */
             ps->gpu_uniforms.hdr_peak_nits = ps->hdr_static_peak;
         } else
         {
-            hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit);
+            /* P010 storage exactly when VAAPI produced the frame in 10-bit */
+            hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit,
+                                   ps->vaapi_active && !ps->vaapi_nv12);
         }
 #ifdef DSVP_PROFILE
         double t_after_peak = get_time_sec();
@@ -4542,52 +5895,20 @@ void video_display(PlayerState *ps) {
     ps->prof_vsync_ms = (t_after_vsync - t_before_gpu) * 1000.0;
 #endif
 
-    /* ── Render pass: YUV planar shader, 3 textures ── */
-    SDL_GPUColorTargetInfo color_target;
-    SDL_zero(color_target);
-    color_target.texture    = swapchain_tex;
-    color_target.clear_color = (SDL_FColor){ 0.0f, 0.0f, 0.0f, 1.0f };
-    color_target.load_op    = SDL_GPU_LOADOP_CLEAR;
-    color_target.store_op   = SDL_GPU_STOREOP_STORE;
-
-    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
-    {
-        SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_yuv);
-
-        player_update_display_rect(ps);
-        float scale_x = (sc_w > 0) ? (float)sc_w / ps->win_w : 1.0f;
-        float scale_y = (sc_h > 0) ? (float)sc_h / ps->win_h : 1.0f;
-
-        SDL_GPUViewport viewport;
-        viewport.x = ps->display_rect.x * scale_x;
-        viewport.y = ps->display_rect.y * scale_y;
-        viewport.w = ps->display_rect.w * scale_x;
-        viewport.h = ps->display_rect.h * scale_y;
-        viewport.min_depth = 0.0f;
-        viewport.max_depth = 1.0f;
-        SDL_SetGPUViewport(pass, &viewport);
-
-        ps->gpu_uniforms.frameCount = (float)ps->diag_frames_displayed;
-
-        SDL_PushGPUFragmentUniformData(cmd, 0,
-            &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
-
-        SDL_GPUTextureSamplerBinding bindings[4] = {
-            { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
-            { .texture = (zerocopy_ok && ps->gpu_tex_uv)
-                         ? ps->gpu_tex_uv : ps->gpu_tex_u,
-                                            .sampler = ps->gpu_sampler },
-            { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
-            { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
-        };
-        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
-
-        SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
-
-        /* ── Overlay quad (alpha-blended over video) ── */
-        gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
+    /* ── Render: video shader at content rate, blit at present rate ── */
+    if (!ps->no_intermediate && ps->intermediate_apt
+            && gpu_frame_tex_ensure(ps, (int)sc_w, (int)sc_h) == 0) {
+        render_video_pass(ps, cmd, ps->gpu_tex_frame, sc_w, sc_h,
+                          zerocopy_ok && ps->gpu_tex_uv != NULL, 0);
+        ps->frame_tex_valid = 1;
+        ps->frame_render_dirty = 0;
+        blit_and_overlay(ps, cmd, swapchain_tex, sc_w, sc_h);
+    } else {
+        /* Direct path (fallback / DSVP_NO_INTERMEDIATE) — identical to
+         * the pre-intermediate renderer. */
+        render_video_pass(ps, cmd, swapchain_tex, sc_w, sc_h,
+                          zerocopy_ok && ps->gpu_tex_uv != NULL, 1);
     }
-    SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
 
 #ifdef DSVP_PROFILE
@@ -4630,6 +5951,143 @@ void video_display(PlayerState *ps) {
 }
 
 
+/* ── Shared video render pass ──
+ * Runs the full YUV/DV/HDR shader into `target` (the intermediate
+ * frame texture, or the swapchain directly in fallback mode). When
+ * draw_overlay is set (direct-to-swapchain mode) the overlay quad is
+ * composited inside the same pass, exactly as the pre-intermediate
+ * code did. */
+static void render_video_pass(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
+                              SDL_GPUTexture *target,
+                              Uint32 sc_w, Uint32 sc_h,
+                              int use_zc_uv, int draw_overlay) {
+    SDL_GPUColorTargetInfo color_target;
+    SDL_zero(color_target);
+    color_target.texture     = target;
+    color_target.clear_color = (SDL_FColor){ 0.0f, 0.0f, 0.0f, 1.0f };
+    color_target.load_op     = SDL_GPU_LOADOP_CLEAR;
+    color_target.store_op    = SDL_GPU_STOREOP_STORE;
+
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    {
+        player_update_display_rect(ps);
+        float scale_x = (sc_w > 0) ? (float)sc_w / ps->win_w : 1.0f;
+        float scale_y = (sc_h > 0) ? (float)sc_h / ps->win_h : 1.0f;
+
+        SDL_GPUViewport viewport;
+        viewport.x = ps->display_rect.x * scale_x;
+        viewport.y = ps->display_rect.y * scale_y;
+        viewport.w = ps->display_rect.w * scale_x;
+        viewport.h = ps->display_rect.h * scale_y;
+        viewport.min_depth = 0.0f;
+        viewport.max_depth = 1.0f;
+
+        /* Sampler variant: dilated kernels only when the viewport is
+         * actually smaller than the video — the only case where the
+         * two variants differ in output. At 1:1/upscale the fixed
+         * unrolled path runs (proven fast under UMA contention). */
+        int downscale = (viewport.w + 0.5f < (float)ps->vid_w)
+                     || (viewport.h + 0.5f < (float)ps->vid_h);
+        /* Pipeline set must match the attachment format: frame-target
+         * passes use the RGBA16 variants, swapchain passes the
+         * swapchain variants (review P1-6). A missing dilated-frame
+         * variant falls back to the fixed FRAME pipeline — never to a
+         * swapchain-format pipeline on a frame target. */
+        int to_frame = (target == ps->gpu_tex_frame && target != NULL);
+        SDL_GPUGraphicsPipeline *pipe_fixed = to_frame
+            ? ps->gpu_pipeline_yuv_frame : ps->gpu_pipeline_yuv;
+        SDL_GPUGraphicsPipeline *pipe_dil = to_frame
+            ? ps->gpu_pipeline_yuv_dilated_frame : ps->gpu_pipeline_yuv_dilated;
+        SDL_GPUGraphicsPipeline *pipe =
+            (downscale && pipe_dil) ? pipe_dil : pipe_fixed;
+        {
+            static int last_dilated = -1;
+            int now_dilated = (downscale && pipe_dil != NULL);
+            if (now_dilated != last_dilated) {
+                last_dilated = now_dilated;
+                log_msg("GPU: sampler variant → %s (vp %.0fx%.0f vs src %dx%d)",
+                        now_dilated ? "dilated (downscale)" : "fixed 4x4",
+                        viewport.w, viewport.h, ps->vid_w, ps->vid_h);
+            }
+        }
+        SDL_BindGPUGraphicsPipeline(pass, pipe);
+        SDL_SetGPUViewport(pass, &viewport);
+
+        /* GEOM DIAG - log the whole geometry chain whenever it changes, so the
+         * shape actually being scanned out can be compared between windowed and
+         * exclusive fullscreen numerically instead of judged by eye. If the
+         * viewport aspect matches the source aspect, any remaining distortion
+         * is downstream of this process. */
+        {
+            static float lvx = -1, lvy = -1, lvw = -1, lvh = -1;
+            if (viewport.x != lvx || viewport.y != lvy ||
+                viewport.w != lvw || viewport.h != lvh) {
+                lvx = viewport.x; lvy = viewport.y;
+                lvw = viewport.w; lvh = viewport.h;
+                log_msg("GEOM: src=%dx%d (%.4f) win=%dx%d sc=%ux%u "
+                        "rect=%d,%d %dx%d scale=%.3f,%.3f -> vp=%.1f,%.1f %.1fx%.1f (%.4f)%s",
+                        ps->vid_w, ps->vid_h,
+                        ps->vid_h ? (double)ps->vid_w / ps->vid_h : 0.0,
+                        ps->win_w, ps->win_h, sc_w, sc_h,
+                        ps->display_rect.x, ps->display_rect.y,
+                        ps->display_rect.w, ps->display_rect.h,
+                        scale_x, scale_y,
+                        viewport.x, viewport.y, viewport.w, viewport.h,
+                        viewport.h > 0 ? (double)viewport.w / viewport.h : 0.0,
+                        ps->fullscreen ? " [FS]" : " [windowed]");
+            }
+        }
+
+        ps->gpu_uniforms.frameCount = (float)ps->diag_frames_displayed;
+
+        SDL_PushGPUFragmentUniformData(cmd, 0,
+            &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
+
+        SDL_GPUTextureSamplerBinding bindings[4] = {
+            { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
+            { .texture = (use_zc_uv && ps->gpu_tex_uv)
+                         ? ps->gpu_tex_uv : ps->gpu_tex_u,
+                                            .sampler = ps->gpu_sampler },
+            { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
+            { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
+        };
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
+
+        SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+
+        if (draw_overlay)
+            gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
+    }
+    SDL_EndGPURenderPass(pass);
+}
+
+/* ── Swapchain pass for intermediate mode: blit + overlay ──
+ * The frame texture is swapchain-sized, so the blit is a 1:1 copy
+ * covering every pixel — LOADOP_DONT_CARE skips a clear. */
+static void blit_and_overlay(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
+                             SDL_GPUTexture *swapchain_tex,
+                             Uint32 sc_w, Uint32 sc_h) {
+    SDL_GPUColorTargetInfo color_target;
+    SDL_zero(color_target);
+    color_target.texture  = swapchain_tex;
+    color_target.load_op  = SDL_GPU_LOADOP_DONT_CARE;
+    color_target.store_op = SDL_GPU_STOREOP_STORE;
+
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
+    {
+        SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_blit);
+        SDL_GPUTextureSamplerBinding binding = {
+            .texture = ps->gpu_tex_frame,
+            .sampler = ps->gpu_sampler_nearest,   /* 1:1 — exact */
+        };
+        SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+        SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+
+        gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
+    }
+    SDL_EndGPURenderPass(pass);
+}
+
 /* Re-draw the last frame without uploading new data.
  * Called from main.c on ticks where no new frame was decoded
  * (GPU double-buffering requires explicit re-blit each frame).
@@ -4659,51 +6117,20 @@ void video_reblit(PlayerState *ps) {
     ps->sc_w = (int)sc_w;
     ps->sc_h = (int)sc_h;
 
-    SDL_GPUColorTargetInfo color_target;
-    SDL_zero(color_target);
-    color_target.texture    = swapchain_tex;
-    color_target.clear_color = (SDL_FColor){ 0.0f, 0.0f, 0.0f, 1.0f };
-    color_target.load_op    = SDL_GPU_LOADOP_CLEAR;
-    color_target.store_op   = SDL_GPU_STOREOP_STORE;
-
-    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &color_target, 1, NULL);
-    {
-        SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_yuv);
-
-        player_update_display_rect(ps);
-        float scale_x = (sc_w > 0) ? (float)sc_w / ps->win_w : 1.0f;
-        float scale_y = (sc_h > 0) ? (float)sc_h / ps->win_h : 1.0f;
-
-        SDL_GPUViewport viewport;
-        viewport.x = ps->display_rect.x * scale_x;
-        viewport.y = ps->display_rect.y * scale_y;
-        viewport.w = ps->display_rect.w * scale_x;
-        viewport.h = ps->display_rect.h * scale_y;
-        viewport.min_depth = 0.0f;
-        viewport.max_depth = 1.0f;
-        SDL_SetGPUViewport(pass, &viewport);
-
-        ps->gpu_uniforms.frameCount = (float)ps->diag_frames_displayed;
-
-        SDL_PushGPUFragmentUniformData(cmd, 0,
-            &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
-
-        SDL_GPUTextureSamplerBinding bindings[4] = {
-            { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
-            { .texture = (ps->vaapi_zerocopy && ps->gpu_tex_uv)
-                         ? ps->gpu_tex_uv : ps->gpu_tex_u,
-                                            .sampler = ps->gpu_sampler },
-            { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
-            { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
-        };
-        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
-
-        SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
-
-        /* ── Overlay quad (alpha-blended over video) ── */
-        gpu_overlay_draw(pass, cmd, ps, sc_w, sc_h);
+    /* ── Reblit: video shader only when state moved; blit every tick ── */
+    if (!ps->no_intermediate && ps->intermediate_apt
+            && gpu_frame_tex_ensure(ps, (int)sc_w, (int)sc_h) == 0) {
+        if (!ps->frame_tex_valid || ps->frame_render_dirty) {
+            render_video_pass(ps, cmd, ps->gpu_tex_frame, sc_w, sc_h,
+                              ps->vaapi_zerocopy && ps->gpu_tex_uv != NULL, 0);
+            ps->frame_tex_valid = 1;
+            ps->frame_render_dirty = 0;
+        }
+        blit_and_overlay(ps, cmd, swapchain_tex, sc_w, sc_h);
+    } else {
+        render_video_pass(ps, cmd, swapchain_tex, sc_w, sc_h,
+                          ps->vaapi_zerocopy && ps->gpu_tex_uv != NULL, 1);
     }
-    SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
 }
 
@@ -4733,6 +6160,25 @@ void player_seek(PlayerState *ps, double incr) {
  * Media Info / Debug
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* ── Bounded append for the info/debug string builders ──
+ *
+ * HEAP-OVERFLOW FIX: the old `INFO_APPEND(...)`
+ * pattern is unsafe on truncation — snprintf returns the WOULD-BE length,
+ * so off can exceed sz, after which (sz - off) is negative and wraps to a
+ * huge size_t on the next call, writing past the buffer. Reachable via
+ * tag-heavy files (the metadata loop is unbounded) or long filenames.
+ * This macro clamps off and skips appends once the buffer is full.
+ *
+ * Expects locals: char *buf; int sz; int off; */
+#define INFO_APPEND(...)                                                    \
+    do {                                                                    \
+        if (off < sz - 1) {                                                 \
+            int _n = snprintf(buf + off, (size_t)(sz - off), __VA_ARGS__);  \
+            if (_n > 0) off += _n;                                          \
+            if (off > sz - 1) off = sz - 1;                                 \
+        }                                                                   \
+    } while (0)
+
 void player_build_media_info(PlayerState *ps) {
     if (!ps->fmt_ctx) return;
 
@@ -4740,9 +6186,9 @@ void player_build_media_info(PlayerState *ps) {
     int   sz  = sizeof(ps->media_info);
     int   off = 0;
 
-    off += snprintf(buf + off, sz - off, "=== MEDIA INFO ===\n");
-    off += snprintf(buf + off, sz - off, "File: %s\n", ps->filepath);
-    off += snprintf(buf + off, sz - off, "Format: %s (%s)\n",
+    INFO_APPEND("=== MEDIA INFO ===\n");
+    INFO_APPEND("File: %s\n", ps->filepath);
+    INFO_APPEND("Format: %s (%s)\n",
         ps->fmt_ctx->iformat->name, ps->fmt_ctx->iformat->long_name);
 
     double duration = (ps->fmt_ctx->duration != AV_NOPTS_VALUE)
@@ -4750,10 +6196,10 @@ void player_build_media_info(PlayerState *ps) {
     int hrs = (int)duration / 3600;
     int min = ((int)duration % 3600) / 60;
     int sec = (int)duration % 60;
-    off += snprintf(buf + off, sz - off, "Duration: %02d:%02d:%02d\n", hrs, min, sec);
+    INFO_APPEND("Duration: %02d:%02d:%02d\n", hrs, min, sec);
 
     if (ps->fmt_ctx->bit_rate > 0) {
-        off += snprintf(buf + off, sz - off, "Bitrate: %"PRId64" kb/s\n",
+        INFO_APPEND("Bitrate: %"PRId64" kb/s\n",
             ps->fmt_ctx->bit_rate / 1000);
     }
 
@@ -4761,26 +6207,26 @@ void player_build_media_info(PlayerState *ps) {
     if (ps->video_stream_idx >= 0) {
         AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
         AVCodecParameters *par = vs->codecpar;
-        off += snprintf(buf + off, sz - off, "\n--- Video ---\n");
-        off += snprintf(buf + off, sz - off, "Codec: %s\n",
+        INFO_APPEND("\n--- Video ---\n");
+        INFO_APPEND("Codec: %s\n",
             avcodec_get_name(par->codec_id));
-        off += snprintf(buf + off, sz - off, "Resolution: %dx%d\n",
+        INFO_APPEND("Resolution: %dx%d\n",
             par->width, par->height);
-        off += snprintf(buf + off, sz - off, "Pixel Format: %s\n",
+        INFO_APPEND("Pixel Format: %s\n",
             av_get_pix_fmt_name(par->format));
-        off += snprintf(buf + off, sz - off, "Decode: %s\n",
+        INFO_APPEND("Decode: %s\n",
             ps->vaapi_active ? "VAAPI hardware" : "software");
 
         if (vs->avg_frame_rate.den > 0) {
-            off += snprintf(buf + off, sz - off, "Frame Rate: %.3f fps\n",
+            INFO_APPEND("Frame Rate: %.3f fps\n",
                 av_q2d(vs->avg_frame_rate));
         }
         if (vs->r_frame_rate.den > 0) {
-            off += snprintf(buf + off, sz - off, "Real Frame Rate: %.3f fps\n",
+            INFO_APPEND("Real Frame Rate: %.3f fps\n",
                 av_q2d(vs->r_frame_rate));
         }
         if (par->bit_rate > 0) {
-            off += snprintf(buf + off, sz - off, "Video Bitrate: %"PRId64" kb/s\n",
+            INFO_APPEND("Video Bitrate: %"PRId64" kb/s\n",
                 par->bit_rate / 1000);
         }
 
@@ -4789,39 +6235,39 @@ void player_build_media_info(PlayerState *ps) {
             int is_hd = (par->height >= 720);
 
             if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
-                off += snprintf(buf + off, sz - off, "Color Space: %s\n",
+                INFO_APPEND("Color Space: %s\n",
                     av_color_space_name(par->color_space));
             } else {
-                off += snprintf(buf + off, sz - off, "Color Space: %s (assumed)\n",
+                INFO_APPEND("Color Space: %s (assumed)\n",
                     is_hd ? "bt709" : "bt601");
             }
 
             if (par->color_range != AVCOL_RANGE_UNSPECIFIED) {
-                off += snprintf(buf + off, sz - off, "Color Range: %s\n",
+                INFO_APPEND("Color Range: %s\n",
                     av_color_range_name(par->color_range));
             } else {
-                off += snprintf(buf + off, sz - off, "Color Range: tv (assumed)\n");
+                INFO_APPEND("Color Range: tv (assumed)\n");
             }
 
             if (par->color_primaries != AVCOL_PRI_UNSPECIFIED) {
-                off += snprintf(buf + off, sz - off, "Color Primaries: %s\n",
+                INFO_APPEND("Color Primaries: %s\n",
                     av_color_primaries_name(par->color_primaries));
             } else {
-                off += snprintf(buf + off, sz - off, "Color Primaries: %s (assumed)\n",
+                INFO_APPEND("Color Primaries: %s (assumed)\n",
                     is_hd ? "bt709" : "bt601");
             }
 
             if (par->color_trc != AVCOL_TRC_UNSPECIFIED) {
-                off += snprintf(buf + off, sz - off, "Color TRC: %s\n",
+                INFO_APPEND("Color TRC: %s\n",
                     av_color_transfer_name(par->color_trc));
             } else {
-                off += snprintf(buf + off, sz - off, "Color TRC: %s (assumed)\n",
+                INFO_APPEND("Color TRC: %s (assumed)\n",
                     is_hd ? "bt709" : "bt601");
             }
 
             /* HDR info from uniforms (already detected at open time) */
             if (ps->gpu_uniforms.is_hdr > 0.0f) {
-                off += snprintf(buf + off, sz - off,
+                INFO_APPEND(
                     "HDR: Yes (peak %.0f nits, %s gamut)\n",
                     ps->gpu_uniforms.hdr_peak_nits,
                     ps->gpu_uniforms.hdr_gamut > 0.5f ? "BT.2020" : "BT.709");
@@ -4833,22 +6279,22 @@ void player_build_media_info(PlayerState *ps) {
     if (ps->audio_stream_idx >= 0) {
         AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
         AVCodecParameters *par = as->codecpar;
-        off += snprintf(buf + off, sz - off, "\n--- Audio ---\n");
-        off += snprintf(buf + off, sz - off, "Codec: %s\n",
+        INFO_APPEND("\n--- Audio ---\n");
+        INFO_APPEND("Codec: %s\n",
             avcodec_get_name(par->codec_id));
-        off += snprintf(buf + off, sz - off, "Sample Rate: %d Hz\n",
+        INFO_APPEND("Sample Rate: %d Hz\n",
             par->sample_rate);
-        off += snprintf(buf + off, sz - off, "Channels: %d\n",
+        INFO_APPEND("Channels: %d\n",
             par->ch_layout.nb_channels);
 
         char ch_layout_str[128];
         av_channel_layout_describe(&par->ch_layout, ch_layout_str, sizeof(ch_layout_str));
-        off += snprintf(buf + off, sz - off, "Channel Layout: %s\n", ch_layout_str);
+        INFO_APPEND("Channel Layout: %s\n", ch_layout_str);
 
-        off += snprintf(buf + off, sz - off, "Sample Format: %s\n",
+        INFO_APPEND("Sample Format: %s\n",
             av_get_sample_fmt_name(par->format));
         if (par->bit_rate > 0) {
-            off += snprintf(buf + off, sz - off, "Audio Bitrate: %"PRId64" kb/s\n",
+            INFO_APPEND("Audio Bitrate: %"PRId64" kb/s\n",
                 par->bit_rate / 1000);
         }
     }
@@ -4858,10 +6304,10 @@ void player_build_media_info(PlayerState *ps) {
     int first = 1;
     while ((tag = av_dict_get(ps->fmt_ctx->metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
         if (first) {
-            off += snprintf(buf + off, sz - off, "\n--- Metadata ---\n");
+            INFO_APPEND("\n--- Metadata ---\n");
             first = 0;
         }
-        off += snprintf(buf + off, sz - off, "%s: %s\n", tag->key, tag->value);
+        INFO_APPEND("%s: %s\n", tag->key, tag->value);
     }
 }
 
@@ -4872,24 +6318,48 @@ void player_build_debug_info(PlayerState *ps) {
     int   sz  = sizeof(ps->debug_info);
     int   off = 0;
 
-    off += snprintf(buf + off, sz - off, "=== DEBUG ===\n");
-    off += snprintf(buf + off, sz - off, "Output:      %dx%d (%s)\n",
+    INFO_APPEND("=== DEBUG ===\n");
+    INFO_APPEND("Output:      %dx%d (%s)\n",
         ps->sc_w, ps->sc_h,
         ps->fullscreen ? "exclusive" : "windowed");
-    off += snprintf(buf + off, sz - off, "Renderer: SDL_GPU\n");
-    off += snprintf(buf + off, sz - off, "A/V Bias:    %.1f ms\n",
+
+    /* Real-time FPS + scaler resolution (video streams only) */
+    if (ps->video_stream_idx >= 0) {
+        if (ps->paused)
+            INFO_APPEND("FPS:         paused\n");
+        else
+            INFO_APPEND("FPS:         %.2f (render %.0f)\n",
+                ps->fps_content, ps->fps_render);
+
+        /* Resolution = source -> the physical-pixel area the scaler
+         * actually fills (display_rect is in logical window coords;
+         * convert to swapchain pixels, matching the viewport math in
+         * video_display). In Game Mode crop-to-fill, out_w can exceed
+         * sc_w — that's the crop overflow, shown honestly. */
+        int out_w = ps->display_rect.w;
+        int out_h = ps->display_rect.h;
+        if (ps->win_w > 0 && ps->sc_w > 0)
+            out_w = (int)((double)ps->display_rect.w * ps->sc_w / ps->win_w + 0.5);
+        if (ps->win_h > 0 && ps->sc_h > 0)
+            out_h = (int)((double)ps->display_rect.h * ps->sc_h / ps->win_h + 0.5);
+        INFO_APPEND("Resolution:  %dx%d -> %dx%d\n",
+            ps->vid_w, ps->vid_h, out_w, out_h);
+    }
+
+    INFO_APPEND("Renderer: SDL_GPU\n");
+    INFO_APPEND("A/V Bias:    %.1f ms\n",
         ps->av_bias * 1000.0);
-    off += snprintf(buf + off, sz - off, "Video Queue: %d pkts (%d KB)\n",
+    INFO_APPEND("Video Queue: %d pkts (%d KB)\n",
         ps->video_pq.nb_packets, ps->video_pq.size / 1024);
-    off += snprintf(buf + off, sz - off, "Audio Queue: %d pkts (%d KB)\n",
+    INFO_APPEND("Audio Queue: %d pkts (%d KB)\n",
         ps->audio_pq.nb_packets, ps->audio_pq.size / 1024);
-    off += snprintf(buf + off, sz - off, "Volume:      %.0f%%\n", ps->volume * 100.0);
+    INFO_APPEND("Volume:      %.0f%%\n", ps->volume * 100.0);
 
     if (ps->video_codec_ctx) {
         if (ps->vaapi_active) {
-            off += snprintf(buf + off, sz - off, "Decode: VAAPI (hardware)\n");
+            INFO_APPEND("Decode: VAAPI (hardware)\n");
         } else {
-            off += snprintf(buf + off, sz - off, "Decoder Threads: %d\n",
+            INFO_APPEND("Decoder Threads: %d\n",
                 ps->video_codec_ctx->thread_count);
         }
 
@@ -4899,24 +6369,25 @@ void player_build_debug_info(PlayerState *ps) {
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
 
         if (ps->vaapi_active) {
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "SWS: bypassed (VAAPI %s → deinterleave → %s, %s)\n",
                 ps->vaapi_nv12 ? "NV12" : "P010",
                 ps->vaapi_nv12 ? "R8_UNORM" : "R16_UNORM",
                 is_full_range ? "full" : "limited");
         } else if (is_10bit && !ps->sws_ctx) {
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "SWS: bypassed (10-bit passthrough, %s->full in shader)\n",
                 is_full_range ? "full" : "limited");
         } else if (is_yuv420p && !ps->sws_ctx) {
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "SWS: bypassed (8-bit passthrough, %s->full in shader)\n",
                 is_full_range ? "full" : "limited");
         } else {
-            off += snprintf(buf + off, sz - off,
-                "SWS: format convert (SWS_LANCZOS + ED dither)\n");
+            INFO_APPEND(
+                "SWS: format convert%s (SWS_LANCZOS + ED dither)\n",
+                ps->sws_out_10bit ? " to 10-bit" : "");
         }
-        off += snprintf(buf + off, sz - off,
+        INFO_APPEND(
             "GPU: Lanczos-2 luma, Catmull-Rom chroma, blue noise dither\n");
 
         {
@@ -4926,13 +6397,13 @@ void player_build_debug_info(PlayerState *ps) {
             };
             int cl = ps->chroma_location;
             const char *cn = (cl >= 0 && cl <= 6) ? chroma_names[cl] : "unknown";
-            off += snprintf(buf + off, sz - off, "Chroma Siting: %s\n", cn);
+            INFO_APPEND("Chroma Siting: %s\n", cn);
         }
     }
 
     /* Audio track info */
     if (ps->aud_count > 1) {
-        off += snprintf(buf + off, sz - off, "Audio Track: %s (%d/%d)\n",
+        INFO_APPEND("Audio Track: %s (%d/%d)\n",
             ps->aud_stream_names[ps->aud_selection],
             ps->aud_selection + 1, ps->aud_count);
     }
@@ -4940,23 +6411,23 @@ void player_build_debug_info(PlayerState *ps) {
     /* Subtitle info */
     if (ps->sub_count > 0) {
         if (ps->sub_selection == 0) {
-            off += snprintf(buf + off, sz - off, "Subtitles: off (%d available)\n",
+            INFO_APPEND("Subtitles: off (%d available)\n",
                 ps->sub_count);
         } else {
-            off += snprintf(buf + off, sz - off, "Subtitles: %s\n",
+            INFO_APPEND("Subtitles: %s\n",
                 ps->sub_stream_names[ps->sub_selection - 1]);
         }
     } else {
-        off += snprintf(buf + off, sz - off, "Subtitles: none found\n");
+        INFO_APPEND("Subtitles: none found\n");
     }
 
     double duration = (ps->fmt_ctx && ps->fmt_ctx->duration != AV_NOPTS_VALUE)
         ? (double)ps->fmt_ctx->duration / AV_TIME_BASE : 0.0;
     double pos = ps->video_clock;
-    off += snprintf(buf + off, sz - off, "Position:    %.1f / %.1f s\n", pos, duration);
+    INFO_APPEND("Position:    %.1f / %.1f s\n", pos, duration);
 
     /* Audio status */
-    off += snprintf(buf + off, sz - off, "\n--- Audio ---\n");
+    INFO_APPEND("\n--- Audio ---\n");
     if (ps->audio_codec_ctx) {
         const char *acodec = avcodec_get_name(ps->audio_codec_ctx->codec_id);
         const char *afmt   = av_get_sample_fmt_name(ps->audio_codec_ctx->sample_fmt);
@@ -4967,7 +6438,7 @@ void player_build_debug_info(PlayerState *ps) {
         av_channel_layout_describe(&ps->audio_codec_ctx->ch_layout,
                                    layout_desc, sizeof(layout_desc));
 
-        off += snprintf(buf + off, sz - off, "Source:  %s %s %dHz %dch (%s)\n",
+        INFO_APPEND("Source:  %s %s %dHz %dch (%s)\n",
             acodec, afmt ? afmt : "?", src_rate, src_ch, layout_desc);
 
         /* Determine output format name from SDL spec */
@@ -4975,63 +6446,63 @@ void player_build_debug_info(PlayerState *ps) {
                               (ps->audio_spec.format == SDL_AUDIO_S16) ? "S16" : "???";
         int out_rate = ps->audio_spec.freq;
         int out_ch   = ps->audio_spec.channels;
-        off += snprintf(buf + off, sz - off, "Output:  %s %dHz %dch (stereo)\n",
+        INFO_APPEND("Output:  %s %dHz %dch (stereo)\n",
             out_fmt, out_rate, out_ch);
 
         int resampling = (src_rate != out_rate);
         int downmixing = (src_ch != out_ch);
 
         if (resampling && downmixing)
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "Pipeline: resample %d->%dHz + downmix %dch->%dch + %s\n",
                 src_rate, out_rate, src_ch, out_ch, out_fmt);
         else if (resampling)
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "Pipeline: resample %d->%dHz + %s\n", src_rate, out_rate, out_fmt);
         else if (downmixing)
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "Pipeline: downmix %dch->%dch + %s\n", src_ch, out_ch, out_fmt);
         else if (afmt && strcmp(afmt, "flt") == 0 &&
                  ps->audio_spec.format == SDL_AUDIO_F32)
-            off += snprintf(buf + off, sz - off, "Pipeline: direct (no conversion)\n");
+            INFO_APPEND("Pipeline: direct (no conversion)\n");
         else
-            off += snprintf(buf + off, sz - off,
+            INFO_APPEND(
                 "Pipeline: format convert %s->%s\n", afmt ? afmt : "?", out_fmt);
     } else {
-        off += snprintf(buf + off, sz - off, "No audio\n");
+        INFO_APPEND("No audio\n");
     }
 
     /* Bitstream status */
-    off += snprintf(buf + off, sz - off, "\n--- Bitstream ---\n");
+    INFO_APPEND("\n--- Bitstream ---\n");
     {
         static const char *mode_names[] = { "PCM", "AUTO", "PASSTHROUGH" };
-        off += snprintf(buf + off, sz - off, "Mode:    %s\n",
+        INFO_APPEND("Mode:    %s\n",
             mode_names[ps->audio_mode]);
-        off += snprintf(buf + off, sz - off, "Active:  %s\n",
+        INFO_APPEND("Active:  %s\n",
             ps->bitstream_active ? "yes" : "no");
         if (ps->bitstream_caps.probed) {
-            off += snprintf(buf + off, sz - off, "Sink:    %s\n",
+            INFO_APPEND("Sink:    %s\n",
                 ps->bitstream_caps.alsa_device[0] ? ps->bitstream_caps.alsa_device : "none");
-            off += snprintf(buf + off, sz - off, "Codecs:  %s%s%s%s%s\n",
+            INFO_APPEND("Codecs:  %s%s%s%s%s\n",
                 ps->bitstream_caps.support_ac3    ? "AC3 " : "",
                 ps->bitstream_caps.support_eac3   ? "EAC3 " : "",
                 ps->bitstream_caps.support_truehd  ? "TrueHD " : "",
                 ps->bitstream_caps.support_dts     ? "DTS " : "",
                 ps->bitstream_caps.support_dtshd   ? "DTS-HD " : "");
         } else {
-            off += snprintf(buf + off, sz - off, "Sink:    not probed\n");
+            INFO_APPEND("Sink:    not probed\n");
         }
     }
 
     /* Playback diagnostics */
-    off += snprintf(buf + off, sz - off, "\n--- Diagnostics ---\n");
-    off += snprintf(buf + off, sz - off, "Decoded:     %d\n", ps->diag_frames_decoded);
-    off += snprintf(buf + off, sz - off, "Displayed:   %d\n", ps->diag_frames_displayed);
-    off += snprintf(buf + off, sz - off, "Dropped:     %d\n", ps->diag_frames_dropped);
-    off += snprintf(buf + off, sz - off, "Multi-ticks: %d\n", ps->diag_multi_decodes);
-    off += snprintf(buf + off, sz - off, "Stall snaps: %d\n", ps->diag_timer_snaps);
-    off += snprintf(buf + off, sz - off, "Peak drift:  %.1f ms\n",
+    INFO_APPEND("\n--- Diagnostics ---\n");
+    INFO_APPEND("Decoded:     %d\n", ps->diag_frames_decoded);
+    INFO_APPEND("Displayed:   %d\n", ps->diag_frames_displayed);
+    INFO_APPEND("Dropped:     %d\n", ps->diag_frames_dropped);
+    INFO_APPEND("Multi-ticks: %d\n", ps->diag_multi_decodes);
+    INFO_APPEND("Stall snaps: %d\n", ps->diag_timer_snaps);
+    INFO_APPEND("Peak drift:  %.1f ms\n",
         ps->diag_max_av_drift * 1000.0);
-    off += snprintf(buf + off, sz - off, "A/V bias:    %.1f ms\n",
+    INFO_APPEND("A/V bias:    %.1f ms\n",
         ps->av_bias * 1000.0);
 }

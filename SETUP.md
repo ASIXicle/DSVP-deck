@@ -23,11 +23,16 @@ sudo pacman-key --populate archlinux holo
 sudo pacman -Syu --noconfirm
 ```
 
-Install the build toolchain:
+Install the build toolchain. Note `glibc` and `linux-api-headers` are
+installed WITHOUT `--needed`: after a SteamOS update the pacman database
+still says they're installed while `/usr/include` has been wiped behind
+its back — `--needed` would skip them and FFmpeg's configure later dies
+with the misleading "Compiler lacks C11 support" (field-hit 2026-08-13):
 
 ```bash
+sudo pacman -S --noconfirm glibc linux-api-headers
 sudo pacman -S --needed --noconfirm \
-    base-devel glibc linux-api-headers \
+    base-devel \
     git cmake nasm yasm pkg-config zlib
 ```
 
@@ -49,6 +54,12 @@ sudo pacman -S --noconfirm \
 
 sudo pacman -S --noconfirm \
     libva libva-utils
+
+# liburing: SDL3's cmake enables its io_uring asyncio backend when the
+# header is present at configure time — and then REQUIRES it at every
+# rebuild. A SteamOS update removed it once (2026-08) and broke an SDL
+# rebuild months after the original configure.
+sudo pacman -S --noconfirm liburing
     
 sudo pacman -S --noconfirm \
     dav1d
@@ -67,27 +78,36 @@ The `vainfo` output should show `VAProfileHEVCMain` and `VAProfileHEVCMain10` wi
 
 If any package fails with key trust errors: `sudo pacman -S --noconfirm holo-keyring archlinux-keyring`
 
-## Phase 2 — Build FFmpeg 8.1
+## Phase 2 — Build FFmpeg 9.0
 
 Build into a local prefix in your home directory. The `--enable-vaapi` flag is critical for HEVC hardware decode.
 
 ```bash
 cd ~
-wget https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz
-tar xf ffmpeg-8.1.tar.xz
-cd ffmpeg-8.1
+# guard: an interrupted pass re-downloads as .tar.xz.1, .2, ... and then
+# extracts the ORIGINAL anyway (field-hit 2026-08-13)
+[ -f ffmpeg-9.0.tar.xz ] || wget https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz
+tar xf ffmpeg-9.0.tar.xz
+cd ffmpeg-9.0
 
 ./configure \
-    --prefix=$HOME/ffmpeg-8.1-local \
+    --prefix=$HOME/ffmpeg-9.0-local \
     --disable-programs \
     --disable-doc \
     --disable-encoders \
     --disable-muxers \
+    --enable-muxer=spdif \
     --enable-shared \
     --disable-static \
     --enable-vaapi \
     --enable-libdav1d
 ```
+
+`--enable-muxer=spdif` re-enables the ONE muxer DSVP needs: spdifenc
+frames compressed audio into IEC 61937 bursts for bitstream
+passthrough. A build without it plays everything fine but silently
+loses passthrough ("Bitstream: spdif muxer not found in FFmpeg" in
+the log, PCM fallback — field-discovered 2026-08-09).
 
 Check the configure output for `vaapi: yes`. If it says `no`, the `libva` headers aren't installed — go back to Phase 1.
 
@@ -99,8 +119,8 @@ make install
 Verify:
 
 ```bash
-PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig pkg-config --modversion libavcodec
-# Should show 62.28.100
+PKG_CONFIG_PATH=$HOME/ffmpeg-9.0-local/lib/pkgconfig pkg-config --modversion libavcodec
+# Should show 63.1.100
 ```
 
 ## Phase 3 — Build SDL3 and SDL3_ttf
@@ -111,8 +131,15 @@ SteamOS doesn't ship SDL3 — build from source.
 
 ```bash
 cd ~
-git clone --depth 1 --branch release-3.4.2 https://github.com/libsdl-org/SDL.git SDL3-src
+# fresh tree required on re-runs: the patch step below fails against an
+# already-patched clone, and `mkdir build` fails against a used one
+rm -rf SDL3-src
+git clone --depth 1 --branch release-3.4.14 https://github.com/libsdl-org/SDL.git SDL3-src
+
+# Apply the DSVP HDR metadata patch BEFORE configuring (version-matched
+# patches live in the repo; see docs/TODO-HDR.md for what it does):
 cd SDL3-src
+patch -p1 < ~/DSVP-build/tools/sdl-patches/sdl-3.4.14-hdr-metadata.patch
 mkdir build && cd build
 
 cmake .. \
@@ -123,8 +150,14 @@ cmake .. \
     -DSDL_X11=ON \
     -DSDL_PIPEWIRE=ON \
     -DSDL_PULSEAUDIO=ON \
-    -DSDL_ALSA=ON
+    -DSDL_ALSA=ON \
+    -DSDL_X11_XTEST=OFF
 ```
+
+(`SDL_X11_XTEST=OFF`: SDL 3.4.14 hard-requires the libxtst dev package
+for X11 builds. XTEST synthesizes input events — DSVP never does —
+and every extra dev package is a future SteamOS-update ambush, so off
+beats installing it.)
 
 Before running `make`, check the cmake summary: `SDL_WAYLAND`, `SDL_PIPEWIRE`, `SDL_DBUS`, `SDL_X11`, and `SDL_VULKAN` should all be ON. If any are OFF, a header or `.pc` file is missing — go back to Phase 1.
 
@@ -137,6 +170,7 @@ make install
 
 ```bash
 cd ~
+rm -rf SDL3_ttf-src   # same fresh-tree rule as SDL3-src above
 git clone --depth 1 --branch release-3.2.2 https://github.com/libsdl-org/SDL_ttf.git SDL3_ttf-src
 cd SDL3_ttf-src
 mkdir build && cd build
@@ -154,15 +188,16 @@ make install
 
 ```bash
 cd ~
-git clone https://github.com/ASIXicle/DSVP.git DSVP-build
+# do NOT rm -rf this one on a re-run — an existing DSVP-build is a
+# working tree; just pull instead
+[ -d DSVP-build ] || git clone https://github.com/ASIXicle/DSVP-deck.git DSVP-build
 cd DSVP-build
-git checkout steamdeck
 
-export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
+export PKG_CONFIG_PATH=$HOME/ffmpeg-9.0-local/lib/pkgconfig:$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
 
 # Verify all deps are found
 pkg-config --modversion libavcodec libavformat sdl3 sdl3-ttf
-# Should show: 62.28.100 / 62.12.100 / 3.4.2 / 3.2.2
+# Should show: 63.1.100 / 63.1.100 / 3.4.14 / 3.2.2
 
 make clean && make
 ```
@@ -173,7 +208,7 @@ SDL3_shadercross is bundled in the repo at `shadercross/SDL3_shadercross-3.0.0-l
 
 ```bash
 cd ~/DSVP-build
-export LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib:$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$HOME/ffmpeg-9.0-local/lib:$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
 ./package.sh
 rm -f DSVP-portable/dsvp.log
 rm -rf ~/DSVP-old && mv ~/DSVP ~/DSVP-old && mv DSVP-portable ~/DSVP
@@ -211,9 +246,9 @@ Once the dependencies are built, rebuilding DSVP after a code change is fast:
 ```bash
 cd ~/DSVP-build
 git pull
-export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
+export PKG_CONFIG_PATH=$HOME/ffmpeg-9.0-local/lib/pkgconfig:$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
 make clean && make
-export LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib:$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$HOME/ffmpeg-9.0-local/lib:$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
 ./package.sh
 rm -f DSVP-portable/dsvp.log
 rm -rf ~/DSVP-old && mv ~/DSVP ~/DSVP-old && mv DSVP-portable ~/DSVP
@@ -222,14 +257,14 @@ rm -rf ~/DSVP-old && mv ~/DSVP ~/DSVP-old && mv DSVP-portable ~/DSVP
 ## Filesystem Layout
 
 ```
-~/ffmpeg-8.1-local/     — Native FFmpeg 8.1 with VAAPI (headers, libs, pkg-config)
-~/sdl3-local/           — Native SDL3 3.4.2 + SDL3_ttf 3.2.2
-~/DSVP-build/           — Source checkout (steamdeck branch)
+~/ffmpeg-9.0-local/     — Native FFmpeg 9.0 with VAAPI (headers, libs, pkg-config)
+~/sdl3-local/           — Native SDL3 3.4.14 + SDL3_ttf 3.2.2
+~/DSVP-build/           — Source checkout (DSVP-deck repo, main branch)
 ~/DSVP/                 — Deployed portable build (binary + bundled libs)
 ~/DSVP-old/             — Previous build (backup)
 ```
 
-Source trees (`~/SDL3-src/`, `~/SDL3_ttf-src/`, `~/ffmpeg-8.1/`) can be deleted after building to free space.
+Source trees (`~/SDL3-src/`, `~/SDL3_ttf-src/`, `~/ffmpeg-9.0/`) can be deleted after building to free space.
 
 ## Troubleshooting
 

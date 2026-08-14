@@ -28,6 +28,7 @@
 #include <libswresample/swresample.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/dovi_meta.h>
+#include <libavutil/pixdesc.h>
 
 /* SDL3 — SDL_MAIN_HANDLED prevents SDL from injecting WinMain */
 #define SDL_MAIN_HANDLED
@@ -48,7 +49,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.2.7-beta"
+#define DSVP_VERSION        "0.3.7-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -60,6 +61,20 @@
 #define MAX_SUB_STREAMS     16      /* max subtitle tracks to catalog   */
 #define MAX_AUDIO_STREAMS   16      /* max audio tracks to catalog      */
 #define SUB_TEXT_SIZE       4096    /* max subtitle text buffer         */
+
+/* Multi-cue text subtitles (P2-16): up to SUB_TEXT_CUES overlapping text
+ * cues display at once — second speaker, signs, nested timing; common in
+ * ASS and overlapping SRT. Text tracks only: bitmap tracks (PGS/DVB/
+ * VobSub) keep the single-display-set model, which is those formats' own
+ * composition semantics. Eviction when full: the cue ending soonest. */
+#define SUB_TEXT_CUES       4
+
+typedef struct {
+    char   text[SUB_TEXT_SIZE];
+    double start_pts;
+    double end_pts;
+    int    valid;
+} SubTextCue;
 #define MAX_SUB_BITMAPS     4       /* max bitmap rects per subtitle    */
 
 /* Default window size when no video is loaded */
@@ -145,8 +160,12 @@ typedef struct GPUUniforms {
     float hdr_midtone_gain; /* midtone lift exponent (G key)       4 bytes */
     float is_dovi;          /* 1.0 = DV reshaping active           4 bytes */
     float is_semiplanar;    /* 1.0 = UV from single R16G16 tex    4 bytes */
-    float _pad0[1];         /* align to 16B for float4 arrays     4 bytes */
+    float out_gamma;        /* 0=sRGB piecewise, else power exp.   4 bytes */
     /* ── 144B boundary ── */
+    float is_hlg;           /* 1.0 = HLG transfer (ARIB STD-B67)   4 bytes */
+    float hdr_pass;         /* 1.0 = HDR passthrough (PQ out)      4 bytes */
+    float _pad1[2];         /* align to 16B for float4 arrays      8 bytes */
+    /* ── 160B boundary ── */
     float dovi_num_pieces[4]; /* [I, Ct, Cp, 0] piece counts      16 bytes */
     float dovi_pivots[9][4];  /* [pivot][comp] normalized pivots 144 bytes */
     float dovi_c0[8][4];     /* [piece][comp] poly coef c0       128 bytes */
@@ -158,13 +177,26 @@ typedef struct GPUUniforms {
     float dovi_out_r0[4];   /* output row 0 [m,m,m,0] (lms→2020) 16 bytes */
     float dovi_out_r1[4];   /* output row 1 [m,m,m,0]            16 bytes */
     float dovi_out_r2[4];   /* output row 2 [m,m,m,0]            16 bytes */
-} GPUUniforms;              /*                                  784 bytes */
+    /* ── DV MMR chroma reshaping (appended — offsets above unchanged) ──
+     * Real-world P5 RPUs overwhelmingly reshape Ct/Cp with MMR, a
+     * cross-channel polynomial over the full (I,Ct,Cp) triple; the
+     * per-component poly path cannot represent it and those components
+     * silently fell back to identity (right luma, wrong colour).
+     * Ported from DSVP main bc20d0a. Single-piece MMR, order 1-3. */
+    float dovi_mmr_meta[4];   /* [ct_order, cp_order, ct_const, cp_const] */
+    float dovi_mmr_ct[6][4];  /* 21 coeffs, [order*7+term] packed  96 bytes */
+    float dovi_mmr_cp[6][4];  /*                                   96 bytes */
+} GPUUniforms;              /*                                 1008 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
  * Central structure holding everything: format/codec contexts, queues,
  * SDL handles, clocks, and UI state. One instance per playback session.
  */
+
+/* Pacing v2 mode machine states (docs/DESIGN-PACING.md) */
+#define PACE_SCHEDULED 0
+#define PACE_LOCKED    1
 
 typedef struct PlayerState {
     /* ── Format / streams ── */
@@ -175,6 +207,12 @@ typedef struct PlayerState {
     /* ── Video decode ── */
     AVCodecContext     *video_codec_ctx;
     struct SwsContext  *sws_ctx;
+    int                 sws_out_10bit;    /* sws destination is yuv420p10le (deep
+                                             source kept at 10-bit through the
+                                             R16 upload path) */
+    int                 sws_dst_siting;   /* AVChromaLocation the sws OUTPUT was
+                                             pinned to — the shader offset is
+                                             derived from this when sws is active */
     AVFrame            *video_frame;      /* raw decoded frame          */
     AVFrame            *rgb_frame;        /* scaled/converted for SDL   */
     uint8_t            *rgb_buffer;       /* backing buffer for rgb_frame */
@@ -200,16 +238,20 @@ typedef struct PlayerState {
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;
     struct SwrContext  *swr_ctx;
+    int                 swr_in_fmt;      /* format swr was configured for      */
+    int                 swr_in_rate;     /* rate swr was configured for        */
+    AVChannelLayout     swr_in_layout;   /* layout swr was configured for
+                                            (owned copy — uninit with swr)    */
     AVFrame            *audio_frame;
     uint8_t            *audio_buf;        /* resampled audio buffer     */
     unsigned int        audio_buf_size;   /* bytes of valid data in buf */
     unsigned int        audio_buf_index;  /* read cursor into buf       */
+    unsigned int        audio_buf_cap;    /* allocated capacity of audio_buf (bytes) */
 
     /* ── Bitstream passthrough ── */
     AudioMode           audio_mode;       /* PCM / Auto / Passthrough   */
     BitstreamCaps       bitstream_caps;   /* HDMI sink capabilities     */
     int                 bitstream_active; /* 1 = currently passing through */
-    void               *alsa_pcm;        /* snd_pcm_t* — ALSA passthrough handle  */
     void               *spdif_ctx;       /* AVFormatContext* — spdifenc muxer      */
     void               *spdif_avio;      /* AVIOContext* — spdifenc memory buffer  */
     uint8_t            *spdif_buf;       /* IEC 61937 framed output buffer         */
@@ -217,11 +259,15 @@ typedef struct PlayerState {
     int                 spdif_write_pos; /* write cursor into spdif_buf (per-frame) */
     SDL_Thread         *bitstream_thread;
     int                 bitstream_quit;  /* signal bitstream thread to exit        */
-    int                 bitstream_seek_pending; /* signal thread to reset clock + ALSA  */
-    int                 bitstream_frame_bytes; /* ALSA frame size: channels * 2 (S16) */
-    int                 bitstream_alsa_rate;   /* actual ALSA sample rate             */
-    double              bitstream_wall_start;  /* wall clock at first ALSA write      */
-    int64_t             bitstream_frames_written; /* cumulative frames sent to ALSA   */
+    int                 bitstream_seek_pending; /* signal feeder to flush + resync      */
+    int                 bitstream_failed; /* feeder saw stream ERROR — main loop
+                                             completes the PCM fallback            */
+    void               *bpw;             /* BitstreamPW* — PipeWire passthrough
+                                          * backend state (bitstream_pw.c)     */
+    double              audio_delay_sec; /* DSVP_AUDIO_DELAY user offset:
+                                          * positive = sink chain delays audio
+                                          * vs video; applied to the bitstream
+                                          * sync clock */
 
     /* ── Async audio mode switch ──
      * P-key mode switch uses a background thread for caller-API
@@ -277,15 +323,128 @@ typedef struct PlayerState {
     float                       hdr_prev_frame_peak;  /* raw peak from previous frame    */
     float                       hdr_static_peak;      /* metadata peak (fallback ceiling) */
     int                         hdr_target_idx;       /* index into SDR target nit table  */
+
+    /* ── HDR output (passthrough) — docs/TODO-HDR.md ── */
+    int                         hdr_out_mode;         /* 0 = off (tone-map), 1 = auto.
+                                                         Z key toggles; survives file
+                                                         opens within the session */
+    int                         hdr_out_active;       /* swapchain is currently
+                                                         HDR10/ST2084 */
+    int                         hdr_pass_content;     /* current file's signal can pass
+                                                         through as-is (PQ, non-DV-P5,
+                                                         non-HLG for now) */
+    char                        hdr_sys_output[32];   /* HDR-capable output name from
+                                                         kscreen-doctor (e.g. "DP-1") */
+    int                         hdr_sys_prior_hdr;    /* output HDR state before we
+                                                         touched it (restore target) */
+    int                         hdr_sys_enabled_by_us;/* we flipped output HDR on —
+                                                         restore on revert/shutdown */
+    float                       out_gamma_pref;       /* output transfer, preserved across
+                                                         opens (E key / DSVP_OUTPUT_GAMMA).
+                                                         0 = unset (parse env on first
+                                                         open), 1.0 = sRGB piecewise,
+                                                         else pure power exponent — the
+                                                         uniform encodes sRGB as 0.0, but
+                                                         0 must mean "unset" here so
+                                                         zero-init works */
     int                         dovi_metadata_logged; /* 1 = logged DV RPU for this file  */
 
     /* ── Overlay GPU handles (lifetime: application, resized as needed) ── */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_overlay; /* RGBA + alpha blend */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_blit;    /* frame tex → swapchain copy */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_frame;   /* YUV → RGBA16 intermediate */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_dilated_frame; /* dilated → intermediate */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_dilated; /* downscale-only sampler
+                                                             variant (DSVP_DILATE) */
+
+    /* ── Intermediate frame texture (render-at-content-rate) ──
+     * The full video shader runs only on NEW frames (or when render
+     * state changes), into a UNORM16 texture; every vsync then blits
+     * it to the swapchain (memcpy-class). Re-running the 4K sampler
+     * chain 60x/s for 24fps content was ~2.5x redundant GPU work —
+     * the headroom KWin's HDR compositing pushed over the edge.
+     * UNORM16 precision (2^-16, uniform) exceeds both output depths;
+     * the video shader's dither already cycles per CONTENT frame
+     * (frameCount = frames_displayed), so output is bit-identical to
+     * the direct path. DSVP_NO_INTERMEDIATE=1 restores direct. */
+    SDL_GPUTexture             *gpu_tex_frame;
+    int                         frame_tex_w, frame_tex_h;
+    int                         frame_tex_valid;   /* holds current content   */
+    int                         frame_render_dirty;/* uniforms/geometry moved —
+                                                      re-render before blit   */
+    int                         no_intermediate;   /* env opt-out / fallback  */
+    int                         drift_resync_ticks;/* consecutive 1:1 ticks with
+                                                      video >0.5s behind audio —
+                                                      triggers the warm reseek */
+    int                         intermediate_apt;  /* per-file: content rate is
+                                                      below display refresh, so
+                                                      redundant re-renders exist
+                                                      for the intermediate to
+                                                      eliminate. At content ==
+                                                      refresh (4K60 SDR) the
+                                                      intermediate saves nothing
+                                                      and its blit bandwidth
+                                                      broke 60 present — field
+                                                      regression 2026-08-07 */
+
+    /* ── Pacing: median cadence sensor + explicit LOCKED/SCHEDULED
+     * mode machine (docs/DESIGN-PACING.md). The v1 threshold stack
+     * was removed at 0.3.6. ── */
+    double                      pace_ring[32];     /* presented-frame intervals */
+    int                         pace_ring_n;       /* filled entries (≤32); reset
+                                                      by window-event hints for a
+                                                      fast re-measure           */
+    int                         pace_ring_pos;     /* next write index          */
+    double                      pace_median;       /* median of ring; 0 = still
+                                                      measuring (blocks LOCKED
+                                                      entry, suspends cadence
+                                                      exit; drift exit stays)   */
+    double                      pace_last_present; /* wall time of last present
+                                                      (display OR reblit; drop
+                                                      ticks are not presents)   */
+    int                         pace_mode;         /* PACE_SCHEDULED / PACE_LOCKED */
+    int                         pace_enter_streak; /* presented frames meeting
+                                                      LOCKED entry cadence match */
+    int                         pace_exit_streak;  /* presented frames failing
+                                                      LOCKED cadence (exit path) */
+    int                         pace_drift_streak; /* displayed frames with drift
+                                                      beyond bias ± one frame —
+                                                      the LOCKED exit contract   */
+    double                      last_av_diff;      /* raw av_diff at last consume;
+                                                      the entry contract's
+                                                      settled-drift check        */
+    double                      sched_off;         /* smoothed (wall − playback
+                                                      clock) offset — the
+                                                      scheduler's time base:
+                                                      t_ideal = pts + sched_off
+                                                      − av_bias                  */
+    int                         sched_off_valid;   /* 0 until anchored           */
+    int                         sched_chain;       /* mid drop-chain: the next
+                                                      frame is due NOW — skip
+                                                      reblit, yield for decode
+                                                      delivery                   */
+    double                      sched_chain_start; /* chain safety-timeout base  */
+    double                      pace_bias_ref;     /* av_bias SNAPSHOT taken at
+                                                      LOCKED entry — the exit
+                                                      contract and reseek
+                                                      backstop compare against
+                                                      this, never the live EMA:
+                                                      a snapshot cannot absorb
+                                                      drift (batch-2 field
+                                                      notes, lesson 10)         */
+    int                         hdrwire_logged;    /* one-shot: wire HDR state
+                                                      logged for this file's
+                                                      passthrough session       */
     SDL_GPUTexture             *gpu_overlay_tex;      /* RGBA8888 overlay  */
     SDL_GPUTransferBuffer      *gpu_overlay_xfer;     /* CPU→GPU staging   */
     int                         overlay_tex_w;         /* current texture dimensions */
     int                         overlay_tex_h;
     int                         overlay_dirty;         /* 1 = need re-upload */
+    int                         overlay_tex_undefined; /* fresh texture, no full-height
+                                                          upload yet — gpu_overlay_upload
+                                                          widens the next band to full */
+    int                         overlay_up_y0;         /* pending upload rows */
+    int                         overlay_up_y1;         /* (exclusive)         */
 
     /* ── Timing / A/V sync ── */
     double              io_deadline;      /* abort FFmpeg I/O after this time */
@@ -312,7 +471,7 @@ typedef struct PlayerState {
 
     /* ── Decode thread (async video decode) ──
      *
-     * Moves video_decode_frame() off the main loop into a background
+     * Moves video decoding off the main loop into a background
      * thread.  The thread continuously decodes one frame ahead into
      * decoded_frame.  Ownership is gated by decode_frame_ready:
      *   ready == 0  →  decode thread may write decoded_frame
@@ -335,7 +494,12 @@ typedef struct PlayerState {
     int                 fullscreen;
     int                 eof;              /* demuxer hit end of file    */
     int                 io_error;         /* demux thread hit I/O error (NFS loss etc.) */
+    int                 vaapi_unsupported; /* get_format saw no VAAPI for this stream
+                                              (unsupported profile) — main retries the
+                                              file in software (review P2-17)          */
+    int                 force_swdec;       /* next player_open skips VAAPI (the retry)  */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
+    int                 res_change_logged;/* per-file: mid-stream resolution warn fired */
 
     /* ── Gamepad (steamdeck branch) ── */
     SDL_Gamepad        *gamepad;           /* first connected gamepad (NULL if none) */
@@ -398,6 +562,11 @@ typedef struct PlayerState {
     int                 sub_valid;          /* 1 = sub_text should display  */
     int                 sub_is_bitmap;      /* 1 = bitmap sub, 0 = text     */
 
+    /* Multi-cue text display (P2-16) — text tracks fill these instead
+     * of the single slot above; bitmap tracks never touch them. */
+    SubTextCue          sub_cues[SUB_TEXT_CUES];
+    int                 sub_cue_count;      /* valid entries in sub_cues    */
+
     /* Bitmap subtitle pixel data (RGBA, freed via av_free) */
     uint8_t            *sub_bitmap_data[MAX_SUB_BITMAPS];
     int                 sub_bitmap_w[MAX_SUB_BITMAPS];
@@ -423,6 +592,13 @@ typedef struct PlayerState {
     double              diag_max_av_drift;     /* worst A/V drift (signed) */
     double              diag_last_report;      /* time of last periodic log*/
 
+    /* ── Real-time FPS measurement (debug overlay, 0.5s window) ── */
+    double              fps_window_start;      /* window anchor (wall sec) */
+    int                 fps_window_frames;     /* CONTENT frames in window */
+    int                 rfps_window_frames;    /* GPU presents in window   */
+    double              fps_content;           /* measured content fps     */
+    double              fps_render;            /* measured present rate    */
+
     /* ── Folder playlist (prev/next navigation) ── */
     char              **playlist_files;      /* sorted full paths          */
     int                 playlist_count;      /* number of playable files   */
@@ -435,7 +611,7 @@ typedef struct PlayerState {
     double              prof_vsync_ms;        /* last frame: copy pass + VSync wait */
     double              prof_render_ms;       /* last frame: render pass + submit */
     double              prof_display_ms;      /* last frame: total video_display() */
-    double              prof_decode_ms;       /* last frame: video_decode_frame()  */
+    double              prof_decode_ms;       /* last frame: video decode          */
 
     /* Running stats (reset every 10s DIAG window) */
     int                 prof_n;
@@ -453,6 +629,38 @@ typedef struct PlayerState {
 
 } PlayerState;
 
+/* ── Subtitle staleness contract ──────────────────────────────────────
+ * One knob, three coupled windows — these lived as free-standing
+ * literals in two files and drifted apart is exactly the failure mode.
+ *
+ * SUB_STALE_CAP_SEC: decode-side safety net. PGS/DVB sets carry
+ *   end_display_time = UINT32_MAX (duration unknown until the clear
+ *   packet); cap so an orphaned set can't stick forever.
+ * SUB_PRUNE_WINDOW_SEC: demux-side rolling-window depth per track.
+ *   MUST exceed the cap, or the demuxer prunes packets the decoder
+ *   still considers displayable.
+ * SUB_CLEAR_FOUND_SEC: a displayed bitmap whose duration is below the
+ *   cap already had its end set by a real clear packet — the
+ *   drain-for-clear can stop. Must sit just under the cap. */
+#define SUB_STALE_CAP_SEC     30.0
+#define SUB_PRUNE_WINDOW_SEC  (SUB_STALE_CAP_SEC + 5.0)
+#define SUB_CLEAR_FOUND_SEC   (SUB_STALE_CAP_SEC - 1.0)
+
+/* Hard byte backstop per subtitle queue. pq_prune_stale can't judge a
+ * NOPTS head (DVB teletext in MPEG-TS emits them), which halted PTS
+ * pruning permanently and let an unselected track's queue grow for the
+ * whole file. Far above any real prune-window footprint; only a
+ * NOPTS-emitting track ever reaches it. */
+#define SUB_PQ_MAX_BYTES  (8 * 1024 * 1024)
+
+/* Master playback clock: audio-driven when an audio stream is active,
+ * video clock otherwise. This exact ternary lived at four call sites
+ * across three files — a new consumer must use this, not re-derive. */
+static inline double player_clock(const PlayerState *ps) {
+    return (ps->audio_stream_idx >= 0) ? ps->audio_clock_sync
+                                       : ps->video_clock;
+}
+
 /* ── Packet Queue API ─────────────────────────────────────────────── */
 
 void  pq_init(PacketQueue *q);
@@ -460,6 +668,9 @@ void  pq_destroy(PacketQueue *q);
 int   pq_put(PacketQueue *q, AVPacket *pkt);
 int   pq_get(PacketQueue *q, AVPacket *pkt, int block);
 void  pq_flush(PacketQueue *q);
+void  pq_prune_stale(PacketQueue *q, int64_t min_pts, int max_bytes);
+int   natural_casecmp(const char *a, const char *b);
+int   pq_peek_pts(PacketQueue *q, int64_t *pts_out);
 
 /* ── Player API (player.c) ────────────────────────────────────────── */
 
@@ -467,7 +678,6 @@ int   player_open(PlayerState *ps, const char *filename);
 void  player_close(PlayerState *ps);
 int   demux_thread_func(void *arg);
 int   decode_thread_func(void *arg);
-int   video_decode_frame(PlayerState *ps);
 void  video_display(PlayerState *ps);
 void  video_reblit(PlayerState *ps);
 void  player_seek(PlayerState *ps, double incr);
@@ -479,11 +689,13 @@ void  player_update_display_rect(PlayerState *ps);
 
 int   gpu_create_pipelines(PlayerState *ps);
 void  gpu_destroy_pipelines(PlayerState *ps);
+void  hdr_output_apply(PlayerState *ps);
+void  hdr_output_shutdown(PlayerState *ps);
 
 /* ── Overlay GPU (player.c) ──────────────────────────────────────── */
 
 int   gpu_overlay_ensure(PlayerState *ps, int width, int height);
-void  gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba, int width, int height);
+void  gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba, int width, int height, int y0, int y1);
 void  gpu_overlay_copy_cmd(SDL_GPUCommandBuffer *cmd, PlayerState *ps);
 void  gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
                         PlayerState *ps, Uint32 sc_w, Uint32 sc_h);
@@ -498,11 +710,27 @@ void  SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
 int   audio_decode_frame(PlayerState *ps);
 void  audio_find_streams(PlayerState *ps);
 void  audio_cycle(PlayerState *ps);
+void  hdrwire_log_state(void);  /* hdrwire.c — log the wire HDR infoframe */
 void  bitstream_probe(PlayerState *ps);
-int   bitstream_start(PlayerState *ps);  /* open ALSA + spdifenc, start thread */
-void  bitstream_stop(PlayerState *ps);   /* close ALSA + spdifenc, join thread */
+int   bitstream_hd_blocked(int av_codec_id, int src_rate); /* >48k IEC platform
+                                          * blocklist — see audio.c; override
+                                          * DSVP_HD_PASSTHROUGH=1 */
+int   bitstream_start(PlayerState *ps);  /* spdifenc + pw stream, start feeder */
+void  bitstream_stop(PlayerState *ps);   /* close stream + spdifenc, join feeder */
 void  bitstream_stop_immediate(PlayerState *ps); /* fast stop, no delays — for async switch */
 int   audio_switch_bg_func(void *arg);   /* async-switch signaler thread */
+
+/* ── PipeWire passthrough backend (bitstream_pw.c) ────────────────
+ * The only bitstream transport: iec958 encoded stream, server owns
+ * the device and channel status (docs/TODO-BITSTREAM.md). */
+int    bitstream_pw_open(PlayerState *ps, int av_codec_id, int rate,
+                         int channels);          /* 1 = negotiated        */
+int    bitstream_pw_write(PlayerState *ps, const uint8_t *data, int len);
+double bitstream_pw_buffered(PlayerState *ps);   /* seconds ring+queued   */
+void   bitstream_pw_pause(PlayerState *ps, int paused);
+void   bitstream_pw_seek_reset(PlayerState *ps);
+void   bitstream_pw_eof_drain(PlayerState *ps);  /* activate below-threshold tail */
+void   bitstream_pw_close(PlayerState *ps);
 
 /* ── Subtitle API (subtitle.c) ───────────────────────────────────── */
 
@@ -511,18 +739,21 @@ int   sub_open_codec(PlayerState *ps, int stream_idx);
 void  sub_close_codec(PlayerState *ps);
 void  sub_cycle(PlayerState *ps);
 void  sub_decode_pending(PlayerState *ps);
+void  sub_text_cues_clear(PlayerState *ps);
 int   sub_init_font(void);
 void  sub_close_font(void);
 TTF_Font *sub_get_font(void);
 TTF_Font *sub_get_outline_font(void);
-/* Phase 2: sub_render will be reworked for GPU compositing */
-void  sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h);
 
 /* ── Overlay API (overlay.c) ─────────────────────────────────────── */
 
 void  overlay_render(PlayerState *ps);
 void  overlay_render_idle(PlayerState *ps);
 void  overlay_render_browser(PlayerState *ps);
+/* UI scale for a given swapchain height — single source of truth, shared by
+ * overlay.c's draw code and main.c's seekbar hit-testing so the two cannot
+ * disagree about where the bar is. */
+int   ui_scale_for(const PlayerState *ps, int sc_h);
 void  overlay_cleanup(void);
 
 /* ── Browser API (browser.c) ────────────────────────────────────── */

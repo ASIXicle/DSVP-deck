@@ -22,6 +22,9 @@ dsvp.log
 *.zip
 *.tar.gz
 *.patch
+# ...except the version-matched SDL patches we deliberately ship
+# (the blanket rule silently ate one once — commit d2fde9d)
+!tools/sdl-patches/*.patch
 DSVP_deck-*/
 # Test scripts and logs
 test_*.sh

@@ -36,53 +36,71 @@ extern int is_media_file(const char *name);
  * and fall back to a safe local path.
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* Heap-allocated and refcounted: on timeout the worker thread is
+ * abandoned mid-stat() and outlives this call — it must land its
+ * result write and semaphore signal in memory that is still alive.
+ * The previous stack-args version was a use-after-return write plus
+ * a signal on a freed semaphore, firing whenever the abandoned
+ * stat() finally errored out (30-60s later on stale NFS). Last
+ * owner (worker or caller) destroys the semaphore and frees. */
 typedef struct {
-    const char    *path;
+    char           path[BROWSER_PATH_MAX];
     SDL_Semaphore *sem;
+    SDL_AtomicInt  refs;    /* 2 at start: caller + worker */
     int            result;  /* 1 = accessible directory, 0 = not */
 } PathCheckArgs;
+
+static void path_check_release(PathCheckArgs *a) {
+    if (SDL_AddAtomicInt(&a->refs, -1) == 1) {  /* we were the last owner */
+        SDL_DestroySemaphore(a->sem);
+        free(a);
+    }
+}
 
 static int path_check_thread(void *arg) {
     PathCheckArgs *a = (PathCheckArgs *)arg;
     struct stat st;
     a->result = (stat(a->path, &st) == 0 && S_ISDIR(st.st_mode));
     SDL_SignalSemaphore(a->sem);
+    path_check_release(a);
     return 0;
 }
 
 /* Returns 1 if path is an accessible directory, 0 if not or timeout.
  * timeout_ms: max time to wait (e.g. 2000 for 2 seconds). */
 static int path_accessible(const char *path, int timeout_ms) {
-    /* Fast path: local paths (starting with /home) rarely stall */
-    SDL_Semaphore *sem = SDL_CreateSemaphore(0);
-    if (!sem) {
+    PathCheckArgs *a = calloc(1, sizeof(*a));
+    if (!a) {
         /* Fallback: blocking stat (old behavior) */
         struct stat st;
         return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
     }
-
-    PathCheckArgs args = { .path = path, .sem = sem, .result = 0 };
-    SDL_Thread *t = SDL_CreateThread(path_check_thread, "pathchk", &args);
-    if (!t) {
-        SDL_DestroySemaphore(sem);
+    snprintf(a->path, sizeof(a->path), "%s", path);
+    a->sem = SDL_CreateSemaphore(0);
+    if (!a->sem) {
+        free(a);
         struct stat st;
         return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
     }
+    SDL_SetAtomicInt(&a->refs, 2);
 
-    int ok = SDL_WaitSemaphoreTimeout(sem, timeout_ms);
-    SDL_DestroySemaphore(sem);
-
-    if (ok) {
-        /* Thread completed in time */
-        SDL_WaitThread(t, NULL);
-        return args.result;
-    } else {
-        /* Timeout — thread is stuck in kernel stat().
-         * Detach it; small leak, but only happens with stale NFS. */
-        SDL_DetachThread(t);
-        log_msg("browser: path check timed out (%dms): %s", timeout_ms, path);
-        return 0;
+    SDL_Thread *t = SDL_CreateThread(path_check_thread, "pathchk", a);
+    if (!t) {
+        SDL_DestroySemaphore(a->sem);
+        free(a);
+        struct stat st;
+        return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
     }
+    /* Detach unconditionally: on timeout nobody can join it, and on
+     * success the refcount — not the join — owns the cleanup. */
+    SDL_DetachThread(t);
+
+    int ok = SDL_WaitSemaphoreTimeout(a->sem, timeout_ms);
+    int result = ok ? a->result : 0;
+    if (!ok)
+        log_msg("browser: path check timed out (%dms): %s", timeout_ms, path);
+    path_check_release(a);
+    return result;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -275,8 +293,10 @@ static int cmp_browse_entries(const void *a, const void *b) {
     /* Directories before files */
     if (ea->is_dir != eb->is_dir)
         return eb->is_dir - ea->is_dir;
-    /* Alphabetical (case-insensitive) */
-    return strcasecmp(ea->name, eb->name);
+    /* Natural order (case-insensitive): E2 before E10, so episodes in
+     * the browser list read in story order — same comparator as the
+     * B/N playlist in main.c. */
+    return natural_casecmp(ea->name, eb->name);
 }
 
 void browser_scan(PlayerState *ps) {

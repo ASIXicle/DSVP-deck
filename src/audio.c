@@ -15,11 +15,6 @@
  */
 
 #include "dsvp.h"
-#include <alsa/asoundlib.h>
-#include <systemd/sd-bus.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <errno.h>
 
 /* ═══════════════════════════════════════════════════════════════════
  * Audio Decode
@@ -29,6 +24,11 @@ int audio_decode_frame(PlayerState *ps) {
     AVPacket pkt;
     int ret;
     int data_size;
+
+    /* Codec can be NULL mid-session if audio_cycle() failed to open the
+     * next track — the device stays open, so the callback still fires.
+     * Produce silence instead of dereferencing NULL. */
+    if (!ps->audio_codec_ctx) return -1;
 
     for (;;) {
         ret = avcodec_receive_frame(ps->audio_codec_ctx, ps->audio_frame);
@@ -60,6 +60,27 @@ int audio_decode_frame(PlayerState *ps) {
                 ps->audio_pts_floor = 0.0;  /* floor satisfied — clear */
             }
 
+            /* Mid-stream format change (DVB/TS program boundaries do
+             * this on legal streams): swr configured for the old frame
+             * shape would read missing plane pointers (6ch planar →
+             * 2ch = NULL derefs) or produce garbled output. Compare
+             * against the configured shape and rebuild (review P1-7). */
+            if (ps->swr_ctx &&
+                (ps->audio_frame->format      != ps->swr_in_fmt ||
+                 ps->audio_frame->sample_rate != ps->swr_in_rate ||
+                 av_channel_layout_compare(&ps->audio_frame->ch_layout,
+                                           &ps->swr_in_layout) != 0)) {
+                log_msg("Audio: stream format changed "
+                        "(fmt %d %dch %dHz -> fmt %d %dch %dHz) — "
+                        "rebuilding resampler",
+                        ps->swr_in_fmt, ps->swr_in_layout.nb_channels,
+                        ps->swr_in_rate,
+                        ps->audio_frame->format,
+                        ps->audio_frame->ch_layout.nb_channels,
+                        ps->audio_frame->sample_rate);
+                swr_free(&ps->swr_ctx);
+            }
+
             if (!ps->swr_ctx) {
                 AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
                 ret = swr_alloc_set_opts2(&ps->swr_ctx,
@@ -70,15 +91,30 @@ int audio_decode_frame(PlayerState *ps) {
                     log_msg("ERROR: swr init failed: %s", av_err2str(ret));
                     return -1;
                 }
+                ps->swr_in_fmt  = ps->audio_frame->format;
+                ps->swr_in_rate = ps->audio_frame->sample_rate;
+                av_channel_layout_uninit(&ps->swr_in_layout);
+                av_channel_layout_copy(&ps->swr_in_layout,
+                                       &ps->audio_frame->ch_layout);
             }
 
             int out_samples = swr_get_out_samples(ps->swr_ctx, ps->audio_frame->nb_samples);
+            if (out_samples < 0) return -1;
             int out_size = out_samples * 2 * 4;  /* stereo F32 = 8 bytes/frame */
 
-            if (!ps->audio_buf || out_size > AUDIO_BUF_SIZE) {
+            /* HEAP-OVERFLOW FIX: the old code re-malloc'd the SAME
+             * AUDIO_BUF_SIZE when out_size exceeded it, then told
+             * swr_convert the buffer held out_samples anyway — a large
+             * decoded frame plus heavy upsampling could write past the
+             * end of the allocation. Grow the buffer to fit instead. */
+            unsigned int need = (out_size > AUDIO_BUF_SIZE)
+                              ? (unsigned int)out_size
+                              : (unsigned int)AUDIO_BUF_SIZE;
+            if (!ps->audio_buf || need > ps->audio_buf_cap) {
                 av_free(ps->audio_buf);
-                ps->audio_buf = av_malloc(AUDIO_BUF_SIZE);
-                if (!ps->audio_buf) return -1;
+                ps->audio_buf = av_malloc(need);
+                if (!ps->audio_buf) { ps->audio_buf_cap = 0; return -1; }
+                ps->audio_buf_cap = need;
             }
 
             uint8_t *out_buf = ps->audio_buf;
@@ -170,7 +206,13 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
      * audio_clock_sync, which always has the full correction applied.
      *
      * CRITICAL: Cap the correction at 100ms to prevent FLAC/large-buffer
-     * runaway where SDL reports huge queued amounts during startup. */
+     * runaway where SDL reports huge queued amounts during startup.
+     *
+     * The freq > 0 clause doubles as a liveness gate: audio_close
+     * zeroes audio_spec.freq as its dead-stream sentinel (see the
+     * COUPLING note there) — it both guards the division below and
+     * keeps a post-failure callback from computing a correction
+     * against a dead device's remembered rate. */
     if (ps->audio_spec.freq > 0 && !ps->seek_recovering) {
         int bytes_per_sample = 2 * 4;  /* F32 stereo = 8 bytes/frame */
 
@@ -233,6 +275,7 @@ int audio_open(PlayerState *ps) {
 
     av_free(ps->audio_buf);  /* prevent leak on PCM↔bitstream mode switch */
     ps->audio_buf       = av_malloc(AUDIO_BUF_SIZE);
+    ps->audio_buf_cap   = ps->audio_buf ? AUDIO_BUF_SIZE : 0;
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;
 
@@ -253,6 +296,20 @@ void audio_close(PlayerState *ps) {
         SDL_DestroyAudioStream(ps->audio_stream);
         ps->audio_stream = NULL;
     }
+    /* Invalidate the remembered device rate (DSVP main 7f09ae0).
+     * audio_cycle's reopen decision compares the new track's rate against
+     * this — a stale value from a dead stream let the same-rate case skip
+     * the reopen entirely, setting audio_stream_idx with no device and no
+     * callback: demux refilled audio_pq, nothing drained it, and the
+     * queue-full throttle froze all playback.
+     *
+     * COUPLING: this zero is also read as a liveness signal by the
+     * clock-correction gate in the audio callback (the freq > 0 check
+     * above audio_clock_sync's computation) and shows as "0 Hz" in the
+     * info OSD after an audio failure. Do not remove it without
+     * migrating those readers — the reopen predicate's direct
+     * !audio_stream check alone does not cover them. */
+    ps->audio_spec.freq = 0;
 }
 
 
@@ -320,10 +377,40 @@ void audio_find_streams(PlayerState *ps) {
  * Audio Track Cycling
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* Take audio fully offline after a failure: no index, no queue, OSD
+ * notice. The ORDER is load-bearing and must exist in exactly one
+ * place: the index is cleared BEFORE the flush because demux routes
+ * packets without seek_mutex — a packet read during the failure
+ * window would land after an earlier flush and sit orphaned forever,
+ * blocking the EOF close (and, at throttle depth, stalling demux).
+ * One racing in-flight pq_put can still land post-flush; the main
+ * loop self-heals that case before its EOF gate. */
+static int bitstream_codec_supported(PlayerState *ps);  /* defined below */
+
+static void audio_disable(PlayerState *ps, const char *osd_msg) {
+    ps->audio_stream_idx = -1;
+    pq_flush(&ps->audio_pq);
+    snprintf(ps->aud_osd, sizeof(ps->aud_osd), "%s", osd_msg);
+    ps->aud_osd_until = get_time_sec() + 2.0;
+}
+
 void audio_cycle(PlayerState *ps) {
     if (ps->aud_count <= 1) {
         snprintf(ps->aud_osd, sizeof(ps->aud_osd),
             ps->aud_count == 0 ? "No audio tracks" : "Only one audio track");
+        ps->aud_osd_until = get_time_sec() + 2.0;
+        return;
+    }
+
+    /* Seek guard: everything below frees/rebuilds audio_codec_ctx,
+     * swr_ctx, and audio_stream — the same objects the demux seek
+     * handler flushes and clears under seek_mutex. The SDL stream-lock
+     * barrier below serializes against the audio CALLBACK only, not
+     * against demux. TryLock: an A press landing inside an in-flight
+     * seek is dropped (press again), never stalled on for up to the
+     * 10s seek io_deadline. */
+    if (!SDL_TryLockMutex(ps->seek_mutex)) {
+        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: busy (seeking)");
         ps->aud_osd_until = get_time_sec() + 2.0;
         return;
     }
@@ -361,6 +448,7 @@ void audio_cycle(PlayerState *ps) {
         snprintf(ps->aud_osd, sizeof(ps->aud_osd),
             "No other non-TrueHD audio tracks");
         ps->aud_osd_until = get_time_sec() + 2.0;
+        SDL_UnlockMutex(ps->seek_mutex);
         return;
     }
 
@@ -369,8 +457,16 @@ void audio_cycle(PlayerState *ps) {
     log_msg("Audio: switching to %s (stream %d)",
         ps->aud_stream_names[new_sel], new_stream_idx);
 
-    if (ps->audio_stream)
+    if (ps->audio_stream) {
         SDL_PauseAudioStreamDevice(ps->audio_stream);
+        /* BARRIER: pausing does not wait for a callback that's already
+         * in flight. SDL runs the get-callback while holding the stream
+         * lock, so lock+unlock returns only after any in-flight
+         * audio_decode_frame() finishes — only then is it safe to
+         * flush the queue and free the codec and swr contexts below. */
+        SDL_LockAudioStream(ps->audio_stream);
+        SDL_UnlockAudioStream(ps->audio_stream);
+    }
 
     pq_flush(&ps->audio_pq);
 
@@ -378,6 +474,7 @@ void audio_cycle(PlayerState *ps) {
         avcodec_free_context(&ps->audio_codec_ctx);
     if (ps->swr_ctx)
         swr_free(&ps->swr_ctx);
+    av_channel_layout_uninit(&ps->swr_in_layout);
 
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;
@@ -387,30 +484,55 @@ void audio_cycle(PlayerState *ps) {
     if (!codec) {
         log_msg("ERROR: No decoder for audio codec %s",
             avcodec_get_name(as->codecpar->codec_id));
-        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: codec error");
-        ps->aud_osd_until = get_time_sec() + 2.0;
+        audio_disable(ps, "Audio: codec error, audio off");
+        SDL_UnlockMutex(ps->seek_mutex);
         return;
     }
 
     ps->audio_codec_ctx = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(ps->audio_codec_ctx, as->codecpar);
+    if (!ps->audio_codec_ctx
+            || avcodec_parameters_to_context(ps->audio_codec_ctx,
+                                             as->codecpar) < 0) {
+        /* OOM / bad params: degrade like every other failure here
+         * instead of dereferencing NULL in avcodec_open2. */
+        log_msg("ERROR: audio codec context alloc/params failed");
+        avcodec_free_context(&ps->audio_codec_ctx);  /* NULL-safe */
+        audio_disable(ps, "Audio: codec error, audio off");
+        SDL_UnlockMutex(ps->seek_mutex);
+        return;
+    }
     ps->audio_codec_ctx->thread_count = 0;
 
     int ret = avcodec_open2(ps->audio_codec_ctx, codec, NULL);
     if (ret < 0) {
         log_msg("ERROR: Cannot open audio codec: %s", av_err2str(ret));
         avcodec_free_context(&ps->audio_codec_ctx);
-        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: codec error");
-        ps->aud_osd_until = get_time_sec() + 2.0;
+        audio_disable(ps, "Audio: codec error, audio off");
+        SDL_UnlockMutex(ps->seek_mutex);
         return;
     }
 
     int new_rate = ps->audio_codec_ctx->sample_rate;
-    if (new_rate != ps->audio_spec.freq) {
-        log_msg("Audio: sample rate changed %d -> %d, reopening stream",
+    /* Reopen when the rate changed OR when there is no live PCM stream
+     * (recovering from an earlier audio failure — the reason the user is
+     * pressing A). Keying on rate alone let the common same-rate case land
+     * in the success path with a codec but no device: total-playback
+     * freeze (DSVP main 7f09ae0). Bitstream/passthrough is excluded — it
+     * legitimately runs with audio_stream == NULL via ALSA. */
+    if ((!ps->audio_stream && !ps->bitstream_active)
+            || new_rate != ps->audio_spec.freq) {
+        log_msg("Audio: %s (rate %d -> %d)",
+            ps->audio_stream ? "sample rate changed, reopening stream"
+                             : "no live stream, reopening device",
             ps->audio_spec.freq, new_rate);
         audio_close(ps);
-        audio_open(ps);
+        if (audio_open(ps) < 0) {
+            log_msg("Audio: device open failed — continuing video-only");
+            avcodec_free_context(&ps->audio_codec_ctx);
+            audio_disable(ps, "Audio: device error, audio off");
+            SDL_UnlockMutex(ps->seek_mutex);
+            return;
+        }
     }
 
     ps->aud_selection    = new_sel;
@@ -425,23 +547,26 @@ void audio_cycle(PlayerState *ps) {
     ps->seek_flags   = AVSEEK_FLAG_BACKWARD;
     ps->seek_request = 1;
 
-    /* Auto-restart bitstream for TrueHD when mode permits.
-     * TrueHD PCM decode (1200 pkt/sec MLP) floods audio_pq and starves
-     * video within 200ms. Don't leave it in PCM purgatory -- go straight
-     * to bitstream if the sink supports it. */
-    if (as->codecpar->codec_id == AV_CODEC_ID_TRUEHD
-        && ps->audio_mode != AUDIO_MODE_PCM
-        && ps->bitstream_caps.support_truehd) {
+    /* Auto-restart passthrough when the mode permits and the sink
+     * supports the NEW codec (field 2026-08-13: an AC3→AC3 track
+     * switch silently demoted to PCM until a manual P press — the
+     * restart was TrueHD-only). TrueHD especially must not linger in
+     * PCM: 1200 pkt/sec MLP floods audio_pq and starves video within
+     * 200ms. bitstream_codec_supported covers sink caps and the >48k
+     * platform blocklist. */
+    if (ps->audio_mode != AUDIO_MODE_PCM
+        && bitstream_codec_supported(ps)) {
         audio_close(ps);
         if (bitstream_start(ps)) {
             snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: %s (passthrough)",
                 ps->aud_stream_names[new_sel]);
             ps->aud_osd_until = get_time_sec() + 2.0;
+            SDL_UnlockMutex(ps->seek_mutex);
             return;
         }
         /* Bitstream failed -- fall back to PCM */
         audio_open(ps);
-        log_msg("Audio: TrueHD bitstream failed, falling back to PCM decode");
+        log_msg("Audio: bitstream restart failed, falling back to PCM decode");
     }
 
     if (ps->audio_stream && !ps->paused)
@@ -450,6 +575,7 @@ void audio_cycle(PlayerState *ps) {
     snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: %s",
         ps->aud_stream_names[new_sel]);
     ps->aud_osd_until = get_time_sec() + 2.0;
+    SDL_UnlockMutex(ps->seek_mutex);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -585,7 +711,7 @@ void bitstream_probe(PlayerState *ps) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * Bitstream Output — IEC 61937 framing (spdifenc) + ALSA direct
+ * Bitstream Output — IEC 61937 framing (spdifenc) → PipeWire
  *
  * Bypasses SDL3 audio entirely. Compressed packets from the demuxer
  * are wrapped in IEC 61937 bursts by FFmpeg's spdif muxer, then
@@ -594,37 +720,14 @@ void bitstream_probe(PlayerState *ps) {
  * Flow: audio_pq → spdifenc → spdif_buf → ALSA hw:X,Y → HDMI → sink
  *
  * Called from player_open when audio_mode != PCM and the sink
- * supports the current codec. Falls back to PCM if ALSA open fails.
+ * supports the current codec. Falls back to PCM on any failure.
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define SPDIF_MAX_BUF  65536   /* max IEC 61937 burst (TrueHD HBR=61440) */
 
-/* ── IEC 60958 channel status for HDMI passthrough ──
- * HDMI transmitters check the channel status to distinguish PCM from
- * compressed audio. Without the non-audio bit set, the TV receives
- * IEC 61937 bursts but interprets them as PCM → static noise.
- *
- * On SteamOS 3.8.3 + kernel 6.16, every userspace path that should
- * deliver this bit at runtime is broken:
- *   - "IEC958 Playback Default" mixer control: kernel silently discards
- *     writes (cset returns 0, cget shows defaults regardless of WP state)
- *   - hw:N,M,AES=... device string: libasound has no per-card alias
- *     chain, snd_pcm_open returns ENOENT
- *   - iec958:CARD=N,DEV=M plugin device: same — no per-card definition
- *
- * The one working path is the HDA hwdep ioctl (SET_DIGI_CONVERT_1 to the
- * converter widget), which requires root or audio-group access to
- * /dev/snd/hwC*D0. Asking DSVP users to grant per-runtime privileges is
- * past the friction ceiling for a media player; the verb-write was
- * therefore extracted into a standalone helper (tools/dsvp-arm-iec958.c)
- * that udev fires at boot and on hwdep change events. The codec retains
- * the non-audio bit across snd_pcm_open, so setting it once at boot is
- * sufficient — DSVP itself runs unprivileged and just opens hw:N,M.
- *
- * See tools/dsvp-arm-iec958.c for the verb-write implementation, and
- * scripts/install-udev-rule.sh for the installation flow. */
-
-
+/* spdifenc's AVIO write callback — collects the framed IEC 61937
+ * burst into ps->spdif_buf for the feeder thread to hand to the
+ * PipeWire backend. */
 static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
     PlayerState *ps = (PlayerState *)opaque;
     if (ps->spdif_write_pos + len > SPDIF_MAX_BUF) {
@@ -637,176 +740,43 @@ static int spdif_write_cb(void *opaque, const uint8_t *data, int len) {
     return len;
 }
 
-/* ── Bitstream output thread ──
- * Pops compressed audio packets from audio_pq, frames them via
- * spdifenc, and writes IEC 61937 bursts to the ALSA device. */
+/* ── Check if the current audio codec is supported for passthrough ── */
+static int bitstream_rate_for_codec(enum AVCodecID id, int src_rate);
 
-static int bitstream_thread_func(void *arg) {
-    PlayerState *ps = (PlayerState *)arg;
-    snd_pcm_t *pcm = (snd_pcm_t *)ps->alsa_pcm;
-    AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
-    int spdif_err_count = 0;
-
-    /* TrueHD: spdifenc requires a major sync frame to initialize.
-     * After a seek or track switch, the first packets in audio_pq
-     * may precede the next major sync — spdifenc rejects them with
-     * "Invalid data found when processing input". Skip until we see
-     * the 0xF8726FBA sync word at bytes 4-7 of the access unit. */
-    int need_truehd_sync = (ps->audio_codec_ctx &&
-        ps->audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD);
-    int truehd_synced = !need_truehd_sync;
-    int truehd_skipped = 0;
-
-    log_msg("Bitstream: output thread started%s",
-            need_truehd_sync ? " (waiting for TrueHD major sync)" : "");
-
-    while (!ps->bitstream_quit) {
-        /* ── Pause gate ──
-         * In bitstream mode, SDL_PauseAudioStreamDevice has no effect —
-         * we're writing directly to ALSA, bypassing SDL audio entirely.
-         * Drop the ALSA buffer on pause entry (immediate silence), then
-         * spin-wait. On resume, re-prepare ALSA and reset the wall-clock
-         * counters so the buffered-time estimation restarts clean. */
-        if (ps->paused && !ps->bitstream_quit) {
-            snd_pcm_drop(pcm);  /* immediate silence */
-            while (ps->paused && !ps->bitstream_quit)
-                SDL_Delay(10);
-            if (ps->bitstream_quit) break;
-            snd_pcm_prepare(pcm);
-            /* Reset clock state — wall-clock math is invalid after pause */
-            ps->bitstream_frames_written = 0;
-            ps->bitstream_wall_start = 0;
-        }
-
-        /* ── Seek reset gate ──
-         * Demux thread sets bitstream_seek_pending after flushing audio_pq.
-         * We handle the reset HERE on the bitstream thread to avoid a data
-         * race with the concurrent frames_written increment in the ALSA
-         * write loop below. Drop kills stale pre-seek audio in the ALSA
-         * ring buffer; prepare re-arms PCM for the next writei. Zeroing
-         * wall_start causes the clock computation (line ~924) to skip
-         * the buffered-time estimation until the first post-seek write,
-         * letting seek recovery's audio_clock_sync = video_clock stick. */
-        if (ps->bitstream_seek_pending && !ps->bitstream_quit) {
-            snd_pcm_drop(pcm);
-            snd_pcm_prepare(pcm);
-            ps->bitstream_frames_written = 0;
-            ps->bitstream_wall_start = 0;
-            ps->bitstream_seek_pending = 0;
-        }
-
-        /* Pop a packet from the audio queue — non-blocking poll loop.
-         * Using block=0 lets us re-check paused, seek_pending, and quit
-         * every 5ms instead of sleeping indefinitely inside pq_get's
-         * SDL_WaitCondition. This makes pause and seek response instant
-         * without needing condvar broadcast from the main thread. */
-        AVPacket pkt;
-        int ret = 0;
-        while (!ps->bitstream_quit && !ps->paused && !ps->bitstream_seek_pending) {
-            ret = pq_get(&ps->audio_pq, &pkt, 0);  /* non-blocking */
-            if (ret != 0) break;  /* got packet (1) or abort (-1) */
-            SDL_Delay(5);
-        }
-        if (ps->paused || ps->bitstream_seek_pending)
-            continue;  /* re-enter loop → hit pause/seek gate */
-        if (ret <= 0 || ps->bitstream_quit) {
-            if (ret > 0) av_packet_unref(&pkt);
-            break;
-        }
-
-        /* Skip packets from wrong stream */
-        if (pkt.stream_index != ps->audio_stream_idx) {
-            av_packet_unref(&pkt);
-            continue;
-        }
-
-        /* TrueHD: skip packets until we hit a major sync frame.
-         * Major sync word 0xF8726FBA sits at bytes 4-7 of the access unit.
-         * Without this, spdifenc can't determine stream parameters and
-         * rejects every packet until a major sync arrives naturally. */
-        if (!truehd_synced) {
-            if (pkt.size >= 8 &&
-                pkt.data[4] == 0xF8 && pkt.data[5] == 0x72 &&
-                pkt.data[6] == 0x6F && pkt.data[7] == 0xBA) {
-                truehd_synced = 1;
-                log_msg("Bitstream: TrueHD major sync found (skipped %d packets)",
-                        truehd_skipped);
-            } else {
-                truehd_skipped++;
-                av_packet_unref(&pkt);
-                continue;
-            }
-        }
-
-        /* Update audio clock from packet PTS */
-        if (pkt.pts != AV_NOPTS_VALUE) {
-            AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
-            double pts = (double)pkt.pts * av_q2d(as->time_base);
-            ps->audio_clock = pts;
-
-            /* Derive buffered time from frame count + wall clock (no snd_pcm_delay)
-             * Credit: Wren (cross-instance advisory, April 2026) */
-            if (ps->bitstream_wall_start > 0) {
-                double submitted = (double)ps->bitstream_frames_written
-                                 / (double)ps->bitstream_alsa_rate;
-                double consumed  = get_time_sec() - ps->bitstream_wall_start;
-                double buffered  = submitted - consumed;
-                if (buffered < 0) buffered = 0;
-                if (buffered > 1.5) buffered = 1.5;
-                ps->audio_clock_sync = pts - buffered;
-            }
-        }
-
-        /* Frame the packet through spdifenc → spdif_buf */
-        ps->spdif_write_pos = 0;
-        pkt.stream_index = 0;  /* spdifenc has one stream at index 0 */
-        ret = av_write_frame(spdif, &pkt);
-        av_packet_unref(&pkt);
-
-        if (ret < 0) {
-            if (++spdif_err_count <= 3)
-                log_msg("Bitstream: spdifenc write failed: %s", av_err2str(ret));
-            else if (spdif_err_count == 4)
-                log_msg("Bitstream: suppressing further spdifenc errors");
-            continue;
-        }
-
-        if (ps->spdif_write_pos <= 0) continue;
-
-        /* Write IEC 61937 burst to ALSA */
-        int bpf = ps->bitstream_frame_bytes;  /* 4 for stereo, 16 for 8ch TrueHD */
-        int frames = ps->spdif_write_pos / bpf;
-        const uint8_t *ptr = ps->spdif_buf;
-        while (frames > 0) {
-            snd_pcm_sframes_t written = snd_pcm_writei(pcm, ptr, frames);
-            if (written < 0) {
-                if (written == -EPIPE) {
-                    /* Underrun — recover and retry */
-                    snd_pcm_prepare(pcm);
-                    log_msg("Bitstream: ALSA underrun — recovered");
-                    continue;
-                }
-                log_msg("Bitstream: ALSA write error: %s",
-                        snd_strerror((int)written));
-                break;
-            }
-            /* Track wall start from first successful write */
-            if (ps->bitstream_wall_start == 0)
-                ps->bitstream_wall_start = get_time_sec();
-            ps->bitstream_frames_written += written;
-            frames -= (int)written;
-            ptr += written * bpf;
-        }
-    }
-
-    log_msg("Bitstream: output thread exiting");
-    return 0;
+/* ── Platform blocklist: every IEC rate above 48k ──
+ * The deck currently cannot deliver >48k IEC 61937 to the wire on ANY
+ * path. Proven 2026-08-09: EAC3 2ch@192k fails via PipeWire, via mpv
+ * (two server routes), and via ALSA-direct with every arm engaged
+ * (verb + IEC958 control + register verified non-audio all run) —
+ * sink mutes, and for EAC3 latches until HDMI reseat. TrueHD 8ch@192k
+ * HBR fails silently on both backends TODAY despite having WORKED via
+ * ALSA+arm on 2026-07-27 — a REGRESSION in that window (SteamOS
+ * updated several times; suspect dock/DP audio path). Community
+ * reports the same DD+ hole via Kodi/pavucontrol. 48k normal-layout
+ * (AC3, DTS core) is the one class that reaches the sink, so AUTO
+ * attempts only that; everything faster decodes to PCM like any
+ * non-bitstreamable codec — no attempt, no silence, no wedge.
+ * WAITING ON VALVE (SteamOS/dock). Retest after updates with
+ * DSVP_HD_PASSTHROUGH=1 (one run, no rebuild); if the banner ever
+ * lights, delete this gate. */
+int bitstream_hd_blocked(int av_codec_id, int src_rate) {
+    if (bitstream_rate_for_codec((enum AVCodecID)av_codec_id,
+                                 src_rate) <= 48000)
+        return 0;
+    return SDL_getenv("DSVP_HD_PASSTHROUGH") == NULL;
 }
 
-/* ── Check if the current audio codec is supported for passthrough ── */
 static int bitstream_codec_supported(PlayerState *ps) {
     if (!ps->audio_codec_ctx) return 0;
     BitstreamCaps *caps = &ps->bitstream_caps;
+
+    if (bitstream_hd_blocked(ps->audio_codec_ctx->codec_id,
+                             ps->audio_codec_ctx->sample_rate)) {
+        log_msg("Bitstream: %s → PCM decode (platform cannot carry >48k "
+                "IEC — waiting on Valve; override: DSVP_HD_PASSTHROUGH=1)",
+                avcodec_get_name(ps->audio_codec_ctx->codec_id));
+        return 0;
+    }
 
     switch (ps->audio_codec_ctx->codec_id) {
         case AV_CODEC_ID_AC3:     return caps->support_ac3;
@@ -818,129 +788,204 @@ static int bitstream_codec_supported(PlayerState *ps) {
 }
 
 /* ── Determine IEC 61937 sample rate for codec ── */
-static int bitstream_rate_for_codec(enum AVCodecID id) {
+/* IEC 61937 carrier rate. AC3/DTS ride at the stream's own sample rate;
+ * EAC3 and TrueHD use a 4x HBR carrier. src_rate is the decoder's reported
+ * rate — previously ignored, so a 44.1kHz DTS or AC3 track (DVD-era rips,
+ * some concert discs) was carried at 48kHz and labeled 48kHz in the channel
+ * status, which the receiver decodes at the wrong pitch or rejects. */
+static int bitstream_rate_for_codec(enum AVCodecID id, int src_rate) {
+    if (src_rate <= 0) src_rate = 48000;
     switch (id) {
-        case AV_CODEC_ID_AC3:    return 48000;
-        case AV_CODEC_ID_EAC3:   return 192000;  /* 4× for IEC 61937 */
-        case AV_CODEC_ID_DTS:    return 48000;
-        case AV_CODEC_ID_TRUEHD: return 192000;  /* HBR */
+        case AV_CODEC_ID_AC3:    return src_rate;
+        case AV_CODEC_ID_EAC3:   return src_rate * 4;   /* 4x for IEC 61937 */
+        case AV_CODEC_ID_DTS:    return src_rate;
+        case AV_CODEC_ID_TRUEHD: return src_rate * 4;   /* HBR */
         default: return 48000;
     }
 }
 
+
+/* ── Tear down spdifenc muxer + AVIO + output buffer ──
+ *
+ * LEAK FIX: avio_context_free() frees ONLY the context, never the
+ * buffer — the earlier comment here claiming FFmpeg 8.x frees both
+ * was wrong, and each P-key bitstream cycle leaked the 64KB AVIO
+ * buffer. The buffer must be freed via avio->buffer (NOT the original
+ * malloc'd pointer): FFmpeg may swap the buffer internally, which is
+ * also why freeing the original pointer double-freed in the past.
+ * Pattern per FFmpeg's own avio_reading.c example. */
+static void spdif_free(PlayerState *ps) {
+    if (ps->spdif_ctx) {
+        AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
+        av_write_trailer(spdif);
+        avformat_free_context(spdif);
+        ps->spdif_ctx = NULL;
+    }
+    if (ps->spdif_avio) {
+        AVIOContext *avio = (AVIOContext *)ps->spdif_avio;
+        av_freep(&avio->buffer);
+        avio_context_free(&avio);
+        ps->spdif_avio = NULL;
+    }
+    if (ps->spdif_buf) {
+        av_free(ps->spdif_buf);
+        ps->spdif_buf = NULL;
+    }
+    ps->spdif_buf_size = 0;
+    ps->spdif_write_pos = 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
- * bitstream_start — Open ALSA + spdifenc, launch output thread
+ * bitstream_start — spdifenc + PipeWire stream, launch feeder thread
  *
  * Returns 1 on success, 0 on failure (caller should fall back to PCM).
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── ReserveDevice1 — ask WirePlumber to yield HDMI audio device ──
- *
- * PipeWire 1.6.x wraps hw:N,M in a loopback sink and holds the ALSA
- * device exclusively.  snd_pcm_open returns EBUSY unless WP releases.
- * The freedesktop ReserveDevice1 D-Bus protocol is the standard way
- * for ALSA-direct apps (JACK, mpv, us) to request this politely.
- *
- * WP advertises org.freedesktop.ReserveDevice1.Audio<card> on the
- * session bus.  We call RequestRelease(priority=1), WP returns true
- * and drops the loopback.  We then CLAIM the bus name ourselves so
- * WP won't try to reclaim mid-playback.  On bitstream_stop we release
- * the name and WP reclaims automatically.
- *
- * Process death (crash, SIGKILL) auto-releases D-Bus names, so no
- * leaked reservation on abnormal exit.
- *
- * Non-fatal: if the D-Bus call fails, bitstream_start proceeds anyway —
- * snd_pcm_open may succeed on its own (WP not holding the device)
- * or fail with EBUSY (handled by PCM fallback). */
 
-static sd_bus *reserve_bus = NULL;
-static int     reserve_card = -1;
+/* ═══════════════════════════════════════════════════════════════════
+ * bitstream_pw_thread_func — feeder thread for the PipeWire backend
+ *
+ * Packets pop from audio_pq, frame through spdifenc, and block into
+ * bitstream_pw's ring; the server owns the device and channel status.
+ * The clock is pts minus the backend's measured buffered time (ring +
+ * pw queue + server delay) minus the user latency offset.
+ * ═══════════════════════════════════════════════════════════════════ */
+static int bitstream_pw_thread_func(void *arg) {
+    PlayerState *ps = (PlayerState *)arg;
+    AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
+    int spdif_err_count = 0;
 
-static int reserve_hdmi_device(int card) {
-    int r;
+    /* TrueHD major-sync gating — same contract as the ALSA thread:
+     * spdifenc rejects packets until a major sync frame arrives. */
+    int need_truehd_sync = (ps->audio_codec_ctx &&
+        ps->audio_codec_ctx->codec_id == AV_CODEC_ID_TRUEHD);
+    int truehd_synced = !need_truehd_sync;
+    int truehd_skipped = 0;
 
-    char dest[80], path[80];
-    snprintf(dest, sizeof(dest),
-             "org.freedesktop.ReserveDevice1.Audio%d", card);
-    snprintf(path, sizeof(path),
-             "/org/freedesktop/ReserveDevice1/Audio%d", card);
+    log_msg("Bitstream[pw]: feeder thread started%s",
+            need_truehd_sync ? " (waiting for TrueHD major sync)" : "");
 
-    /* Open session bus (reuse across P-key toggles) */
-    if (!reserve_bus) {
-        r = sd_bus_open_user(&reserve_bus);
-        if (r < 0) {
-            log_msg("Bitstream: sd_bus_open_user failed: %s", strerror(-r));
-            return -1;
+    while (!ps->bitstream_quit) {
+        /* ── Pause gate ──
+         * set_active(false) freezes the stream with its queued bursts
+         * intact; resume is burst-aligned for free (buffers were only
+         * ever queued whole). No clock reset needed — buffered time
+         * is measured, not modeled. */
+        if (ps->paused && !ps->bitstream_quit) {
+            bitstream_pw_pause(ps, 1);
+            while (ps->paused && !ps->bitstream_quit)
+                SDL_Delay(10);
+            if (ps->bitstream_quit) break;
+            bitstream_pw_pause(ps, 0);
+        }
+
+        /* ── Seek reset gate ── */
+        if (ps->bitstream_seek_pending && !ps->bitstream_quit) {
+            bitstream_pw_seek_reset(ps);
+            if (need_truehd_sync) {
+                truehd_synced = 0;
+                truehd_skipped = 0;
+            }
+            ps->bitstream_seek_pending = 0;
+        }
+
+        /* Pop a packet — non-blocking poll, same rationale as the
+         * ALSA thread (instant pause/seek/quit response). */
+        AVPacket pkt;
+        int ret = 0;
+        while (!ps->bitstream_quit && !ps->paused && !ps->audio_stalled &&
+               !ps->bitstream_seek_pending) {
+            ret = pq_get(&ps->audio_pq, &pkt, 0);
+            if (ret != 0) break;
+            /* Demux EOF with an empty queue: whatever sits in the ring
+             * below the start threshold is all the audio there is —
+             * activate so the tail renders (review P2-18). */
+            if (ps->eof) bitstream_pw_eof_drain(ps);
+            SDL_Delay(5);
+        }
+        if (ps->paused || ps->audio_stalled || ps->bitstream_seek_pending) {
+            /* The poll can return WITH an owned packet before the flag
+             * check lands (TrueHD ~1200 pkt/s keeps re-rolling the
+             * window) — unref like the quit path below or it leaks. */
+            if (ret > 0) av_packet_unref(&pkt);
+            continue;
+        }
+        if (ret <= 0 || ps->bitstream_quit) {
+            if (ret > 0) av_packet_unref(&pkt);
+            break;
+        }
+
+        if (pkt.stream_index != ps->audio_stream_idx) {
+            av_packet_unref(&pkt);
+            continue;
+        }
+
+        if (!truehd_synced) {
+            if (pkt.size >= 8 &&
+                pkt.data[4] == 0xF8 && pkt.data[5] == 0x72 &&
+                pkt.data[6] == 0x6F && pkt.data[7] == 0xBA) {
+                truehd_synced = 1;
+                log_msg("Bitstream[pw]: TrueHD major sync found "
+                        "(skipped %d packets)", truehd_skipped);
+            } else {
+                truehd_skipped++;
+                av_packet_unref(&pkt);
+                continue;
+            }
+        }
+
+        /* Audio clock: pts of this packet minus measured buffered time,
+         * minus the user latency offset (the receiver's decode delay is
+         * invisible to every clock we can read — DSVP_AUDIO_DELAY). */
+        if (pkt.pts != AV_NOPTS_VALUE) {
+            AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
+            double pts = (double)pkt.pts * av_q2d(as->time_base);
+            ps->audio_clock = pts;
+            double buffered = bitstream_pw_buffered(ps);
+            if (buffered < 0) buffered = 0;
+            if (buffered > 1.5) buffered = 1.5;
+            ps->audio_clock_sync = pts - buffered - ps->audio_delay_sec;
+        }
+
+        /* Frame through spdifenc → spdif_buf */
+        ps->spdif_write_pos = 0;
+        pkt.stream_index = 0;
+        ret = av_write_frame(spdif, &pkt);
+        av_packet_unref(&pkt);
+
+        if (ret < 0) {
+            if (++spdif_err_count <= 3)
+                log_msg("Bitstream[pw]: spdifenc write failed: %s",
+                        av_err2str(ret));
+            else if (spdif_err_count == 4)
+                log_msg("Bitstream[pw]: suppressing further spdifenc errors");
+            continue;
+        }
+        if (ps->spdif_write_pos <= 0) continue;
+
+        if (bitstream_pw_write(ps, ps->spdif_buf, ps->spdif_write_pos) < 0) {
+            /* Normal on stop: the quit flag wakes a blocked writer.
+             * Anything else is the stream dying under us (undock /
+             * HDMI unplug → PW_STREAM_STATE_ERROR) — flag it so the
+             * main loop completes the PCM fallback; audio must never
+             * just go silent (charter / review P1-4). */
+            if (!ps->bitstream_quit) {
+                log_msg("Bitstream[pw]: backend gone mid-write — "
+                        "thread exiting (PCM fallback pending)");
+                ps->bitstream_failed = 1;
+            }
+            break;
         }
     }
 
-    /* Step 1: ask WP to release the device */
-    sd_bus_message *reply = NULL;
-    sd_bus_error error = SD_BUS_ERROR_NULL;
-    int released = 0;
-
-    r = sd_bus_call_method(reserve_bus, dest, path,
-                           "org.freedesktop.ReserveDevice1",
-                           "RequestRelease",
-                           &error, &reply,
-                           "i", (int32_t)1);
-    if (r < 0) {
-        /* NameHasNoOwner = no one holds the reservation, proceed */
-        if (sd_bus_error_has_name(&error,
-                "org.freedesktop.DBus.Error.NameHasNoOwner")) {
-            log_msg("Bitstream: Audio%d has no owner — claiming directly",
-                    card);
-        } else {
-            log_msg("Bitstream: RequestRelease failed: %s — proceeding to claim",
-                    error.message ? error.message : strerror(-r));
-        }
-        sd_bus_error_free(&error);
-    } else {
-        sd_bus_message_read(reply, "b", &released);
-        sd_bus_message_unref(reply);
-        if (!released) {
-            log_msg("Bitstream: WirePlumber refused to release Audio%d",
-                    card);
-            return -1;
-        }
-        log_msg("Bitstream: WirePlumber released Audio%d", card);
-    }
-
-    /* Step 2: claim the reservation name so WP doesn't reclaim mid-play.
-     * REPLACE_EXISTING handles the race between RequestRelease returning
-     * true and WP actually dropping the name.  ALLOW_REPLACEMENT lets
-     * other ReserveDevice1 clients (mpv, JACK) replace us cleanly. */
-    r = sd_bus_request_name(reserve_bus, dest,
-                            SD_BUS_NAME_REPLACE_EXISTING |
-                            SD_BUS_NAME_ALLOW_REPLACEMENT);
-    if (r < 0) {
-        log_msg("Bitstream: failed to claim %s: %s — proceeding anyway",
-                dest, strerror(-r));
-        /* Non-fatal: RequestRelease already made WP yield */
-    } else {
-        log_msg("Bitstream: claimed reservation %s", dest);
-        reserve_card = card;
-    }
-
+    log_msg("Bitstream[pw]: feeder thread exiting");
     return 0;
 }
 
-static void release_hdmi_device(void) {
-    if (!reserve_bus || reserve_card < 0) return;
-
-    char name[80];
-    snprintf(name, sizeof(name),
-             "org.freedesktop.ReserveDevice1.Audio%d", reserve_card);
-
-    sd_bus_release_name(reserve_bus, name);
-    log_msg("Bitstream: released reservation %s", name);
-    reserve_card = -1;
-}
-
 int bitstream_start(PlayerState *ps) {
+    ps->bitstream_failed = 0;
     if (!ps->audio_codec_ctx || !ps->bitstream_caps.alsa_device[0]) {
-        log_msg("Bitstream: no codec or no ALSA device — cannot start");
+        log_msg("Bitstream: no codec or no HDMI sink probed — cannot start");
         return 0;
     }
 
@@ -951,7 +996,8 @@ int bitstream_start(PlayerState *ps) {
     }
 
     enum AVCodecID codec_id = ps->audio_codec_ctx->codec_id;
-    int rate = bitstream_rate_for_codec(codec_id);
+    int rate = bitstream_rate_for_codec(codec_id,
+                  ps->audio_codec_ctx->sample_rate);
     int channels = 2;  /* IEC 61937 is always stereo (except TrueHD HBR=8ch) */
     if (codec_id == AV_CODEC_ID_TRUEHD) channels = 8;
 
@@ -1005,6 +1051,7 @@ int bitstream_start(PlayerState *ps) {
     AVStream *st = avformat_new_stream(spdif, NULL);
     if (!st) {
         log_msg("Bitstream: failed to create spdifenc stream");
+        av_freep(&avio->buffer);
         avio_context_free(&avio);
         avformat_free_context(spdif);
         av_free(ps->spdif_buf); ps->spdif_buf = NULL;
@@ -1013,11 +1060,23 @@ int bitstream_start(PlayerState *ps) {
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id   = codec_id;
     st->codecpar->sample_rate = ps->audio_codec_ctx->sample_rate;
-    st->codecpar->ch_layout   = ps->audio_codec_ctx->ch_layout;
+    /* Deep copy — struct assignment aliases u.map for CUSTOM-order
+     * layouts, and both spdif_free and avcodec_free_context would
+     * then uninit the same heap pointer (double free). */
+    if (av_channel_layout_copy(&st->codecpar->ch_layout,
+                               &ps->audio_codec_ctx->ch_layout) < 0) {
+        log_msg("Bitstream: channel layout copy failed");
+        av_freep(&avio->buffer);
+        avio_context_free(&avio);
+        avformat_free_context(spdif);
+        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
+        return 0;
+    }
 
     int ret = avformat_write_header(spdif, NULL);
     if (ret < 0) {
         log_msg("Bitstream: spdifenc write_header failed: %s", av_err2str(ret));
+        av_freep(&avio->buffer);
         avio_context_free(&avio);
         avformat_free_context(spdif);
         av_free(ps->spdif_buf); ps->spdif_buf = NULL;
@@ -1027,156 +1086,47 @@ int bitstream_start(PlayerState *ps) {
     ps->spdif_ctx  = spdif;
     ps->spdif_avio = avio;
 
-    /* ── Open ALSA device for passthrough ──
-     * The HDA codec's IEC 61937 non-audio bit is armed at boot by the
-     * dsvp-arm-iec958 helper (installed via scripts/install-udev-rule.sh,
-     * fired by udev whenever /dev/snd/hwC*D0 appears or changes). DSVP
-     * itself runs unprivileged and just opens the raw hw device — kernel
-     * ALSA gives us exclusive access, PipeWire yields and reclaims
-     * automatically on close. If the user hasn't run install-udev-rule.sh,
-     * the codec will be in PCM mode and the TV will interpret IEC 61937
-     * bursts as PCM (audible static) — that's the diagnostic signal. */
-
-     /* Ask WirePlumber to release the HDMI audio device */
-    int card_num = 0;
-    sscanf(ps->bitstream_caps.alsa_device, "hw:%d", &card_num);
-    reserve_hdmi_device(card_num);
-
-    snd_pcm_t *pcm = NULL;
-    ret = snd_pcm_open(&pcm, ps->bitstream_caps.alsa_device,
-                        SND_PCM_STREAM_PLAYBACK, 0);
-    if (ret < 0) {
-        log_msg("Bitstream: ALSA open '%s' failed: %s",
-                ps->bitstream_caps.alsa_device, snd_strerror(ret));
-        av_write_trailer(spdif);
-        avio_context_free(&avio);
-        avformat_free_context(spdif);
-        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
-        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
+    /* ── PipeWire-native transport ──
+     * (docs/TODO-BITSTREAM.md Track A). The server owns the device,
+     * the AES bits, and the non-audio bit — no root anywhere, and
+     * WirePlumber is never disturbed: failure falls back to PCM with
+     * the audio stack untouched. */
+    if (!bitstream_pw_open(ps, (int)codec_id, rate, channels)) {
+        spdif_free(ps);
+        snprintf(ps->aud_osd, sizeof(ps->aud_osd),
+                 "Passthrough unavailable — using PCM");
+        ps->aud_osd_until = get_time_sec() + 5.0;
         return 0;
     }
-    
-    /* Set ALSA hardware parameters */
-    snd_pcm_hw_params_t *hw;
-    snd_pcm_hw_params_alloca(&hw);
-    snd_pcm_hw_params_any(pcm, hw);
-    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
-    snd_pcm_hw_params_set_channels(pcm, hw, channels);
-
-    unsigned int actual_rate = rate;
-    snd_pcm_hw_params_set_rate_near(pcm, hw, &actual_rate, NULL);
-    if ((int)actual_rate != rate) {
-        log_msg("Bitstream: ALSA rate %d requested, got %d", rate, actual_rate);
-    }
-
-    /* Buffer: 1s, period: 250ms — TrueHD HBR needs large runway
-     * to prevent snd_pcm_writei blocking, which starves demux/video.
-     * At 192kHz, 200ms was only 38400 frames — insufficient for TrueHD's
-     * ~1200 packet/sec rate. 1s gives the bitstream thread enough
-     * headroom for the demux thread to interleave video packets. */
-    snd_pcm_uframes_t buffer_size = actual_rate;        /* 1s */
-    snd_pcm_uframes_t period_size = actual_rate / 20;   /* 50ms */
-    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer_size);
-    snd_pcm_hw_params_set_period_size_near(pcm, hw, &period_size, NULL);
-
-    ret = snd_pcm_hw_params(pcm, hw);
-    if (ret < 0) {
-        log_msg("Bitstream: ALSA hw_params failed: %s", snd_strerror(ret));
-        snd_pcm_close(pcm);
-        av_write_trailer(spdif);
-        avio_context_free(&avio);
-        avformat_free_context(spdif);
-        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
-        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
-        return 0;
-    }
-
-    snd_pcm_prepare(pcm);
-
-    /* Set start_threshold to 50% of buffer so ALSA doesn't start playback
-     * until the buffer is half-full. This gives the bitstream thread ~500ms
-     * of headroom before the first underrun can occur — critical for TrueHD
-     * where demux thread interleaving can delay packet delivery. */
-    {
-        snd_pcm_sw_params_t *sw;
-        snd_pcm_sw_params_alloca(&sw);
-        snd_pcm_sw_params_current(pcm, sw);
-        snd_pcm_sw_params_set_start_threshold(pcm, sw, buffer_size / 2);
-        int sw_ret = snd_pcm_sw_params(pcm, sw);
-        if (sw_ret < 0)
-            log_msg("Bitstream: ALSA sw_params failed: %s (non-fatal)", snd_strerror(sw_ret));
-        else
-            log_msg("Bitstream: ALSA start_threshold=%lu (warmup headroom)", buffer_size / 2);
-    }
-
-    ps->alsa_pcm = pcm;
-    ps->bitstream_frame_bytes = channels * 2;  /* S16LE: 4 for stereo, 16 for 8ch */
-    ps->bitstream_alsa_rate = actual_rate;
-    ps->bitstream_frames_written = 0;
-    ps->bitstream_wall_start = 0;  /* set on first ALSA write in thread */
-
-    log_msg("Bitstream: ALSA opened %s — %d Hz %dch S16LE (buf=%lu period=%lu)",
-            ps->bitstream_caps.alsa_device, actual_rate, channels,
-            buffer_size, period_size);
-
-    /* Set non-audio bit via HDA verb AFTER snd_pcm_prepare.
-     * snd_pcm_prepare latches IEC958 Default (0x04) to the codec,
-     * overwriting any boot-time verb arming. We must re-arm here. */
-    {
-        char hwpath[32];
-        snprintf(hwpath, sizeof(hwpath), "/dev/snd/hwC%dD0", card_num);
-        int hwfd = open(hwpath, O_RDWR);
-        if (hwfd >= 0) {
-            struct { uint32_t verb; uint32_t res; } hda;
-            hda.verb = (0x06 << 20) | (0x70D << 8) | 0x23;
-            hda.res = 0;
-            if (ioctl(hwfd, (int)0xC008480B, &hda) == 0)
-                log_msg("Bitstream: armed non-audio bit on NID 0x06 (verb 0x%08x)", hda.verb);
-            else
-                log_msg("Bitstream: HDA verb write failed: %s", strerror(errno));
-            close(hwfd);
-        } else {
-            log_msg("Bitstream: open(%s) failed: %s — non-audio bit not set",
-                    hwpath, strerror(errno));
-        }
-    }
-
-    /* ── Launch output thread ── */
     ps->bitstream_quit = 0;
+    ps->bitstream_seek_pending = 0;
+    ps->audio_pq.abort_request = 0;
 
-    /* Flush stale decoded PCM frames from audio_pq.
-     * When switching from PCM→bitstream on a TrueHD track, the decode
-     * thread fills audio_pq with decoded PCM frames. The bitstream
-     * thread expects raw compressed packets. Without this flush,
-     * spdifenc gets PCM data → garbage IEC 61937 bursts.
-     * Credit: Wren (cross-instance advisory, April 2026) */
+    /* Flush stale queue contents from the PCM era before the feeder
+     * starts — wrong-payload packets must never reach spdifenc
+     * (Wren's PCM→bitstream switch fix, preserved across the backend
+     * change). */
     pq_flush(&ps->audio_pq);
 
-    ps->bitstream_active = 1;
-    ps->bitstream_thread = SDL_CreateThread(
-        bitstream_thread_func, "bitstream", ps);
-
+    ps->bitstream_thread = SDL_CreateThread(bitstream_pw_thread_func,
+                                            "bitstream_pw", ps);
     if (!ps->bitstream_thread) {
-        log_msg("Bitstream: failed to create thread: %s", SDL_GetError());
-        snd_pcm_close(pcm);
-        ps->alsa_pcm = NULL;
-        ps->bitstream_active = 0;
-        av_write_trailer(spdif);
-        avio_context_free(&avio);
-        avformat_free_context(spdif);
-        av_free(ps->spdif_buf); ps->spdif_buf = NULL;
-        ps->spdif_ctx = NULL; ps->spdif_avio = NULL;
+        log_msg("Bitstream[pw]: thread create failed");
+        bitstream_pw_close(ps);
+        spdif_free(ps);
         return 0;
     }
-
-    log_msg("Bitstream: passthrough active — %s → %s",
-            avcodec_get_name(codec_id), ps->bitstream_caps.alsa_device);
+    ps->bitstream_active = 1;
+    snprintf(ps->aud_osd, sizeof(ps->aud_osd),
+             "Passthrough: %s (PipeWire)", avcodec_get_name(codec_id));
+    ps->aud_osd_until = get_time_sec() + 3.0;
+    log_msg("Bitstream[pw]: passthrough active — %s %d Hz %dch",
+            avcodec_get_name(codec_id), rate, channels);
     return 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * bitstream_stop — Shut down ALSA + spdifenc, join output thread
+ * bitstream_stop — drain PipeWire stream + spdifenc, join feeder
  * ═══════════════════════════════════════════════════════════════════ */
 
 void bitstream_stop(PlayerState *ps) {
@@ -1194,42 +1144,17 @@ void bitstream_stop(PlayerState *ps) {
         ps->bitstream_thread = NULL;
     }
 
-    /* Close ALSA */
-    if (ps->alsa_pcm) {
-        snd_pcm_drop((snd_pcm_t *)ps->alsa_pcm);
-        snd_pcm_close((snd_pcm_t *)ps->alsa_pcm);
-        ps->alsa_pcm = NULL;
-    }
+    /* PipeWire backend teardown (Track A) — flush + ordered destroy;
+     * WirePlumber was never disturbed, so there is nothing to rebuild
+     * and no audio-stack restart on this path. */
+    if (ps->bpw)
+        bitstream_pw_close(ps);
 
-    /* Release HDMI reservation so WirePlumber can reclaim */
-    release_hdmi_device();
-
-    /* Close spdifenc */
-    if (ps->spdif_ctx) {
-        AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
-        av_write_trailer(spdif);
-        avformat_free_context(spdif);
-        ps->spdif_ctx = NULL;
-    }
-    if (ps->spdif_avio) {
-        AVIOContext *avio = (AVIOContext *)ps->spdif_avio;
-        /* avio_context_free frees both the context and its buffer in FFmpeg 8.x.
-         * Do NOT call av_free(avio->buffer) separately — that's a double-free. */
-        avio_context_free(&avio);
-        ps->spdif_avio = NULL;
-    }
-
-    if (ps->spdif_buf) {
-        av_free(ps->spdif_buf);
-        ps->spdif_buf = NULL;
-    }
-    ps->spdif_buf_size = 0;
-    ps->spdif_write_pos = 0;
+    /* Close spdifenc + AVIO + output buffer (leak-safe — see spdif_free) */
+    spdif_free(ps);
 
     ps->bitstream_active = 0;
     ps->bitstream_quit = 0;
-    ps->bitstream_frames_written = 0;
-    ps->bitstream_wall_start = 0;
 
     /* Reset audio clocks — bitstream thread was updating audio_clock_sync
      * via wall-clock frame counting. Without reset, the stale value persists
@@ -1242,10 +1167,6 @@ void bitstream_stop(PlayerState *ps) {
 
     /* Reset abort so audio_pq works normally for PCM fallback */
     ps->audio_pq.abort_request = 0;
-
-    /* No IEC958 mixer reset needed — AES bits were embedded in the
-     * device string at snd_pcm_open time and clear naturally when the
-     * device closes. PipeWire reopens hw:N,M with default (PCM) AES. */
 
     log_msg("Bitstream: passthrough stopped");
 }
@@ -1274,40 +1195,17 @@ void bitstream_stop_immediate(PlayerState *ps) {
         ps->bitstream_thread = NULL;
     }
 
-    /* Close ALSA */
-    if (ps->alsa_pcm) {
-        snd_pcm_drop((snd_pcm_t *)ps->alsa_pcm);
-        snd_pcm_close((snd_pcm_t *)ps->alsa_pcm);
-        ps->alsa_pcm = NULL;
-    }
+    /* PipeWire backend teardown (Track A) — flush + ordered destroy;
+     * WirePlumber was never disturbed, so there is nothing to rebuild
+     * and no audio-stack restart on this path. */
+    if (ps->bpw)
+        bitstream_pw_close(ps);
 
-    /* Release HDMI reservation so WirePlumber can reclaim */
-    release_hdmi_device();
-
-    /* Close spdifenc */
-    if (ps->spdif_ctx) {
-        AVFormatContext *spdif = (AVFormatContext *)ps->spdif_ctx;
-        av_write_trailer(spdif);
-        avformat_free_context(spdif);
-        ps->spdif_ctx = NULL;
-    }
-    if (ps->spdif_avio) {
-        AVIOContext *avio = (AVIOContext *)ps->spdif_avio;
-        avio_context_free(&avio);
-        ps->spdif_avio = NULL;
-    }
-
-    if (ps->spdif_buf) {
-        av_free(ps->spdif_buf);
-        ps->spdif_buf = NULL;
-    }
-    ps->spdif_buf_size = 0;
-    ps->spdif_write_pos = 0;
+    /* Close spdifenc + AVIO + output buffer (leak-safe — see spdif_free) */
+    spdif_free(ps);
 
     ps->bitstream_active = 0;
     ps->bitstream_quit = 0;
-    ps->bitstream_frames_written = 0;
-    ps->bitstream_wall_start = 0;
 
     /* Reset clocks */
     ps->audio_clock = ps->video_clock;
@@ -1317,10 +1215,6 @@ void bitstream_stop_immediate(PlayerState *ps) {
 
     /* Reset abort so audio_pq works normally for PCM */
     ps->audio_pq.abort_request = 0;
-
-    /* No IEC958 mixer reset needed — AES bits were embedded in the
-     * device string at snd_pcm_open time and clear when the device
-     * closes. */
 
     /* NOTE: nothing else to defer — profile bounce removed entirely */
 }

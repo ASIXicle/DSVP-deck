@@ -11,6 +11,8 @@
  */
 
 #include "dsvp.h"
+#include <libavcodec/codec_desc.h>   /* avcodec_descriptor_get — text-vs-bitmap track dispatch */
+#include <limits.h>
 #include <zlib.h>
 
 /* ── Font state (module-level) ─────────────────────────────────────── */
@@ -20,10 +22,6 @@ static TTF_Font *sub_font_outline = NULL;
 static TTF_Font *sub_font_cjk         = NULL;
 static TTF_Font *sub_font_cjk_outline = NULL;
 static int       font_loaded      = 0;
-
-/* Golden Yellow subtitle color and black outline */
-static const SDL_Color COLOR_SUB     = { 255, 223, 0, 255 };   /* #FFDF00 */
-static const SDL_Color COLOR_OUTLINE = { 0,   0,   0, 255 };
 
 /* ── Font discovery ────────────────────────────────────────────────── */
 
@@ -280,6 +278,16 @@ void sub_close_codec(PlayerState *ps) {
     ps->sub_is_bitmap = 0;
     ps->sub_text[0] = '\0';
     sub_clear_bitmaps(ps);
+    sub_text_cues_clear(ps);
+}
+
+/* All multi-cue state gone at once — seek flushes, track changes, and
+ * codec close all route through here so no path can leave a stale cue
+ * displaying against a new timeline. */
+void sub_text_cues_clear(PlayerState *ps) {
+    for (int i = 0; i < SUB_TEXT_CUES; i++)
+        ps->sub_cues[i].valid = 0;
+    ps->sub_cue_count = 0;
 }
 
 
@@ -298,8 +306,20 @@ void sub_cycle(PlayerState *ps) {
         return;
     }
 
+    /* Seek guard: sub_close_codec/sub_open_codec free and replace the
+     * context the demux seek handler flushes under seek_mutex. TryLock —
+     * an S press landing inside a seek is dropped, not stalled on. */
+    if (!SDL_TryLockMutex(ps->seek_mutex)) return;
+
     /* Cycle: 0 (off) → 1 → 2 → ... → N → 0 (off) */
     ps->sub_selection = (ps->sub_selection + 1) % (ps->sub_count + 1);
+
+    /* Queues are NOT flushed here (revised from DSVP main 55834d4): the
+     * demuxer keeps every track as a rolling ~35s window precisely so the
+     * newly selected track has the current moment's packets on hand —
+     * flushing made S appear dead for the ~10s it took playback to reach
+     * the demux read position. The decode-side stale-skip absorbs the
+     * (bounded) backlog. */
 
     if (ps->sub_selection == 0) {
         sub_close_codec(ps);
@@ -316,6 +336,7 @@ void sub_cycle(PlayerState *ps) {
         ps->sub_is_bitmap = 0;
         ps->sub_text[0] = '\0';
         sub_clear_bitmaps(ps);
+        sub_text_cues_clear(ps);
 
         snprintf(ps->sub_osd, sizeof(ps->sub_osd), "Subtitles: %s",
             ps->sub_stream_names[sel]);
@@ -324,6 +345,7 @@ void sub_cycle(PlayerState *ps) {
     }
 
     ps->sub_osd_until = get_time_sec() + 2.0;
+    SDL_UnlockMutex(ps->seek_mutex);
 }
 
 
@@ -418,7 +440,148 @@ static uint8_t *pgs_try_decompress(const uint8_t *data, int size, int *out_size)
  * Skips subtitles whose end time has already passed.
  */
 
+static void sub_decode_pending_locked(PlayerState *ps);
+
+/* ── P2-16: multi-cue text drain ──
+ *
+ * The single-slot design stopped consuming packets while a cue was on
+ * screen, so a cue starting inside another's window was popped only
+ * after the first expired — and then discarded as already expired.
+ * Overlapping dialogue and ASS signs/second-speaker events never
+ * displayed. Text tracks instead drain EVERY due packet each tick into
+ * up to SUB_TEXT_CUES simultaneous cues.
+ *
+ * Bitmap tracks (PGS/DVB/VobSub) keep the single-set flow in
+ * sub_decode_pending_locked — display sets are full-screen compositions
+ * where one-active-set is the format's own model, and that path's
+ * clear-packet/END-inject machinery stays exactly as field-verified. */
+
+static void sub_text_cue_push(PlayerState *ps, const char *text,
+                              double start, double end) {
+    int slot = -1;
+    for (int i = 0; i < SUB_TEXT_CUES; i++) {
+        if (!ps->sub_cues[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Full: evict the cue that ends soonest — it has the least
+         * display time left to lose. */
+        slot = 0;
+        for (int i = 1; i < SUB_TEXT_CUES; i++)
+            if (ps->sub_cues[i].end_pts < ps->sub_cues[slot].end_pts)
+                slot = i;
+    }
+    snprintf(ps->sub_cues[slot].text, SUB_TEXT_SIZE, "%s", text);
+    ps->sub_cues[slot].start_pts = start;
+    ps->sub_cues[slot].end_pts   = end;
+    ps->sub_cues[slot].valid     = 1;
+}
+
+static void sub_text_drain_multi(PlayerState *ps, PacketQueue *spq, double now) {
+    /* Expire first so eviction never has to fight cues that are
+     * already off screen. */
+    for (int i = 0; i < SUB_TEXT_CUES; i++)
+        if (ps->sub_cues[i].valid && now > ps->sub_cues[i].end_pts)
+            ps->sub_cues[i].valid = 0;
+
+    AVPacket pkt;
+    for (;;) {
+        /* Due-only gate — same rule as the bitmap drain below: never
+         * consume a packet whose time has not come. */
+        {
+            int64_t head_pts;
+            if (pq_peek_pts(spq, &head_pts) && head_pts != AV_NOPTS_VALUE) {
+                AVStream *head_st =
+                    ps->fmt_ctx->streams[ps->sub_active_idx];
+                double head_sec =
+                    (double)head_pts * av_q2d(head_st->time_base);
+                if (head_sec > now) break;
+            }
+        }
+        if (pq_get(spq, &pkt, 0) <= 0) break;
+
+        AVSubtitle sub;
+        int got_sub = 0;
+        int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub,
+                                           &got_sub, &pkt);
+        log_msg("Sub: MAIN-LOOP pkt_size=%d got_sub=%d rects=%u ret=%d",
+                pkt.size, got_sub, got_sub ? sub.num_rects : 0, ret);
+        if (ret < 0) {
+            log_msg("Sub: decode error ret=%d", ret);
+            av_packet_unref(&pkt);
+            continue;
+        }
+        if (!got_sub) {
+            av_packet_unref(&pkt);
+            continue;
+        }
+
+        AVStream *st = ps->fmt_ctx->streams[ps->sub_active_idx];
+        double pkt_pts = 0.0;
+        if (pkt.pts != AV_NOPTS_VALUE)
+            pkt_pts = (double)pkt.pts * av_q2d(st->time_base);
+
+        double start = pkt_pts + (double)sub.start_display_time / 1000.0;
+        double end   = pkt_pts + (double)sub.end_display_time / 1000.0;
+
+        /* SRT/subrip decoded by FFmpeg often sets end_display_time=0.
+         * The actual duration is in pkt.duration in stream time_base. */
+        if (sub.end_display_time == 0 && pkt.duration > 0)
+            end = pkt_pts + (double)pkt.duration * av_q2d(st->time_base);
+        else if (sub.end_display_time == 0)
+            end = start + 3.0;  /* last resort fallback */
+
+        if (end - start > SUB_STALE_CAP_SEC)
+            end = start + SUB_STALE_CAP_SEC;
+
+        if (end < now) {
+            log_msg("Sub: skipped expired (end=%.1f < now=%.1f)", end, now);
+            avsubtitle_free(&sub);
+            av_packet_unref(&pkt);
+            continue;
+        }
+
+        /* One cue per rect: a packet carrying several ASS events is
+         * several simultaneous cues, not one (the single-slot code
+         * kept only the last rect). */
+        for (unsigned i = 0; i < sub.num_rects; i++) {
+            AVSubtitleRect *rect = sub.rects[i];
+            char text[SUB_TEXT_SIZE] = {0};
+            if (rect->type == SUBTITLE_TEXT && rect->text) {
+                snprintf(text, sizeof(text), "%s", rect->text);
+                log_msg("Sub [TEXT] %.1f-%.1f: \"%.*s\"", start, end, 60, text);
+            } else if (rect->type == SUBTITLE_ASS && rect->ass) {
+                strip_ass_markup(rect->ass, text, sizeof(text));
+                log_msg("Sub [ASS] %.1f-%.1f: \"%.*s\"", start, end, 60, text);
+            }
+            if (text[0])
+                sub_text_cue_push(ps, text, start, end);
+        }
+
+        avsubtitle_free(&sub);
+        av_packet_unref(&pkt);
+    }
+
+    int n = 0;
+    for (int i = 0; i < SUB_TEXT_CUES; i++)
+        if (ps->sub_cues[i].valid) n++;
+    ps->sub_cue_count = n;
+}
+
+/* Public entry — seek guard. The demux seek handler flushes
+ * sub_codec_ctx under seek_mutex (player.c); the video decode thread
+ * (seek_mutex TryLock) and the audio callback (seeking check) both
+ * carry guards against that flush — this path carried neither, and
+ * avcodec_decode_subtitle2 racing avcodec_flush_buffers on one
+ * context is heap-corruption class. TryLock like the video decode
+ * thread: skip this tick rather than stall the main loop. */
 void sub_decode_pending(PlayerState *ps) {
+    if (ps->seeking || ps->seek_request) return;
+    if (!SDL_TryLockMutex(ps->seek_mutex)) return;
+    sub_decode_pending_locked(ps);
+    SDL_UnlockMutex(ps->seek_mutex);
+}
+
+static void sub_decode_pending_locked(PlayerState *ps) {
     if (ps->sub_active_idx < 0 || !ps->sub_codec_ctx) return;
     if (ps->sub_selection <= 0 || ps->sub_selection > ps->sub_count) return;
 
@@ -426,8 +589,19 @@ void sub_decode_pending(PlayerState *ps) {
     int queue_idx = ps->sub_selection - 1;
     PacketQueue *spq = &ps->sub_pqs[queue_idx];
 
-    double now = ps->audio_clock_sync;
-    if (ps->audio_stream_idx < 0) now = ps->video_clock;
+    double now = player_clock(ps);
+
+    /* P2-16: text tracks take the multi-cue drain; everything below
+     * this dispatch is the bitmap flow, untouched. Track type is a
+     * codec property, fixed for the life of the selection. */
+    {
+        const AVCodecDescriptor *d =
+            avcodec_descriptor_get(ps->sub_codec_ctx->codec_id);
+        if (d && (d->props & AV_CODEC_PROP_TEXT_SUB)) {
+            sub_text_drain_multi(ps, spq, now);
+            return;
+        }
+    }
 
     /* If current subtitle is still valid and on-screen, keep it.
      * Exception: bitmap subs currently DISPLAYING need to drain the queue
@@ -436,8 +610,9 @@ void sub_decode_pending(PlayerState *ps) {
     if (ps->sub_valid && now <= ps->sub_end_pts) {
         if (!ps->sub_is_bitmap) return;
         if (now < ps->sub_start_pts) return;  /* not showing yet, don't drain */
-        /* If end_pts was updated from the 30s cap, clear was already found */
-        if (ps->sub_end_pts - ps->sub_start_pts < 29.0) return;
+        /* Duration below the cap means a real clear packet already set
+         * end_pts — the drain-for-clear is done. */
+        if (ps->sub_end_pts - ps->sub_start_pts < SUB_CLEAR_FOUND_SEC) return;
         /* Bitmap currently displayed, clear not yet found — drain for it */
     }
 
@@ -452,7 +627,36 @@ void sub_decode_pending(PlayerState *ps) {
     AVPacket pkt;
     int pgs_packets_this_drain = 0;
     double last_pgs_pts = 0.0;
-    while (pq_get(spq, &pkt, 0) > 0) {
+    for (;;) {
+        /* Never consume packets whose time has not come (DSVP main
+         * 25f54d7, gate made unconditional in review). The old code
+         * decoded everything queued hunting for a 0-rect clear and
+         * permanently DISCARDED any display set that had rects — i.e.
+         * the next caption. Segments of one display set share the
+         * set's PTS, so stopping at a future PTS cannot split a due
+         * set.
+         *
+         * The gate must apply to EVERY drain, not just drain-for-clear:
+         * an S-press onto an END-stripped PGS track drains with
+         * sub_valid == 0, and ungated it consumed the ~10s of demux
+         * read-ahead too — every due set decoded got_sub=0, each PCS
+         * clobbered the previous accumulation, and the single post-
+         * drain END inject assembled only the last, FUTURE set. The
+         * current moment's caption (the whole point of the rolling
+         * window) was destroyed unseen. Gated, the last accumulated
+         * set is the due one, and the inject assembles exactly it. */
+        {
+            int64_t head_pts;
+            if (pq_peek_pts(spq, &head_pts) && head_pts != AV_NOPTS_VALUE) {
+                AVStream *head_st =
+                    ps->fmt_ctx->streams[ps->sub_active_idx];
+                double head_sec =
+                    (double)head_pts * av_q2d(head_st->time_base);
+                if (head_sec > now) break;
+            }
+        }
+        if (pq_get(spq, &pkt, 0) <= 0) break;
+
         AVSubtitle sub;
         int got_sub = 0;
 
@@ -522,10 +726,10 @@ void sub_decode_pending(PlayerState *ps) {
         }
 
         /* PGS/DVB: end_display_time is often UINT32_MAX (duration unknown
-         * until the clear packet arrives). Cap to 30s as a safety net —
-         * the 0-rect clear packet will expire it earlier. */
-        if (end - start > 30.0) {
-            end = start + 30.0;
+         * until the clear packet arrives). Cap as a safety net — the
+         * 0-rect clear packet will expire it earlier. */
+        if (end - start > SUB_STALE_CAP_SEC) {
+            end = start + SUB_STALE_CAP_SEC;
         }
 
         /* If we're only draining for a clear packet, handle it here
@@ -550,7 +754,24 @@ void sub_decode_pending(PlayerState *ps) {
                 av_packet_unref(&pkt);
                 continue;
             }
-            /* Not a clear packet — skip it, keep looking */
+            /* A due display set WITH rects is the next caption directly
+             * replacing the current one (epoch continuation). It ends the
+             * displayed set now — fall through to normal extraction and
+             * display it instead of destroying it. */
+            draining_for_clear = 0;
+            ps->sub_valid = 0;
+        }
+
+        /* Skip expired sets BEFORE rect extraction — the palette→RGBA
+         * conversion (av_malloc + per-pixel fill) for sets that were
+         * then discarded was a per-S-press hitch on a deep backlog.
+         * Cannot move above the decode (the decoder must see every
+         * packet to stay in sync) nor above the drain-for-clear block
+         * (an expired set replacing the displayed one must still end
+         * it). A stale 0-rect clear is safe to skip: at this point
+         * nothing is displaying that it could fail to clear. */
+        if (end < now) {
+            log_msg("Sub: skipped expired (end=%.1f < now=%.1f)", end, now);
             avsubtitle_free(&sub);
             av_packet_unref(&pkt);
             continue;
@@ -587,8 +808,13 @@ void sub_decode_pending(PlayerState *ps) {
                 int w = rect->w;
                 int h = rect->h;
 
-                /* Convert paletted pixels to RGBA */
-                uint8_t *rgba = av_malloc(w * h * 4);
+                /* Convert paletted pixels to RGBA.
+                 * w*h*4 is int arithmetic and w/h come from a decoded
+                 * subtitle rect in an untrusted file — reject anything that
+                 * would overflow into a small allocation while the fill loop
+                 * writes offsets computed the same overflowing way. */
+                uint8_t *rgba = ((int64_t)w * h > (int64_t)INT_MAX / 4)
+                                ? NULL : av_malloc((size_t)w * h * 4);
                 if (rgba) {
                     for (int row = 0; row < h; row++) {
                         for (int col = 0; col < w; col++) {
@@ -636,11 +862,22 @@ void sub_decode_pending(PlayerState *ps) {
 
         if (text[0] == '\0' && !got_bitmap) continue;
 
-        /* Skip subtitles that have already expired */
-        if (end < now) {
-            log_msg("Sub: skipped expired (end=%.1f < now=%.1f)", end, now);
-            sub_clear_bitmaps(ps);
-            continue;
+        /* A LATER due display set still queued supersedes this one.
+         * On an S-press onto a track with backlog, every set younger
+         * than SUB_STALE_CAP_SEC survives the expiry check — keeping
+         * the first and breaking flashed N obsolete captions, one per
+         * frame, before the current one settled. The newest due set is
+         * the one that reflects "now"; the future head stays queued. */
+        {
+            int64_t head_pts;
+            if (pq_peek_pts(spq, &head_pts) && head_pts != AV_NOPTS_VALUE) {
+                double head_sec = (double)head_pts * av_q2d(st->time_base);
+                if (head_sec <= now) {
+                    log_msg("Sub: superseded by due set (head=%.1f)", head_sec);
+                    sub_clear_bitmaps(ps);
+                    continue;
+                }
+            }
         }
 
         /* Keep this subtitle */
@@ -666,8 +903,18 @@ void sub_decode_pending(PlayerState *ps) {
      * idle frame. display_end_segment() resets presentation state, so a
      * premature END (before all segments arrive) would clear accumulated
      * data. By waiting until the queue is fully drained, all segments
-     * from the current display set are loaded and END can assemble them. */
-    if (pgs_packets_this_drain > 0 && !ps->sub_valid &&
+     * from the current display set are loaded and END can assemble them.
+     *
+     * NOT gated on !sub_valid (DSVP main 7f09ae0): on END-stripped MKV,
+     * the replacement caption B (or a genuine clear) drained while
+     * caption A displays decodes with got_sub=0 and NEEDS the inject to
+     * fire — gating on !sub_valid meant B accumulated silently, was
+     * clobbered by the next set's PCS, and never showed while A stuck
+     * for its 30s cap. Premature-END safety holds regardless: the
+     * peek-based drain above only consumes DUE packets, and a display
+     * set's segments share the set's PTS, so consumed sets are
+     * complete. */
+    if (pgs_packets_this_drain > 0 &&
         ps->sub_codec_ctx &&
         ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
 
@@ -687,7 +934,7 @@ void sub_decode_pending(PlayerState *ps) {
             double start = last_pgs_pts + (double)sub.start_display_time / 1000.0;
             double end   = last_pgs_pts + (double)sub.end_display_time / 1000.0;
             if (sub.end_display_time == 0) end = start + 5.0;
-            if (end - start > 30.0) end = start + 30.0;
+            if (end - start > SUB_STALE_CAP_SEC) end = start + SUB_STALE_CAP_SEC;
 
             if (sub.num_rects == 0) {
                 log_msg("Sub: PGS-END clear (0 rects, pts=%.1f)", last_pgs_pts);
@@ -705,7 +952,8 @@ void sub_decode_pending(PlayerState *ps) {
                         ps->sub_bitmap_count < MAX_SUB_BITMAPS) {
                         uint32_t *palette = (uint32_t *)rect->data[1];
                         int w = rect->w, h = rect->h;
-                        uint8_t *rgba = av_malloc(w * h * 4);
+                        uint8_t *rgba = ((int64_t)w * h > (int64_t)INT_MAX / 4)
+                                        ? NULL : av_malloc((size_t)w * h * 4);
                         if (rgba) {
                             for (int row = 0; row < h; row++) {
                                 for (int col = 0; col < w; col++) {
@@ -744,137 +992,3 @@ void sub_decode_pending(PlayerState *ps) {
     }
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════
- * Subtitle Rendering
- * ═══════════════════════════════════════════════════════════════════ */
-
-static void render_text_outlined(SDL_Renderer *renderer, TTF_Font *font,
-                                  TTF_Font *outline_font, const char *text,
-                                  int x, int y, SDL_Color fg, SDL_Color outline_col) {
-    if (!text || !text[0]) return;
-
-    if (outline_font) {
-        SDL_Surface *outline_surf = TTF_RenderText_Blended(outline_font, text, 0, outline_col);
-        if (outline_surf) {
-            SDL_Texture *outline_tex = SDL_CreateTextureFromSurface(renderer, outline_surf);
-            if (outline_tex) {
-                int outline_offset = TTF_GetFontOutline(outline_font);
-                SDL_Rect dst = { x - outline_offset, y - outline_offset,
-                                 outline_surf->w, outline_surf->h };
-                {SDL_FRect _fdst = rect_to_frect(&dst); SDL_RenderTexture(renderer, outline_tex, NULL, &_fdst);}
-                SDL_DestroyTexture(outline_tex);
-            }
-            SDL_DestroySurface(outline_surf);
-        }
-    }
-
-    SDL_Surface *text_surf = TTF_RenderText_Blended(font, text, 0, fg);
-    if (text_surf) {
-        SDL_Texture *text_tex = SDL_CreateTextureFromSurface(renderer, text_surf);
-        if (text_tex) {
-            SDL_Rect dst = { x, y, text_surf->w, text_surf->h };
-            {SDL_FRect _fdst = rect_to_frect(&dst); SDL_RenderTexture(renderer, text_tex, NULL, &_fdst);}
-            SDL_DestroyTexture(text_tex);
-        }
-        SDL_DestroySurface(text_surf);
-    }
-}
-
-void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
-
-    /* ── Render active subtitle ── */
-    if (ps->sub_valid) {
-        double now = ps->audio_clock_sync;
-        if (ps->audio_stream_idx < 0) now = ps->video_clock;
-
-        if (now >= ps->sub_start_pts && now <= ps->sub_end_pts) {
-            if (ps->sub_is_bitmap && ps->sub_bitmap_count > 0) {
-                /* Bitmap subtitles now rendered via overlay.c GPU path.
-                 * This legacy sub_render() is unused. */
-                (void)renderer; (void)win_w; (void)win_h;
-            } else if (!ps->sub_is_bitmap && ps->sub_text[0]) {
-                /* ── Text subtitle: render with SDL_ttf ── */
-                if (font_loaded) {
-                    char buf[SUB_TEXT_SIZE];
-                    snprintf(buf, sizeof(buf), "%s", ps->sub_text);
-
-                    char *lines[64];
-                    int nlines = 0;
-                    char *tok = strtok(buf, "\n");
-                    while (tok && nlines < 64) {
-                        if (tok[0] != '\0') {
-                            lines[nlines++] = tok;
-                        }
-                        tok = strtok(NULL, "\n");
-                    }
-
-                    int font_size = win_h / 24;
-                    if (font_size < 14) font_size = 14;
-                    if (font_size > 54) font_size = 54;
-
-                    TTF_SetFontSize(sub_font, font_size);
-                    if (sub_font_outline)
-                        TTF_SetFontSize(sub_font_outline, font_size);
-
-                    int line_height = TTF_GetFontLineSkip(sub_font);
-                    int total_height = nlines * line_height;
-                    int y_base = win_h - 60 - total_height;
-
-                    for (int i = 0; i < nlines; i++) {
-                        int tw = 0, th = 0;
-                        TTF_GetStringSize(sub_font, lines[i], 0, &tw, &th);
-                        int x = (win_w - tw) / 2;
-                        int y = y_base + i * line_height;
-
-                        render_text_outlined(renderer, sub_font, sub_font_outline,
-                            lines[i], x, y, COLOR_SUB, COLOR_OUTLINE);
-                    }
-                }
-            }
-        } else if (now > ps->sub_end_pts) {
-            ps->sub_valid = 0;
-            sub_clear_bitmaps(ps);
-        }
-    }
-
-    /* ── Render track-change OSD (subtitle or audio) ── */
-    const char *osd_text = NULL;
-    double osd_until = 0;
-
-    /* Audio OSD takes priority if both are active */
-    if (ps->aud_osd[0] && get_time_sec() < ps->aud_osd_until) {
-        osd_text = ps->aud_osd;
-        osd_until = ps->aud_osd_until;
-    } else if (ps->aud_osd[0]) {
-        ps->aud_osd[0] = '\0';
-    }
-
-    if (ps->sub_osd[0] && get_time_sec() < ps->sub_osd_until) {
-        /* If no audio OSD, show subtitle OSD; otherwise audio wins */
-        if (!osd_text) {
-            osd_text = ps->sub_osd;
-            osd_until = ps->sub_osd_until;
-        }
-    } else if (ps->sub_osd[0]) {
-        ps->sub_osd[0] = '\0';
-    }
-
-    if (osd_text && get_time_sec() < osd_until && font_loaded) {
-        int font_size = win_h / 40;
-        if (font_size < 12) font_size = 12;
-        if (font_size > 32) font_size = 32;
-
-        TTF_SetFontSize(sub_font, font_size);
-        if (sub_font_outline)
-            TTF_SetFontSize(sub_font_outline, font_size);
-
-        int tw = 0, th = 0;
-        TTF_GetStringSize(sub_font, osd_text, 0, &tw, &th);
-        int x = (win_w - tw) / 2;
-        int y = 30;
-
-        render_text_outlined(renderer, sub_font, sub_font_outline,
-            osd_text, x, y, COLOR_SUB, COLOR_OUTLINE);
-    }
-}

@@ -18,6 +18,148 @@
 #include "dsvp.h"
 #include "dsvp_icon.h"
 #include <dirent.h>
+#include <signal.h>
+
+/* Baked in by the Makefile (git short SHA, +dirty when the tree is modified).
+ * Fallback keeps the file compilable outside the build system. */
+#ifndef DSVP_GIT_COMMIT
+#define DSVP_GIT_COMMIT "unknown"
+#endif
+
+/* Ctrl-C / SIGTERM must not skip cleanup. The dangerous case is being
+ * killed mid-passthrough: the receiver is being fed IEC 61937 and the
+ * stream just stops without the non-audio bit being cleared, which is
+ * exactly the state that latches some TVs (LG OLEDs confirmed) into
+ * silence. Flag it here, let the main loop exit normally, and every
+ * teardown path runs as usual. */
+static volatile sig_atomic_t g_signal_quit = 0;
+static void on_terminate_signal(int sig) { (void)sig; g_signal_quit = 1; }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Pacing v2 (DSVP_PACING=v2) — median cadence sensor + explicit
+ * LOCKED/SCHEDULED mode machine. Design: docs/DESIGN-PACING.md.
+ * Batch 2 scope: the machine decides the mode; the mode BODIES are
+ * still the v1 mechanisms (LOCKED = the 1:1 path, SCHEDULED = the
+ * accumulator + drop stack). Inert unless the env flag is set.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Called once per PRESENTED tick (video_display or video_reblit —
+ * drop ticks present nothing and are not heartbeats). Maintains the
+ * median of the last 32 presented-frame intervals (a mean chases
+ * transition outliers: field tick=25.3 described no real cadence)
+ * and drives the cadence half of the mode contracts: LOCKED entry
+ * needs a 1.5% match sustained 30 presents AND settled drift; the
+ * cadence exit needs 4% mismatch sustained 10. The drift exit
+ * contract lives in the consume path (per displayed frame). */
+static void pacing_v2_present_tick(PlayerState *ps, double now) {
+    if (!ps->playing)
+        return;
+
+    /* Measure: interval between presents; transients >100ms are
+     * stall/seek boundaries, not cadence. */
+    if (ps->pace_last_present > 0.0) {
+        double dt = now - ps->pace_last_present;
+        if (dt < 0.1) {
+            ps->pace_ring[ps->pace_ring_pos] = dt;
+            ps->pace_ring_pos = (ps->pace_ring_pos + 1) % 32;
+            if (ps->pace_ring_n < 32)
+                ps->pace_ring_n++;
+            if (ps->pace_ring_n >= 8) {
+                double sorted[32];
+                memcpy(sorted, ps->pace_ring,
+                       ps->pace_ring_n * sizeof(double));
+                for (int i = 1; i < ps->pace_ring_n; i++) {
+                    double v = sorted[i];
+                    int j = i - 1;
+                    while (j >= 0 && sorted[j] > v) {
+                        sorted[j + 1] = sorted[j];
+                        j--;
+                    }
+                    sorted[j + 1] = v;
+                }
+                ps->pace_median = sorted[ps->pace_ring_n / 2];
+            }
+        }
+    }
+    ps->pace_last_present = now;
+
+    /* Mode machine — cadence contracts. */
+    double content_dt = ps->frame_last_delay;
+    int rate_ok = (content_dt > 0.001 && content_dt < 0.020);
+    if (ps->pace_median <= 0.0 || !rate_ok) {
+        ps->pace_enter_streak = 0;
+        /* Content left the 1:1 range (playlist advance mid-mode):
+         * LOCKED is meaningless, exit now. A merely-invalid median
+         * (ring refilling after a window hint) holds the mode — the
+         * drift exit contract keeps guarding meanwhile. */
+        if (ps->pace_mode == PACE_LOCKED && !rate_ok) {
+            ps->pace_mode = PACE_SCHEDULED;
+            ps->pace_exit_streak  = 0;
+            ps->pace_drift_streak = 0;
+            log_msg("PACE: -> SCHEDULED (content cadence %.1fms left "
+                    "the 1:1 range)", content_dt * 1000.0);
+        }
+        return;
+    }
+
+    double err = fabs(ps->pace_median - content_dt);
+    if (ps->pace_mode == PACE_SCHEDULED) {
+        if (err < content_dt * 0.015) {
+            ps->pace_enter_streak++;
+            /* ENTRY CONTRACT: cadence match sustained AND drift
+             * settled — never enter LOCKED owing frames (review F2:
+             * LOCKED cannot repay). Video-only owes nothing. */
+            double resid = (ps->audio_stream_idx >= 0)
+                ? fabs(ps->last_av_diff - ps->av_bias) : 0.0;
+            if (ps->pace_enter_streak >= 30 && resid < content_dt) {
+                ps->pace_mode = PACE_LOCKED;
+                ps->pace_enter_streak = 0;
+                ps->pace_exit_streak  = 0;
+                ps->pace_drift_streak = 0;
+                /* Latency reference for this LOCKED residency: a
+                 * snapshot. The live EMA keeps learning (that is
+                 * LOCKED's job) but exits measure against the value
+                 * at entry — an EMA chases slow drift and absorbs it
+                 * (the slow-sink case); a snapshot cannot. */
+                ps->pace_bias_ref = ps->av_bias;
+                log_msg("PACE: -> LOCKED (median %.2fms, content "
+                        "%.2fms, resid drift %.1fms)",
+                        ps->pace_median * 1000.0, content_dt * 1000.0,
+                        resid * 1000.0);
+            }
+        } else {
+            ps->pace_enter_streak = 0;
+        }
+    } else {
+        if (err > content_dt * 0.04) {
+            if (++ps->pace_exit_streak >= 10) {
+                ps->pace_mode = PACE_SCHEDULED;
+                ps->pace_enter_streak = 0;
+                ps->pace_exit_streak  = 0;
+                ps->pace_drift_streak = 0;
+                log_msg("PACE: -> SCHEDULED (cadence mismatch: median "
+                        "%.2fms vs content %.2fms)",
+                        ps->pace_median * 1000.0, content_dt * 1000.0);
+            }
+        } else {
+            ps->pace_exit_streak = 0;
+        }
+    }
+}
+
+/* Window-event hint: geometry changed, cadence may be about to
+ * change. Restart the measurement window and sustain streaks so the
+ * machine re-decides from fresh data. Hints never switch modes
+ * themselves — fullscreen ≠ direct scanout (KWin re-promotion is
+ * fullscreen at degraded cadence and must read as such). */
+static void pacing_v2_window_hint(PlayerState *ps) {
+    ps->pace_ring_n       = 0;
+    ps->pace_ring_pos     = 0;
+    ps->pace_median       = 0.0;
+    ps->pace_last_present = 0.0;
+    ps->pace_enter_streak = 0;
+    ps->pace_exit_streak  = 0;
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  * Folder Playlist — prev/next file navigation
@@ -27,16 +169,28 @@
  * sorts alphabetically, and allows navigating to adjacent entries.
  */
 
+/* Video containers only: player_open hard-requires a video stream, so
+ * advertising audio extensions (.mp3/.flac/…) put unopenable files in
+ * the browser and playlist — EOF auto-advance hitting a coverless
+ * soundtrack file dumped the user back to the browser (review P2-15).
+ * Re-add them when audio-only playback exists. */
 const char *video_extensions[] = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
     ".ts", ".m2ts", ".mpg", ".mpeg", ".3gp",
-    ".mp3", ".flac", ".wav", ".aac", ".ogg", ".opus", ".m4a", ".wma",
     NULL
 };
 
-/* HDR midtone gain index — file-scope so it can be reset on file open.
- * Index 3 = 1.3f, matching the default gpu_uniforms.hdr_midtone_gain. */
+/* HDR midtone gain — file-scope so it can be reset on file open.
+ * Index 3 = 1.3f, the default. gain_reset writes BOTH the index and
+ * the live uniform: resetting only the index left the effective gain
+ * carried over from the previous file while the OSD claimed default —
+ * first G press then jumped two steps at once (review P2-14). */
+static const float s_gain_table[6] = { 1.0f, 1.1f, 1.2f, 1.3f, 1.35f, 1.4f };
 static int s_gain_idx = 3;
+static void gain_reset(PlayerState *ps) {
+    s_gain_idx = 3;
+    ps->gpu_uniforms.hdr_midtone_gain = s_gain_table[s_gain_idx];
+}
 
 int is_media_file(const char *name) {
     const char *dot = strrchr(name, '.');
@@ -47,10 +201,44 @@ int is_media_file(const char *name) {
     return 0;
 }
 
+/* Natural-order, case-insensitive compare (DSVP main 7f09ae0): digit
+ * runs compare as numbers, so "E2" sorts before "E10" — byte-wise
+ * folding played episodes out of story order in any season folder with
+ * unpadded numbering. ASCII folding; deterministic leading-zero
+ * tie-break keeps the ordering a strict total order for qsort. */
+int natural_casecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= '0' && ca <= '9' && cb >= '0' && cb <= '9') {
+            const char *pa = a, *pb = b;
+            while (*pa == '0') pa++;
+            while (*pb == '0') pb++;
+            const char *da = pa, *db = pb;
+            while (*da >= '0' && *da <= '9') da++;
+            while (*db >= '0' && *db <= '9') db++;
+            ptrdiff_t la = da - pa, lb = db - pb;
+            if (la != lb) return (la < lb) ? -1 : 1;
+            for (; pa < da; pa++, pb++)
+                if (*pa != *pb) return (*pa < *pb) ? -1 : 1;
+            ptrdiff_t za = pa - a - la, zb = pb - b - lb;
+            if (za != zb) return (za < zb) ? -1 : 1;
+            a = da; b = db;
+            continue;
+        }
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return (ca < cb) ? -1 : 1;
+        a++; b++;
+    }
+    if (*a) return 1;
+    if (*b) return -1;
+    return 0;
+}
+
 static int cmp_strings(const void *a, const void *b) {
     const char *sa = *(const char **)a;
     const char *sb = *(const char **)b;
-    return strcasecmp(sa, sb);
+    return natural_casecmp(sa, sb);
 }
 
 static void playlist_free(PlayerState *ps) {
@@ -81,7 +269,10 @@ static void playlist_scan(PlayerState *ps) {
         *(sep + 1) = '\0';  /* dir now ends with separator */
     } else {
         snprintf(base, sizeof(base), "%s", dir);
-        strcpy(dir, ".");
+        /* Trailing slash matters: the entry constructor below joins
+         * with "%s%s" — bare "." produced ".<name>" paths and a
+         * permanently-lost playlist index (review P2-12). */
+        strcpy(dir, "./");
     }
 
     /* Scan directory */
@@ -134,8 +325,14 @@ static void playlist_scan(PlayerState *ps) {
     /* Find current file's index */
     ps->playlist_index = -1;
     for (int i = 0; i < count; i++) {
-        /* Compare against full filepath */
-        if (strcmp(files[i], ps->filepath) == 0) {
+        /* Compare against full filepath. Relative launches store the
+         * bare name while entries carry the "./" prefix — strip it
+         * for the comparison (P2-12). */
+        const char *entry = files[i];
+        if (entry[0] == '.' && entry[1] == '/'
+                && strchr(ps->filepath, '/') == NULL)
+            entry += 2;
+        if (strcmp(entry, ps->filepath) == 0) {
             ps->playlist_index = i;
             break;
         }
@@ -211,10 +408,102 @@ static void gpu_draw_idle(PlayerState *ps) {
  * Main
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* ── Fullscreen toggle — the ONLY place that changes fullscreen state ──
+ *
+ * Both the F key and double-click route here. They used to be separate
+ * implementations: F did an exclusive modeset (SDL_SetWindowFullscreenMode
+ * with a concrete mode) and cleared it on exit, while double-click called
+ * SDL_SetWindowFullscreen alone. Because the mode is sticky per-window,
+ * mixing them produced order-dependent behaviour — a double-click after an
+ * F-cycle could enter exclusive fullscreen with a mode chosen for a display
+ * that may no longer be attached — and the double-click exit skipped the
+ * aspect-ratio window restore, leaving a stale window shape.
+ *
+ * Exclusive fullscreen is deliberate: SDL_WINDOW_FULLSCREEN alone gives
+ * borderless desktop fullscreen, which drifted at 4K60 on the dock. */
+/* ── Fullscreen — borderless only, by design ──────────────────────────
+ *
+ * DSVP never changes the display mode. It asks for borderless desktop
+ * fullscreen, which reuses whatever mode the desktop is already running.
+ *
+ * There used to be an "exclusive" path that called
+ * SDL_SetWindowFullscreenMode() with a concrete SDL_DisplayMode, added long
+ * ago to chase 4K60 pacing drift on an older software stack. It was removed
+ * 2026-07-31 because it issued a real display modeset on every keypress, and
+ * a modeset forces the whole link to renegotiate — through a dock's DP->HDMI
+ * converter, a TV's input handling, and whatever else sits in the path. On
+ * the Steam Deck dock that renegotiation does not reliably come back clean:
+ * observed outcomes included the picture landing vertically offset, a blank
+ * screen needing manual recovery, and SDL's mode list going stale after a
+ * hotplug so fullscreen silently stopped working entirely.
+ *
+ * No end user should be able to reach any of those states by pressing F in a
+ * video player, and nothing ever demonstrated exclusive producing a better
+ * picture than borderless. The safe path is the only path.
+ *
+ * ps->fullscreen is a mirror of compositor state, so the toggle reads the
+ * window's ACTUAL flags rather than trusting it — the compositor can change
+ * fullscreen state without asking us (WM shortcut, session change), and a
+ * desynced mirror used to make F toggle the flag instead of the window.
+ * ────────────────────────────────────────────────────────────────────── */
+static void set_fullscreen(PlayerState *ps, SDL_Window *window, bool want_fs) {
+    /* Pause audio across the transition to prevent drift */
+    if (ps->playing && !ps->paused && ps->audio_stream)
+        SDL_PauseAudioStreamDevice(ps->audio_stream);
+
+    ps->fullscreen = want_fs;
+    pacing_v2_window_hint(ps);
+
+    /* NULL mode = "use the desktop's current mode". This is what keeps the
+     * display link untouched, and it also clears any mode a previous build
+     * may have left stuck on the window. */
+    SDL_SetWindowFullscreenMode(window, NULL);
+    SDL_SetWindowFullscreen(window, want_fs);
+
+    if (want_fs) {
+        log_msg("FS: entered borderless fullscreen (desktop mode, no modeset)");
+    } else {
+        log_msg("FS: returned to windowed");
+
+        /* Resize to the current video's aspect ratio. Without this, opening a
+         * different-aspect file while fullscreen leaves the old window shape
+         * behind as stale black bars. */
+        if (ps->playing && ps->vid_w > 0 && ps->vid_h > 0) {
+            const SDL_DisplayMode *dm =
+                SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+            int max_w = dm ? (int)(dm->w * 0.8) : 1920;
+            int max_h = dm ? (int)(dm->h * 0.8) : 1080;
+            int w = ps->vid_w, h = ps->vid_h;
+            if (w > max_w || h > max_h) {
+                double scale = fmin((double)max_w / w, (double)max_h / h);
+                w = (int)(w * scale);
+                h = (int)(h * scale);
+            }
+            ps->win_w = w;
+            ps->win_h = h;
+            SDL_SetWindowSize(window, w, h);
+        }
+    }
+
+    if (ps->playing && !ps->paused && ps->audio_stream)
+        SDL_ResumeAudioStreamDevice(ps->audio_stream);
+}
+
+static void toggle_fullscreen(PlayerState *ps, SDL_Window *window) {
+    bool is_fs = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+    set_fullscreen(ps, window, !is_fs);
+}
+
 int main(int argc, char *argv[]) {
     /* ── Initialize logging (before anything else) ── */
     log_init();
-    log_msg("Starting DSVP v" DSVP_VERSION " (argc=%d)", argc);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_terminate_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    log_msg("Starting DSVP v" DSVP_VERSION " build " DSVP_GIT_COMMIT " (argc=%d)", argc);
     log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),
             LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR);
 
@@ -356,6 +645,24 @@ int main(int argc, char *argv[]) {
         SDL_GPU_PRESENTMODE_VSYNC);
     log_msg("GPU: swapchain set to SDR + VSync");
 
+    /* ── HDR capability probe (docs/TODO-HDR.md) ──
+     * Which swapchain compositions will this window actually get?
+     * This single log line is the architecture decision for HDR
+     * passthrough: HDR10_ST2084 supported in a given session type
+     * (desktop / desktop+KDE-HDR / Game Mode) means per-file HDR
+     * output works there. Permanent diagnostic — costs four queries
+     * at startup and answers "why no HDR?" forever after. */
+    log_msg("GPU: swapchain support: SDR=%d SDR_LINEAR=%d "
+            "HDR_EXTENDED_LINEAR=%d HDR10_ST2084=%d",
+        SDL_WindowSupportsGPUSwapchainComposition(gpu_device, window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR),
+        SDL_WindowSupportsGPUSwapchainComposition(gpu_device, window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR),
+        SDL_WindowSupportsGPUSwapchainComposition(gpu_device, window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR),
+        SDL_WindowSupportsGPUSwapchainComposition(gpu_device, window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084));
+
     /* ── Initialize subtitle font (Phase 2 will use for GPU overlay) ── */
     if (sub_init_font() < 0) {
         log_msg("WARNING: Subtitle rendering disabled (no font)");
@@ -366,6 +673,24 @@ int main(int argc, char *argv[]) {
     memset(&ps, 0, sizeof(ps));
     ps.window     = window;
     ps.gpu_device = gpu_device;
+    /* HDR output defaults to auto (docs/TODO-HDR.md): passthrough
+     * engages per-file when content + display path support it; Z
+     * toggles live. Revisit the default once the first passthrough
+     * test settles whether desktop-mode KWin truly switches the
+     * display or tone-maps our surface itself. */
+    ps.hdr_out_mode = 1;
+    /* Opt-out for the render-at-content-rate intermediate (see dsvp.h) */
+    ps.no_intermediate = (SDL_getenv("DSVP_NO_INTERMEDIATE") != NULL);
+    if (ps.no_intermediate)
+        log_msg("Render: DSVP_NO_INTERMEDIATE set — direct render path");
+    {
+        const char *pv = SDL_getenv("DSVP_PACING");
+        if (pv != NULL && strcmp(pv, "v1") == 0)
+            log_msg("WARN: DSVP_PACING=v1 requested — the legacy "
+                    "threshold stack was removed at 0.3.6");
+        log_msg("Pacing: v2 mode machine (median sensor + slot "
+                "scheduler)");
+    }
     ps.volume     = 1.00;
     ps.video_stream_idx = -1;
     ps.audio_stream_idx = -1;
@@ -375,7 +700,28 @@ int main(int argc, char *argv[]) {
     ps.hdr_target_idx = 0;  /* default: 203 nits (industry standard) */
     ps.gpu_uniforms.hdr_target_nits = 203.0f;
     ps.gpu_uniforms.hdr_midtone_gain = 1.3f;  /* default: moderate midtone lift */
-    ps.audio_mode = AUDIO_MODE_AUTO;  /* probe HDMI sink, passthrough if supported */
+    /* DSVP_PCM=1 forces PCM decode at startup. Escape hatch while the
+     * SteamOS 192kHz HDMI audio regression (June 2026) blocks EAC3/TrueHD
+     * passthrough on docked Deck: any 192k stream is silent and wedges the
+     * LG C4 (mute latch until HDMI reseat). 48k passthrough (AC3) verified
+     * unaffected. P-key mode cycling remains available as usual. */
+    ps.audio_mode = getenv("DSVP_PCM")
+        ? AUDIO_MODE_PCM   /* decode everything, no bitstream at open */
+        : AUDIO_MODE_AUTO; /* probe HDMI sink, passthrough if supported */
+
+    /* ── User audio-latency offset (madVR-style escape hatch) ──
+     * DSVP_AUDIO_DELAY=<ms>, positive = the sink chain (TV decode,
+     * AVR, soundbar) delays audio by that much relative to video.
+     * Passthrough latency can't be measured in-app — the receiver
+     * decodes downstream of every clock we can read — so the eye/ear
+     * sets this once per setup. Applied to the bitstream sync clock. */
+    {
+        const char *ad = getenv("DSVP_AUDIO_DELAY");
+        ps.audio_delay_sec = ad ? atof(ad) / 1000.0 : 0.0;
+        if (ps.audio_delay_sec != 0.0)
+            log_msg("Audio: user latency offset %+.0f ms (DSVP_AUDIO_DELAY)",
+                    ps.audio_delay_sec * 1000.0);
+    }
 
     /* ── Detect Game Mode vs Desktop Mode ──
      * Gamescope (SteamOS Game Mode compositor) sets GAMESCOPE_WAYLAND_DISPLAY.
@@ -400,7 +746,7 @@ int main(int argc, char *argv[]) {
         if (player_open(&ps, open_path) != 0) {
             log_msg("ERROR: Failed to open: %s", open_path);
         } else {
-            s_gain_idx = 3;
+            gain_reset(&ps);
             playlist_scan(&ps);
         }
         free(open_path);
@@ -444,7 +790,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Main loop ── */
+    double pr_t0 = 0.0;   /* PRESENT DIAG window start (VRR investigation) */
+    int    pr_n  = 0;     /* iterations (≈presents) in current window */
+    const int s_diag = (getenv("DSVP_DIAG") != NULL);
     while (!ps.quit) {
+        if (g_signal_quit) { log_msg("Signal received — shutting down cleanly"); ps.quit = 1; break; }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
@@ -455,6 +805,15 @@ int main(int argc, char *argv[]) {
                 break;
 
             case SDL_EVENT_KEY_DOWN:
+                /* Raw key report under DSVP_DIAG=1. Bindings that "do nothing"
+                 * are almost always the event not being what the code assumed
+                 * — scancode vs keycode, or modifiers not arriving — so print
+                 * what SDL actually delivered rather than guessing at it. */
+                if (s_diag)
+                    log_msg("KEY: scancode=%d key=%d mod=0x%04x repeat=%d",
+                            (int)ev.key.scancode, (int)ev.key.key,
+                            (unsigned)ev.key.mod, (int)ev.key.repeat);
+
                 /* ── Browser navigation (when shown and no file playing) ── */
                 if (ps.browser_active && !ps.playing) {
                     int browser_consumed = 1;
@@ -480,6 +839,7 @@ int main(int argc, char *argv[]) {
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
                                 log_msg("ERROR: Failed to open file");
                             } else {
+                                gain_reset(&ps);
                                 playlist_scan(&ps);
                             }
                         }
@@ -494,7 +854,21 @@ int main(int argc, char *argv[]) {
                     }
                     if (browser_consumed) break;
                 }
+
+                /* Auto-repeat is wanted in the browser above (hold to scroll)
+                 * but nowhere below: a held or bouncing A/P/S/N/B key fires a
+                 * track switch, passthrough toggle or file change per repeat
+                 * event, which is how one keypress produced six identical
+                 * "skipping TrueHD track" refusals in a row. */
+                if (ev.key.repeat) break;
+
                 switch (ev.key.key) {
+
+                case SDLK_ESCAPE:
+                    /* The controls overlay tells the user Esc closes it; until
+                     * now nothing bound Esc, so it lied on a keyboard. */
+                    if (ps.show_controls) ps.show_controls = 0;
+                    break;
 
                 case SDLK_Q:
                     if (ps.playing) {
@@ -523,7 +897,7 @@ int main(int argc, char *argv[]) {
                      * If playing, close first so we return to browser. */
                     log_msg("File browser requested (O key)");
                     if (ps.playing) player_close(&ps);
-                    s_gain_idx = 3;
+                    gain_reset(&ps);
                     ps.show_controls = 0;
                     if (!ps.browser_active) {
                         browser_init(&ps);
@@ -543,112 +917,17 @@ int main(int argc, char *argv[]) {
                         }
                         if (!ps.paused) {
                             ps.frame_timer = get_time_sec();
+                            /* Restart FPS window — the paused gap would
+                             * otherwise skew the first reading on resume */
+                            ps.fps_window_start   = 0.0;
+                            ps.fps_window_frames  = 0;
+                            ps.rfps_window_frames = 0;
                         }
                     }
                     break;
 
                 case SDLK_F:
-                    /* Pause audio during mode switch to prevent drift */
-                    if (ps.playing && !ps.paused && ps.audio_stream)
-                        SDL_PauseAudioStreamDevice(ps.audio_stream);
-                    ps.fullscreen = !ps.fullscreen;
-
-                    /* ── EXCLUSIVE FULLSCREEN (Holden's day-1 intuition) ──
-                     * SDL_WINDOW_FULLSCREEN alone defaults to BORDERLESS
-                     * desktop-mode fullscreen (per SDL3 docs). Every prior
-                     * test this week was borderless. Exclusive fullscreen
-                     * — via SDL_SetWindowFullscreenMode(window, &mode)
-                     * with a concrete SDL_DisplayMode — hands display
-                     * control directly to the app, bypassing KWin's
-                     * compositor path entirely. If the 4K60 windowed→
-                     * fullscreen drift comes from the compositor's
-                     * handling of the transition, exclusive fullscreen
-                     * should route around it.
-                     *
-                     * On entry to fullscreen: pick the display mode
-                     * matching the current desktop (w, h, refresh_rate)
-                     * and set it before the fullscreen toggle. On exit:
-                     * clear the mode (NULL) to return to borderless
-                     * desktop behavior, which is harmless for the
-                     * windowed path. */
-                    if (ps.fullscreen) {
-                        SDL_DisplayID disp = SDL_GetDisplayForWindow(window);
-                        if (disp == 0) disp = SDL_GetPrimaryDisplay();
-                        int mode_count = 0;
-                        SDL_DisplayMode **modes =
-                            SDL_GetFullscreenDisplayModes(disp, &mode_count);
-                        const SDL_DisplayMode *chosen = NULL;
-
-                        /* Pick highest resolution mode. On SteamOS 200% scale,
-                         * SDL_GetCurrentDisplayMode returns LOGICAL 1920x1080,
-                         * not physical 3840x2160. Matching against it picks the
-                         * wrong mode. Instead: iterate all modes, pick max w*h,
-                         * prefer higher refresh within same resolution. */
-                        if (modes) {
-                            int best_pixels = 0;
-                            float best_refresh = 0;
-                            for (int i = 0; i < mode_count; i++) {
-                                int pixels = modes[i]->w * modes[i]->h;
-                                if (pixels > best_pixels ||
-                                    (pixels == best_pixels &&
-                                     modes[i]->refresh_rate > best_refresh)) {
-                                    chosen = modes[i];
-                                    best_pixels = pixels;
-                                    best_refresh = modes[i]->refresh_rate;
-                                }
-                            }
-                            /* Log available modes for diagnostics */
-                            for (int i = 0; i < mode_count; i++) {
-                                log_msg("FS-mode[%d]: %dx%d@%.3fHz%s",
-                                        i, modes[i]->w, modes[i]->h,
-                                        modes[i]->refresh_rate,
-                                        modes[i] == chosen ? " ← CHOSEN" : "");
-                            }
-                        }
-
-                        bool mode_ok = false;
-                        if (chosen) {
-                            mode_ok = SDL_SetWindowFullscreenMode(window, chosen);
-                            log_msg("FS-exclusive: mode %dx%d@%.3fHz set=%d",
-                                    chosen->w, chosen->h,
-                                    chosen->refresh_rate, mode_ok);
-                        } else {
-                            log_msg("FS-exclusive: no modes found "
-                                    "(have %d modes), falling back to borderless",
-                                    mode_count);
-                        }
-                        if (modes) SDL_free(modes);
-                        SDL_SetWindowFullscreen(window, true);
-                    } else {
-                        /* Return to borderless desktop behavior for
-                         * subsequent windowed→fs cycles. NULL means
-                         * "use desktop mode" per SDL3 docs. */
-                        SDL_SetWindowFullscreenMode(window, NULL);
-                        SDL_SetWindowFullscreen(window, false);
-                    }
-
-                    /* Returning to windowed: resize to current video's aspect ratio.
-                     * Without this, opening a different-aspect file while fullscreen
-                     * leaves the old window shape (stale black bars). */
-                    if (!ps.fullscreen && ps.playing && ps.vid_w > 0 && ps.vid_h > 0) {
-                        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(
-                            SDL_GetPrimaryDisplay());
-                        int max_w = dm ? (int)(dm->w * 0.8) : 1920;
-                        int max_h = dm ? (int)(dm->h * 0.8) : 1080;
-                        int w = ps.vid_w, h = ps.vid_h;
-                        if (w > max_w || h > max_h) {
-                            double scale = fmin((double)max_w / w, (double)max_h / h);
-                            w = (int)(w * scale);
-                            h = (int)(h * scale);
-                        }
-                        ps.win_w = w;
-                        ps.win_h = h;
-                        SDL_SetWindowSize(window, w, h);
-                    }
-                    if (ps.playing) {
-                        if (!ps.paused && ps.audio_stream)
-                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                    }
+                    toggle_fullscreen(&ps, window);
                     break;
 
                 case SDLK_D:
@@ -673,9 +952,17 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_H:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        if (ps.hdr_out_active) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "HDR debug: no effect in passthrough "
+                                     "(Z = tone-map)");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
                         int mode = (int)ps.gpu_uniforms.hdr_debug;
                         mode = (mode + 1) % 4;
                         ps.gpu_uniforms.hdr_debug = (float)mode;
+                        ps.frame_render_dirty = 1;
                         float tn = ps.gpu_uniforms.hdr_target_nits;
                         const char *fmt[] = {
                             "HDR: BT.2390 (%.0f nit target)",
@@ -691,9 +978,17 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_T:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        if (ps.hdr_out_active) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "SDR target: no effect in passthrough "
+                                     "(Z = tone-map)");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
                         static const float targets[] = { 203.0f, 300.0f, 400.0f };
                         ps.hdr_target_idx = (ps.hdr_target_idx + 1) % 3;
                         ps.gpu_uniforms.hdr_target_nits = targets[ps.hdr_target_idx];
+                        ps.frame_render_dirty = 1;
                         snprintf(ps.aud_osd, sizeof(ps.aud_osd),
                                  "SDR target: %.0f nits", targets[ps.hdr_target_idx]);
                         ps.aud_osd_until = get_time_sec() + 2.0;
@@ -704,14 +999,74 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_G:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
-                        static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f, 1.35f, 1.4f };
+                        if (ps.hdr_out_active) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "Midtone gain: no effect in passthrough "
+                                     "(Z = tone-map)");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
                         s_gain_idx = (s_gain_idx + 1) % 6;
-                        ps.gpu_uniforms.hdr_midtone_gain = gains[s_gain_idx];
+                        ps.gpu_uniforms.hdr_midtone_gain = s_gain_table[s_gain_idx];
+                        ps.frame_render_dirty = 1;
                         snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                                 "Midtone gain: %.2f", gains[s_gain_idx]);
+                                 "Midtone gain: %.2f", s_gain_table[s_gain_idx]);
                         ps.aud_osd_until = get_time_sec() + 2.0;
                         log_msg("HDR: midtone gain changed to %.2f",
-                                gains[s_gain_idx]);
+                                s_gain_table[s_gain_idx]);
+                    }
+                    break;
+
+                case SDLK_Z:
+                    /* Toggle HDR passthrough ↔ SDR tone-map, live.
+                     * The A/B: display's tone mapping vs ours. */
+                    if (!ps.playing || ps.gpu_uniforms.is_hdr <= 0.0f)
+                        break;
+                    if (!ps.hdr_pass_content) {
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "HDR passthrough: n/a for this format yet");
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        break;
+                    }
+                    if (!SDL_WindowSupportsGPUSwapchainComposition(
+                            ps.gpu_device, ps.window,
+                            SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084)) {
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "HDR passthrough: display path has no HDR");
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        break;
+                    }
+                    ps.hdr_out_mode = ps.hdr_out_mode ? 0 : 1;
+                    hdr_output_apply(&ps);
+                    snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                             "HDR output: %s",
+                             ps.hdr_out_active
+                                 ? "passthrough (display tone-maps)"
+                                 : "tone-map (SDR)");
+                    ps.aud_osd_until = get_time_sec() + 2.0;
+                    break;
+
+                case SDLK_E:
+                    /* Cycle output transfer for tone-mapped content:
+                     * sRGB piecewise → 2.2 → 2.4. Same effect as
+                     * DSVP_OUTPUT_GAMMA, but live — the docked-vs-
+                     * internal-panel A/B is an eye test, not a
+                     * relaunch. Only meaningful on the tone-mapped
+                     * paths, so gated on HDR like T and G. */
+                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        float next;
+                        const char *name;
+                        if (ps.out_gamma_pref == 1.0f)      { next = 2.2f; name = "gamma 2.2"; }
+                        else if (ps.out_gamma_pref == 2.2f) { next = 2.4f; name = "gamma 2.4 (BT.1886)"; }
+                        else                                { next = 1.0f; name = "sRGB piecewise"; }
+                        ps.out_gamma_pref = next;
+                        ps.gpu_uniforms.out_gamma =
+                            (next == 1.0f) ? 0.0f : next;
+                        ps.frame_render_dirty = 1;
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Output transfer: %s", name);
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        log_msg("Output transfer changed to %s", name);
                     }
                     break;
 
@@ -761,6 +1116,16 @@ int main(int argc, char *argv[]) {
                             ps.audio_switch_phase = 1;
                             ps.audio_switch_thread = SDL_CreateThread(
                                 audio_switch_bg_func, "audioswitch", &ps);
+                            if (!ps.audio_switch_thread) {
+                                /* Thread creation failed: complete the
+                                 * switch synchronously next tick, or
+                                 * phase sticks at 1 forever — audio
+                                 * already torn down, P key dead. */
+                                log_msg("WARN: audio switch thread failed "
+                                        "(%s) — completing synchronously",
+                                        SDL_GetError());
+                                ps.audio_switch_phase = 2;
+                            }
 
                             snprintf(ps.aud_osd, sizeof(ps.aud_osd),
                                      "Audio Mode: switching...");
@@ -825,34 +1190,21 @@ int main(int argc, char *argv[]) {
                                      delta > 0 ? "next" : "previous");
                             ps.aud_osd_until = get_time_sec() + 2.0;
                         } else {
-                            /* Save playlist state before close */
-                            char **saved_files = ps.playlist_files;
-                            int saved_count = ps.playlist_count;
-                            int saved_index = next;
-                            ps.playlist_files = NULL; /* prevent close from freeing */
-                            ps.playlist_count = 0;
-
-                            int was_fs = ps.fullscreen;
+                            /* The playlist is owned by this loop;
+                             * player_close/player_open never touch its
+                             * fields, so it survives the cycle as-is. */
                             player_close(&ps);
-                            ps.fullscreen = was_fs;
 
                             log_msg("Playlist nav: opening [%d/%d] %s",
-                                    saved_index + 1, saved_count,
-                                    saved_files[saved_index]);
+                                    next + 1, ps.playlist_count,
+                                    ps.playlist_files[next]);
 
-                            if (player_open(&ps, saved_files[saved_index]) == 0) {
-                                s_gain_idx = 3;
-                                ps.playlist_files = saved_files;
-                                ps.playlist_count = saved_count;
-                                ps.playlist_index = saved_index;
-                            } else {
+                            if (player_open(&ps, ps.playlist_files[next]) == 0)
+                                gain_reset(&ps);
+                            else
                                 log_msg("ERROR: Failed to open: %s",
-                                        saved_files[saved_index]);
-                                /* Restore playlist so user can try again */
-                                ps.playlist_files = saved_files;
-                                ps.playlist_count = saved_count;
-                                ps.playlist_index = saved_index;
-                            }
+                                        ps.playlist_files[next]);
+                            ps.playlist_index = next;
                         }
                     }
                     break;
@@ -865,16 +1217,8 @@ int main(int argc, char *argv[]) {
 
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT && ev.button.clicks == 2) {
-                    /* Double-click → toggle fullscreen */
-                    if (ps.playing && !ps.paused && ps.audio_stream)
-                        SDL_PauseAudioStreamDevice(ps.audio_stream);
-                    ps.fullscreen = !ps.fullscreen;
-                    SDL_SetWindowFullscreen(window,
-                        ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
-                    if (ps.playing) {
-                        if (!ps.paused && ps.audio_stream)
-                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                    }
+                    /* Double-click -> same path as F, no divergence */
+                    toggle_fullscreen(&ps, window);
                 }
 
                 /* Click on seek bar — buttons and progress track.
@@ -883,13 +1227,17 @@ int main(int argc, char *argv[]) {
                  * s = UI scale factor (1 windowed, 2 fullscreen) must
                  * match s_ui_scale in overlay.c. */
                 if (ev.button.button == SDL_BUTTON_LEFT && ps.playing
+                      && ev.button.clicks == 1   /* P2-13: the second click of a
+                                                    double-click toggles fullscreen
+                                                    above — it must not also seek
+                                                    against post-toggle geometry */
                       && ps.show_seekbar) {
                     int h_now;
                     SDL_GetWindowSizeInPixels(window, NULL, &h_now);
                     float density = SDL_GetWindowPixelDensity(window);
                     int mx = (int)(ev.button.x * density);
                     int my = (int)(ev.button.y * density);
-                    int s = ps.game_mode ? 3 : (ps.fullscreen ? 2 : 1);
+                    int s = ui_scale_for(&ps, h_now);
                     int bar_h = 30 * s;
                     int bar_y = h_now - bar_h;
 
@@ -946,11 +1294,40 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
+            case SDL_EVENT_DISPLAY_ADDED:
+            case SDL_EVENT_DISPLAY_REMOVED:
+            case SDL_EVENT_DISPLAY_ORIENTATION:
+            case SDL_EVENT_DISPLAY_MOVED:
+                /* Hotplug can leave SDL's view of the display stale — after an
+                 * unplug/replug, fullscreen silently stopped working with no
+                 * event handled and nothing logged. Log it so the next
+                 * occurrence is visible rather than mysterious. */
+                log_msg("DISPLAY EVENT: type=%u displayID=%u (mode list may be stale)",
+                        (unsigned)ev.type, (unsigned)ev.display.displayID);
+                break;
+
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+                log_msg("DISPLAY: window moved to displayID=%u", (unsigned)ev.window.data1);
+                break;
+
+            case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+                if (!ps.fullscreen)
+                    log_msg("FS-sync: compositor entered fullscreen (we thought windowed)");
+                ps.fullscreen = 1;
+                break;
+
+            case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+                if (ps.fullscreen)
+                    log_msg("FS-sync: compositor left fullscreen (we thought fullscreen)");
+                ps.fullscreen = 0;
+                break;
+
             case SDL_EVENT_WINDOW_RESIZED:
                     ps.win_w = ev.window.data1;
                     ps.win_h = ev.window.data2;
                     log_msg("SDL_EVENT_WINDOW_RESIZED: %dx%d",
                             ev.window.data1, ev.window.data2);
+                    pacing_v2_window_hint(&ps);
                 break;
 
             /* ── Gamepad hotplug ── */
@@ -990,6 +1367,7 @@ int main(int argc, char *argv[]) {
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
                                 log_msg("ERROR: Failed to open file");
                             } else {
+                                gain_reset(&ps);
                                 playlist_scan(&ps);
                             }
                         }
@@ -1029,8 +1407,13 @@ int main(int argc, char *argv[]) {
                             else
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         }
-                        if (!ps.paused)
+                        if (!ps.paused) {
                             ps.frame_timer = get_time_sec();
+                            /* Restart FPS window after the paused gap */
+                            ps.fps_window_start   = 0.0;
+                            ps.fps_window_frames  = 0;
+                            ps.rfps_window_frames = 0;
+                        }
                     }
                     break;
 
@@ -1197,12 +1580,12 @@ int main(int argc, char *argv[]) {
                         if (ps.transport_focus == 1) {
                             /* Scrubber: edge-trigger first seek, start hold timer */
                             if (new_zone == -1) {
-                                player_seek(&ps, -30.0);
+                                player_seek(&ps, -SEEK_LARGE_SEC);
                                 ps.transport_seek_dir = -1;
                                 ps.transport_seek_start = get_time_sec();
                                 ps.transport_seek_last = ps.transport_seek_start;
                             } else if (new_zone == 1) {
-                                player_seek(&ps, 30.0);
+                                player_seek(&ps, SEEK_LARGE_SEC);
                                 ps.transport_seek_dir = 1;
                                 ps.transport_seek_start = get_time_sec();
                                 ps.transport_seek_last = ps.transport_seek_start;
@@ -1279,7 +1662,7 @@ int main(int argc, char *argv[]) {
             double tnow = get_time_sec();
             double held = tnow - ps.transport_seek_start;
             if (held >= 0.40 && tnow - ps.transport_seek_last >= 0.20) {
-                double amount = 30.0 + 15.0 * held;
+                double amount = SEEK_LARGE_SEC + 15.0 * held;
                 if (amount > 180.0) amount = 180.0;
                 player_seek(&ps, ps.transport_seek_dir * amount);
                 ps.transport_seek_last = tnow;
@@ -1357,10 +1740,36 @@ int main(int argc, char *argv[]) {
              * video_reblit() re-draws the last frame without uploading. */
             double now = get_time_sec();
             int new_frame = 0;
+            int frame_dropped = 0;   /* consumed but NOT displayed */
+
+            /* v2: smoothed wall↔playback-clock offset — the scheduler's
+             * time base (never raw audio_clock_sync samples: callback
+             * granularity and the buffered_sec estimate would smear the
+             * schedule). EMA α=0.02/tick ≈ 1s; a jump > 250ms is a
+             * discontinuity (seek, pause, stall-resume clock snap) and
+             * re-anchors hard. Video-only anchors once at the current
+             * frame and never chases — wall clock = tempo fidelity. */
+            if (!ps.paused && !ps.seek_recovering
+                    && !ps.audio_stalled) {
+                if (ps.audio_stream_idx >= 0) {
+                    double off = now - ps.audio_clock_sync;
+                    if (!ps.sched_off_valid
+                            || fabs(off - ps.sched_off) > 0.25) {
+                        ps.sched_off = off;
+                        ps.sched_off_valid = 1;
+                    } else {
+                        ps.sched_off += 0.02 * (off - ps.sched_off);
+                    }
+                } else if (!ps.sched_off_valid && ps.video_ready
+                           && ps.video_clock > 0.0) {
+                    ps.sched_off = now - ps.video_clock;
+                    ps.sched_off_valid = 1;
+                }
+            }
 
             /* ── Consume decoded frame from decode thread ──
              *
-             * The decode thread runs video_decode_frame() asynchronously
+             * The decode thread decodes frames asynchronously
              * and writes one frame into ps.decoded_frame.  The main loop
              * consumes it here when frame_timer permits, then signals
              * the decode thread to decode the next frame.
@@ -1371,13 +1780,36 @@ int main(int argc, char *argv[]) {
              * This eliminates the 22-37ms VAAPI decode stall that was
              * blocking reblits and causing visible judder. */
 
-            int is_1to1 = (ps.frame_last_delay > 0.001
-                           && ps.frame_last_delay < 0.020);
+            int is_1to1 = (ps.pace_mode == PACE_LOCKED);
 
             SDL_LockMutex(ps.decode_mutex);
             int frame_avail = ps.decode_frame_ready;
 
-            if (frame_avail && now >= ps.frame_timer) {
+            /* Consume gate. v2 SCHEDULED: a frame is admitted when its
+             * scheduled slot arrives — now ≥ t_ideal − slot/2, with
+             * t_ideal = pts + sched_off − modeled latency. An early
+             * frame leaves the handoff full (decode backpressure, as
+             * v1) and the tick reblits: that IS the repeat pattern
+             * (2:3 for 24p; one repeat per ~17s for 59.94-on-60.00).
+             * Everything else (LOCKED, seek recovery, stalled audio,
+             * unanchored clock) gates on frame_timer. */
+            int consume_ok;
+            if (ps.pace_mode == PACE_SCHEDULED
+                    && ps.sched_off_valid && !ps.seek_recovering
+                    && !ps.audio_stalled) {
+                double slot = (ps.pace_median > 0.0)
+                              ? ps.pace_median : ps.frame_last_delay;
+                if (slot <= 0.0 || slot > 0.1)
+                    slot = 1.0 / 60.0;
+                consume_ok = (now >= ps.decoded_pts + ps.sched_off
+                                     - ps.av_bias - slot * 0.5);
+                if (frame_avail && !consume_ok)
+                    ps.sched_chain = 0;   /* next frame is early — no chase */
+            } else {
+                consume_ok = (now >= ps.frame_timer);
+            }
+
+            if (frame_avail && consume_ok) {
                 /* ── Move decoded frame → video_frame ── */
                 av_frame_unref(ps.video_frame);
                 av_frame_move_ref(ps.video_frame, ps.decoded_frame);
@@ -1398,44 +1830,61 @@ int main(int argc, char *argv[]) {
                 /* A/V sync adjustment */
                 double delay = pts_delay;
                 double av_diff = 0.0;
-                double av_diff_c = 0.0;
                 int one_to_one = 0;
                 if (ps.audio_stream_idx >= 0) {
                     av_diff = ps.video_clock - ps.audio_clock_sync;
 
-                    /* Adaptive bias correction: EMA of av_diff
-                     * absorbs systematic OS audio pipeline latency.
-                     * Only the catch-up (negative) branch uses the
-                     * corrected value — the slow-down (positive)
-                     * branch uses raw av_diff to avoid overcorrection. */
-                    if (!ps.seek_recovering) {
+                    /* Latency model: EMA of av_diff absorbs
+                     * systematic OS/device audio pipeline latency.
+                     * v2 SCHEDULED: bias FROZEN. The scheduler pins
+                     * av_diff onto the schedule (which subtracts the
+                     * bias), so feeding the EMA here would be the
+                     * controller measuring itself — the bias-
+                     * absorption blind spot from the batch-2 field
+                     * notes. LOCKED lets av_diff float free and
+                     * learns the latency honestly; the scheduler
+                     * consumes what LOCKED learned. */
+                    if (!ps.seek_recovering && !ps.audio_stalled
+                            && ps.pace_mode == PACE_LOCKED) {
                         ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
                         ps.av_bias_samples++;
                     }
-                    av_diff_c = av_diff;
-                    if (ps.av_bias_samples >= 60) {
-                        double bias = ps.av_bias;
-                        if (bias < -0.200) bias = -0.200;
-                        if (bias >  0.200) bias =  0.200;
-                        av_diff_c = av_diff - bias;
+                    ps.last_av_diff = av_diff;
+
+                    /* v2 LOCKED EXIT CONTRACT (the entry contract's
+                     * mirror): drift beyond the modeled bias by more
+                     * than one frame, sustained ~10 displayed frames
+                     * → hand back to SCHEDULED to repay. Wrong LOCKED
+                     * entries self-heal for the cost of a couple of
+                     * repeats; the warm reseek stays a deep-fault
+                     * backstop. Evaluated before one_to_one below so
+                     * an exit takes effect the same tick. */
+                    if (ps.pace_mode == PACE_LOCKED
+                            && !ps.seek_recovering) {
+                        if (fabs(av_diff - ps.pace_bias_ref) > pts_delay) {
+                            if (++ps.pace_drift_streak >= 10) {
+                                ps.pace_mode = PACE_SCHEDULED;
+                                ps.pace_drift_streak = 0;
+                                ps.pace_enter_streak = 0;
+                                ps.pace_exit_streak  = 0;
+                                log_msg("PACE: -> SCHEDULED (drift "
+                                        "exit: A/V %.1fms vs ref "
+                                        "%.1fms)",
+                                        av_diff * 1000.0,
+                                        ps.pace_bias_ref * 1000.0);
+                            }
+                        } else {
+                            ps.pace_drift_streak = 0;
+                        }
                     }
 
-                    /* 1:1 VSync pacing: when content frame rate
-                     * matches display refresh (~50-60fps), VSync
-                     * alone provides the pacing heartbeat. Frame drops
-                     * are disabled — the warm-reset (audio reopen + seek)
-                     * fixes cold-start drift at 60fps. */
-                    one_to_one = (pts_delay > 0.001
-                                  && pts_delay < 0.020);
+                    /* LOCKED = 1:1 vsync-slaved: drops disabled,
+                     * vsync is the pacing heartbeat; the mode machine
+                     * (entry/exit contracts, cadence sensor) decides
+                     * when that trust is warranted. */
+                    one_to_one = (ps.pace_mode == PACE_LOCKED);
 
-                    double threshold = fmax(pts_delay, 0.01);
-                    if (!one_to_one) {
-                        if (av_diff > threshold) {
-                            delay = pts_delay + av_diff;
-                        } else if (av_diff_c < -threshold) {
-                            delay = 0.0;
-                        }
-                    } else if (ps.av_bias_samples >= 120) {
+                    if (one_to_one && ps.av_bias_samples >= 120) {
                         /* Micro-correction: nudge frame_timer toward
                          * audio clock without triggering oscillation */
                         double bias = ps.av_bias;
@@ -1444,11 +1893,84 @@ int main(int argc, char *argv[]) {
                         delay = pts_delay + bias * 0.02;
                     }
 
-                    if (!ps.seek_recovering &&
-                            fabs(av_diff) > fabs(ps.diag_max_av_drift))
+                    /* Warmup guard: until the bias converges the raw diff still
+                     * carries the seek transient, which is how a 4467ms "Peak
+                     * A/V drift" got recorded for what was really a 5s seek.
+                     * Under v2 SCHEDULED the bias is frozen and samples never
+                     * accrue — an anchored scheduler clock is the equivalent
+                     * warmed-up state (field: peak= stuck at 0.0 all run). */
+                    if (!ps.seek_recovering
+                            && (ps.av_bias_samples >= 60
+                                || ps.sched_off_valid)
+                            && fabs(av_diff) > fabs(ps.diag_max_av_drift))
                         ps.diag_max_av_drift = av_diff;
                 }
 
+                if (ps.pace_mode == PACE_SCHEDULED
+                        && !ps.audio_stalled) {
+                    /* ── SCHEDULED (batch 3): slot-assignment
+                     * scheduler. The consume gate admitted this frame
+                     * because its scheduled slot arrived. Show it
+                     * unless it is LATE by more than half a slot —
+                     * then its slot has already passed and the
+                     * nearest-slot assignment belongs to a later
+                     * frame: consume WITHOUT presenting (the b4265e7
+                     * actuator) and chain straight to the next frame.
+                     * Structural drops fall out of the assignment
+                     * (evenly spaced, ~1 per R frames); repeats fall
+                     * out of the reblit path when nothing is due. No
+                     * thresholds, no rate limiter, no deep-burn
+                     * special case. frame_timer is bookkeeping only:
+                     * pinned to `now` so a LOCKED handover inherits a
+                     * fresh timer and the v1 snap-forward stays
+                     * silent. */
+                    ps.frame_timer = now;
+                    new_frame = 1;
+                    if (ps.sched_off_valid && !ps.seek_recovering) {
+                        double late = now - (ps.video_clock
+                                             + ps.sched_off
+                                             - ps.av_bias);
+                        if (ps.audio_stream_idx < 0
+                                && fabs(late) > 0.25) {
+                            /* Video-only re-anchor (design decision —
+                             * tempo fidelity): nothing to catch up TO
+                             * after a discontinuity; resume exact
+                             * tempo from here. */
+                            ps.sched_off = now - ps.video_clock;
+                            late = 0.0;
+                        }
+                        /* Drop test compares against the CONTENT
+                         * period, not the slot: dropping is only
+                         * right when the NEXT frame is nearer to this
+                         * slot than the current one (late >
+                         * pts_delay/2). Half-a-SLOT was wrong for
+                         * content slower than the display — 24p
+                         * due-times sweep the tick grid (41.7ms =
+                         * 2.5 slots), so frames landed ~8ms late from
+                         * pure tick quantization and were dropped for
+                         * zero benefit: nothing newer existed to show
+                         * for another 41.7ms (field: 14% drops,
+                         * judder). For content at/above slot rate
+                         * pts_delay ≈ slot and behavior is unchanged
+                         * (structural drops, backlog burns). */
+                        if (late > pts_delay * 0.5) {
+                            new_frame = 0;
+                            frame_dropped = 1;
+                            ps.sched_chain = 1;
+                            ps.sched_chain_start = now;
+                            ps.diag_frames_dropped++;
+                            log_msg("DIAG: frame dropped at %.3fs "
+                                    "(sched late %.1fms)",
+                                    ps.video_clock, late * 1000.0);
+                        } else {
+                            ps.sched_chain = 0;
+                        }
+                    }
+                } else {
+                /* LOCKED / fallback consume body: frame_timer paces at
+                 * content cadence (vsync is the clock in LOCKED; the
+                 * brief seek-recovery and audio-stall windows pace the
+                 * same way until their handlers re-sync). */
                 /* Minimum delay floor */
                 double min_delay = ps.frame_last_delay * 0.5;
                 if (delay < min_delay)
@@ -1465,42 +1987,125 @@ int main(int argc, char *argv[]) {
                 if (ps.frame_timer > now + 0.1)
                     ps.frame_timer = now + 0.1;
 
-                /* Drop frame if video is genuinely behind audio.
-                 *
-                 * At 1:1 (content fps ≈ display refresh), drops are
-                 * DISABLED. VSync provides the pacing heartbeat and
-                 * the snap-forward handles genuine stalls. The raw
-                 * av_diff at 1:1 includes a fixed pipeline offset
-                 * (decode latency + OS audio buffering) that isn't
-                 * growing drift — the decoder IS keeping up. Dropping
-                 * on that offset replaces smooth 60fps video with a
-                 * frozen frame, which is far worse than the offset.
-                 *
-                 * For non-1:1 content (e.g. 24fps on 60Hz), the
-                 * accumulator-based timing needs active correction,
-                 * so bias-corrected drops still apply at -50ms. */
-                if (!one_to_one && ps.audio_stream_idx >= 0
-                        && !ps.seek_recovering) {
-                    double drop_diff = (ps.av_bias_samples >= 60)
-                                       ? av_diff_c : av_diff;
-                    if (drop_diff < -0.05) {
-                        new_frame = 0;
-                        ps.diag_frames_dropped++;
-                        log_msg("DIAG: frame dropped at %.3fs "
-                                "(A/V drift: %.1fms)",
-                                ps.video_clock, av_diff * 1000.0);
+                }   /* end LOCKED/fallback consume body */
+
+                /* 1:1 drift resync — the warm-reset, generalized.
+                 * At 1:1, drops are disabled and the decode gate
+                 * (mc=1) caps consumption at exactly content rate, so
+                 * once video falls behind audio (compositor stall
+                 * after a fullscreen toggle) NOTHING can ever catch
+                 * up — the deficit is permanent, and the av_bias EMA
+                 * slowly absorbs it and hides it from the corrected
+                 * metric (field log: bias -4.4s). Detect sustained
+                 * genuine drift on the RAW diff — 0.5s is far above
+                 * any legitimate pipeline offset — and reseek to the
+                 * audio clock, the same warm-reset that fixes
+                 * cold-start drift. 90 CONSUMED ticks (drops count):
+                 * ≈1.5s at 1:1 display cadence, but a slot-free drop
+                 * burst can run the counter in well under a second —
+                 * in N:1 this is a deep-fault backstop, not a timed
+                 * grace period. Runs in every pacing mode. */
+                /* v2: the backstop threshold is bias-relative and
+                 * scaled in frame periods (a fixed −0.5s missed the
+                 * −0.2s stranding class), referenced to the LOCKED
+                 * snapshot when in LOCKED. Floor at −0.2s so a noisy
+                 * reference can never hair-trigger a reseek. Counted
+                 * on DISPLAYED frames under v2 so the ~1.5s grace is
+                 * wall-time-true (drops counted it down in <1s). */
+                double resync_ref = (ps.pace_mode == PACE_LOCKED)
+                                    ? ps.pace_bias_ref : ps.av_bias;
+                double resync_thresh = resync_ref - 10.0 * pts_delay;
+                if (resync_thresh > -0.2)
+                    resync_thresh = -0.2;
+                if (ps.audio_stream_idx >= 0
+                        && !ps.seek_recovering && av_diff < resync_thresh) {
+                    if (new_frame
+                            && ++ps.drift_resync_ticks >= 90) {
+                        ps.drift_resync_ticks = 0;
+                        log_msg("DIAG: drift resync — video %.2fs "
+                                "behind audio, warm reseek",
+                                -av_diff);
+                        double pos = ps.audio_clock_sync;
+                        if (pos < 0.1) pos = 0.1;
+                        ps.seek_target  = (int64_t)(pos * AV_TIME_BASE);
+                        ps.seek_flags   = AVSEEK_FLAG_BACKWARD;
+                        ps.seek_request = 1;
                     }
+                } else {
+                    ps.drift_resync_ticks = 0;
                 }
+
             } else {
                 SDL_UnlockMutex(ps.decode_mutex);
 
+                /* v2 SCHEDULED drop-chain: after a drop the next frame
+                 * is ~0.3ms away in the decode thread. Reblitting now
+                 * would spend a full display slot per dropped frame,
+                 * and a backlog could never burn faster than the slot
+                 * rate (the review-F3 arithmetic). Yield 1ms and
+                 * re-poll instead; the safety timeout hands back to
+                 * reblits if decode has genuinely stalled. */
+                if (ps.pace_mode == PACE_SCHEDULED
+                        && ps.sched_chain) {
+                    if (now - ps.sched_chain_start > 0.05)
+                        ps.sched_chain = 0;
+                    else
+                        SDL_Delay(1);
+                }
+
                 /* I/O error (stale NFS, network loss) — close and return to browser */
                 if (ps.io_error) {
+                    /* Unsupported-VAAPI-profile abort (P2-17): retry
+                     * the same file in software decode instead of
+                     * dumping the user to the browser. get_format set
+                     * the flag; the hard-error streak escalated here. */
+                    if (ps.vaapi_unsupported && !ps.force_swdec
+                            && ps.filepath[0]) {
+                        char retry_path[sizeof(ps.filepath)];
+                        snprintf(retry_path, sizeof(retry_path), "%s",
+                                 ps.filepath);
+                        log_msg("VAAPI: profile unsupported — reopening "
+                                "in software decode");
+                        player_close(&ps);
+                        ps.quit = 0;
+                        ps.force_swdec = 1;
+                        int ok = (player_open(&ps, retry_path) == 0);
+                        ps.force_swdec = 0;
+                        if (ok) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "Software decode (profile unsupported "
+                                     "by hardware)");
+                            ps.aud_osd_until = get_time_sec() + 3.0;
+                            continue;
+                        }
+                        /* retry failed — fall through to the browser */
+                    }
                     log_msg("I/O error detected — closing playback, returning to browser");
                     player_close(&ps);
                     ps.browser_active = 1;
                     ps.quit = 0;
                     continue;
+                }
+
+                /* Self-heal the audio-disable unwind race: demux routes
+                 * packets by stream index with no lock, so one in-flight
+                 * pq_put can land AFTER audio_disable's flush. With
+                 * audio off nothing drains the queue, and a single
+                 * stray packet blocked the EOF gate below forever —
+                 * auto-play-next never fired after an audio failure. */
+                if (ps.audio_stream_idx < 0 && ps.audio_pq.nb_packets > 0)
+                    pq_flush(&ps.audio_pq);
+
+                /* Stall-pause raced EOF (P2-10 edge): the watchdog can
+                 * fire just before decode_eof lands, and stall-resume
+                 * needs a new video frame that will never come — the
+                 * paused stream then holds the audio tail in the queue
+                 * and the gate below never passes. Unstick here. */
+                if (ps.eof && ps.decode_eof && ps.audio_stalled) {
+                    if (ps.audio_stream && !ps.paused)
+                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    ps.audio_stalled = 0;
+                    log_msg("DIAG: audio resumed at EOF (tail drain)");
                 }
 
                 /* EOF detection: decode thread drained, no packets left */
@@ -1513,31 +2118,22 @@ int main(int argc, char *argv[]) {
                     if (ps.playlist_count > 0 && ps.playlist_index >= 0
                             && ps.playlist_index + 1 < ps.playlist_count) {
                         int next = ps.playlist_index + 1;
-                        char **saved_files = ps.playlist_files;
-                        int saved_count = ps.playlist_count;
-                        ps.playlist_files = NULL;
-                        ps.playlist_count = 0;
-
-                        int was_fs = ps.fullscreen;
+                        /* Playlist fields survive close/open untouched
+                         * (owned here, not by player.c). */
                         player_close(&ps);
-                        ps.fullscreen = was_fs;
 
                         log_msg("Auto-play next: [%d/%d] %s",
-                                next + 1, saved_count,
-                                saved_files[next]);
+                                next + 1, ps.playlist_count,
+                                ps.playlist_files[next]);
 
-                        if (player_open(&ps, saved_files[next]) == 0) {
-                            ps.playlist_files = saved_files;
-                            ps.playlist_count = saved_count;
-                            ps.playlist_index = next;
+                        if (player_open(&ps, ps.playlist_files[next]) == 0) {
+                            gain_reset(&ps);
                             auto_played = 1;
                         } else {
                             log_msg("ERROR: Auto-play failed: %s",
-                                    saved_files[next]);
-                            ps.playlist_files = saved_files;
-                            ps.playlist_count = saved_count;
-                            ps.playlist_index = next;
+                                    ps.playlist_files[next]);
                         }
+                        ps.playlist_index = next;
                     }
 
                     if (!auto_played) {
@@ -1581,7 +2177,9 @@ int main(int argc, char *argv[]) {
             if (new_frame) {
                 video_display(&ps);
                 ps.diag_frames_displayed++;
+                ps.fps_window_frames++;   /* real-time FPS: content frame */
                 ps.last_frame_wall = now;
+                pacing_v2_present_tick(&ps, now);
 
                 /* Resume from seek: first displayed frame post-seek.
                  *
@@ -1604,8 +2202,9 @@ int main(int argc, char *argv[]) {
                     ps.audio_clock      = ps.video_clock;
                     ps.audio_clock_sync = ps.video_clock;
                     ps.audio_pts_floor  = ps.video_clock;
-                    ps.av_bias          = 0.0;
-                    ps.av_bias_samples  = 0;
+                    /* Bias deliberately preserved across seeks — see the note
+                     * in player.c's seek handler. The clocks above are what
+                     * needed re-syncing; the measured output latency did not. */
                     ps.frame_last_pts   = ps.video_clock;
 
                     /* Flush stale audio and resume */
@@ -1621,15 +2220,23 @@ int main(int argc, char *argv[]) {
 
                 /* Resume from stall: video is flowing again */
                 if (ps.audio_stalled) {
-                    SDL_ClearAudioStream(ps.audio_stream);
-                    ps.audio_clock      = ps.video_clock;
-                    ps.audio_clock_sync = ps.video_clock;
-                    ps.av_bias          = 0.0;
-                    ps.av_bias_samples  = 0;
-                    ps.frame_timer      = get_time_sec();
+                    if (ps.audio_stream) {
+                        SDL_ClearAudioStream(ps.audio_stream);
+                        ps.audio_clock      = ps.video_clock;
+                        ps.audio_clock_sync = ps.video_clock;
+                        ps.av_bias          = 0.0;
+                        ps.av_bias_samples  = 0;
+                        ps.frame_timer      = get_time_sec();
 
-                    if (!ps.paused)
-                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                        if (!ps.paused)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    } else if (ps.bitstream_active) {
+                        /* Passthrough: the feeder was gated by
+                         * audio_stalled; a seek-style reset drops the
+                         * stale ring and re-zeroes its clock (P2-11). */
+                        ps.frame_timer = get_time_sec();
+                        ps.bitstream_seek_pending = 1;
+                    }
 
                     ps.audio_stalled = 0;
                     log_msg("DIAG: audio resumed after stall "
@@ -1643,14 +2250,42 @@ int main(int argc, char *argv[]) {
              * or on complex GOPs — audio must not run free during that. */
             if (ps.playing && !ps.paused && !ps.seek_recovering
                     && !ps.audio_stalled && ps.audio_stream_idx >= 0
+                    && !(ps.eof && ps.decode_eof)
                     && ps.last_frame_wall > 0.0
                     && now - ps.last_frame_wall > 0.2) {
-                SDL_PauseAudioStreamDevice(ps.audio_stream);
+                /* eof exemption (P2-10): once video has fully ended,
+                 * missing frames are not a stall — pausing here froze
+                 * the audio tail in the queue and the EOF gate above
+                 * (audio_pq empty) could never pass, killing
+                 * auto-play-next on audio-tail files.
+                 * Passthrough (P2-11): audio_stream is NULL — the
+                 * pause below was a no-op and bitstream audio ran
+                 * free through stalls. The feeder now gates on
+                 * audio_stalled directly (bounded by ring depth). */
+                if (ps.audio_stream)
+                    SDL_PauseAudioStreamDevice(ps.audio_stream);
                 ps.audio_stalled = 1;
                 log_msg("DIAG: audio paused — video stall detected "
                         "(%.0fms gap at %.3fs)",
                         (now - ps.last_frame_wall) * 1000.0,
                         ps.video_clock);
+            }
+
+            /* ── Passthrough backend death → PCM fallback (P1-4) ──
+             * The feeder exits and raises this flag when the PipeWire
+             * stream errors post-open (undock / HDMI unplug). Finish
+             * the fallback here on the main thread: the charter says
+             * audio degrades to PCM, never to silence. */
+            if (ps.bitstream_failed) {
+                ps.bitstream_failed = 0;
+                log_msg("Bitstream: backend failed — falling back to PCM decode");
+                bitstream_stop(&ps);
+                audio_open(&ps);
+                if (ps.audio_stream && !ps.paused)
+                    SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                         "Passthrough lost — PCM decode");
+                ps.aud_osd_until = get_time_sec() + 3.0;
             }
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
@@ -1659,7 +2294,7 @@ int main(int argc, char *argv[]) {
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
                         "dropped=%d snaps=%d "
                         "A/V=%.1fms peak=%.1fms bias=%.1fms "
-                        "pacing=%s",
+                        "pacing=%s tick=%.1fms",
                         ps.video_clock,
                         ps.diag_frames_decoded,
                         ps.diag_frames_displayed,
@@ -1668,7 +2303,22 @@ int main(int argc, char *argv[]) {
                         av_now * 1000.0,
                         ps.diag_max_av_drift * 1000.0,
                         ps.av_bias * 1000.0,
-                        is_1to1 ? "1:1(mc=1)" : "N:1(mc=4)");
+                        ps.pace_mode == PACE_LOCKED
+                            ? "LOCKED" : "SCHEDULED",
+                        ps.pace_median * 1000.0);
+
+                /* One-shot wire-truth capture: once per file, at the
+                 * first periodic report with HDR passthrough active —
+                 * KWin needs a couple of seconds after engage to
+                 * program the connector, and by the first 10s report
+                 * it has long settled. Logs the ACTUAL infoframe the
+                 * kernel is sending (HDRWIRE: lines) so every HDR
+                 * session carries its own metadata ground truth. */
+                if (!ps.hdrwire_logged
+                        && ps.gpu_uniforms.hdr_pass > 0.5f) {
+                    hdrwire_log_state();
+                    ps.hdrwire_logged = 1;
+                }
 #ifdef DSVP_PROFILE
                 if (ps.prof_n > 0) {
                     log_msg("PROF: [%.0fs] n=%d  "
@@ -1699,9 +2349,46 @@ int main(int argc, char *argv[]) {
                 ps.diag_last_report = now;
             }
 
-            /* Re-blit on ticks with no new frame (GPU double-buffering) */
-            if (!new_frame && ps.playing && ps.gpu_tex_y && ps.video_ready) {
+            /* Re-blit on ticks with no new frame (GPU double-buffering).
+             *
+             * NOT after a drop: a reblit blocks a full vsync slot
+             * re-showing the OLD frame, so a drop that reblits costs
+             * exactly what a display costs — video can never advance
+             * faster than the slot rate, and in windowed (~57 slots/s
+             * for 60fps content) catch-up was mathematically
+             * impossible: drift pinned at the deep-drop threshold and
+             * the audio stall-pause did the "recovery" (the storm).
+             * Skipping the present lets the loop consume the next
+             * frame immediately — the screen keeps the last presented
+             * image, and a 250ms backlog burns in ~15 slot-free drops
+             * (~15ms), invisible. This is what makes drops actually
+             * DROP. */
+            if (!new_frame && !frame_dropped && !ps.sched_chain
+                    && ps.playing && ps.gpu_tex_y && ps.video_ready) {
                 video_reblit(&ps);
+                pacing_v2_present_tick(&ps, now);
+            }
+
+            /* ── Real-time FPS measurement (debug overlay) ──
+             * One present per playing tick (video_display or video_reblit)
+             * EXCEPT drop ticks, which present nothing and must not
+             * count as renders. Roll a 0.5s window: long enough to be
+             * stable, short enough to track seeks and stalls. Guarded
+             * on ps.playing — if the EOF branch closed playback this
+             * tick, no video present happened. */
+            if (ps.playing) {
+                if (!frame_dropped)
+                    ps.rfps_window_frames++;
+                if (ps.fps_window_start <= 0.0)
+                    ps.fps_window_start = now;
+                double fps_dt = now - ps.fps_window_start;
+                if (fps_dt >= 0.5) {
+                    ps.fps_content = ps.fps_window_frames  / fps_dt;
+                    ps.fps_render  = ps.rfps_window_frames / fps_dt;
+                    ps.fps_window_frames  = 0;
+                    ps.rfps_window_frames = 0;
+                    ps.fps_window_start   = now;
+                }
             }
 
             /* If playback ended this tick (player_close was called in the
@@ -1730,14 +2417,53 @@ int main(int argc, char *argv[]) {
             SDL_ShowCursor();
         }
 
-        /* Don't burn CPU when idle or paused */
-        if (!ps.playing || ps.paused) {
+        /* ── PRESENT-RATE DIAG (opt-in: DSVP_DIAG=1) ──
+         * Nearly every loop iteration submits one frame (display, reblit,
+         * or draw_idle), so iteration rate is present rate. This is what
+         * proved the KWin VRR-floor blanking below, and it is the first
+         * thing worth having again if presentation ever misbehaves — so
+         * it stays in the tree, off by default rather than deleted.
+         * "ret2browser" is the return-to-browser latch, not an active
+         * browser: it stays 1 through playback by design. */
+        if (s_diag) {
+            double pr_now = get_time_sec();
+            pr_n++;
+            if (pr_t0 <= 0.0) pr_t0 = pr_now;
+            if (pr_now - pr_t0 >= 1.0) {
+                log_msg("PRESENT DIAG: %.0f presents/s (playing=%d paused=%d ret2browser=%d fs=%d)",
+                        pr_n / (pr_now - pr_t0), ps.playing, ps.paused,
+                        ps.browser_active, ps.fullscreen);
+                pr_n = 0;
+                pr_t0 = pr_now;
+            }
+        }
+
+        /* Don't burn CPU when idle or paused — EXCEPT in fullscreen.
+         * KWin engages adaptive sync (VRR "Automatic") for fullscreen
+         * surfaces as of Plasma 6.4 (SteamOS 3.8.24). This delay plus
+         * the VSync block in swapchain acquire throttles paused/browser
+         * presents to ~30/s — below an OLED TV's VRR floor (~40Hz on
+         * the LG C4, dock DP-1) — and the panel blanks until the rate
+         * recovers. In fullscreen, skip the delay: VSync alone paces
+         * the loop at refresh rate and the acquire blocks, so CPU cost
+         * stays negligible. Windowed keeps the throttle (compositor
+         * retains the last buffer there, and it never blanked). */
+        if ((!ps.playing || ps.paused) && !ps.fullscreen) {
             SDL_Delay(16); /* ~60fps idle */
         }
     }
 
     /* ── Cleanup ── */
     log_msg("Shutting down");
+    /* Never leave the display in HDR after we exit — player_close
+     * covers normal file close; this covers every app-exit path. */
+    hdr_output_shutdown(&ps);
+    /* An async audio-track switch still in flight reads &ps, which is main's
+     * stack — join it before that stack frame goes away. */
+    if (ps.audio_switch_thread) {
+        SDL_WaitThread(ps.audio_switch_thread, NULL);
+        ps.audio_switch_thread = NULL;
+    }
     if (ps.playing) player_close(&ps);
     if (ps.gamepad) SDL_CloseGamepad(ps.gamepad);
     browser_free_entries(&ps);
