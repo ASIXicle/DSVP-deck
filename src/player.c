@@ -23,6 +23,12 @@
 
 #include "dsvp.h"
 
+#include <sys/wait.h>   /* waitpid */
+#include <spawn.h>      /* posix_spawnp */
+#include <fcntl.h>      /* O_WRONLY */
+#include <signal.h>     /* kill(pid, 0) — stamp liveness probe */
+#include <unistd.h>     /* getpid */
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * Blue Noise Dither Texture (64×64, void-and-cluster algorithm)
@@ -159,6 +165,33 @@ static const char hlsl_yuv_planar_frag[] =
     "SamplerState sampU : register(s1, space2);\n"
     "SamplerState sampV : register(s2, space2);\n"
     "SamplerState sampNoise : register(s3, space2);\n"
+    "#if DSVP_PQ_LUT\n"
+    "/* SDR-in-PQ encode LUTs (REVIEW-PERF §3 design, re-corrected): the\n"
+    " * 9-pow/pixel encode chain measured as the whole 60fps drop cost\n"
+    " * (DSVP_PQ_NOMATH discriminator, 2026-08-20). BOTH LUTs live in\n"
+    " * sqrt-ish domains: texLutLin stores x^1.2 (squared here to get\n"
+    " * x^2.4) because an R16-stored straight x^2.4 quantises shadows\n"
+    " * to ~1.5e-5 steps that PQ's near-black slope amplifies to 5-17\n"
+    " * ten-bit codes (simulated); this shape keeps the whole chain\n"
+    " * under 0.4 codes at any nits, below the dither floor. texLutPq\n"
+    " * is the PQ OETF indexed by sqrt(linear); the out_pq nits scale\n"
+    " * is BAKED IN at build time. saturate() clamps filter overshoot\n"
+    " * the pow path propagated — eye-test note in the review doc. */\n"
+    "Texture2D<float> texLutLin : register(t4, space2);\n"
+    "Texture2D<float> texLutPq : register(t5, space2);\n"
+    "SamplerState sampLutLin : register(s4, space2);\n"
+    "SamplerState sampLutPq : register(s5, space2);\n"
+    "float lut_coord(float x) { return x * (1023.0/1024.0) + (0.5/1024.0); }\n"
+    "float lut_lin(float x) {\n"
+    "    float t = texLutLin.SampleLevel(sampLutLin,\n"
+    "        float2(lut_coord(saturate(x)), 0.5), 0);\n"
+    "    return t * t;  /* stored x^1.2 -> x^2.4 */\n"
+    "}\n"
+    "float lut_pq(float y) {\n"
+    "    return texLutPq.SampleLevel(sampLutPq,\n"
+    "        float2(lut_coord(sqrt(saturate(y))), 0.5), 0);\n"
+    "}\n"
+    "#endif\n"
     "\n"
     "cbuffer Params : register(b0, space3) {\n"
     "    row_major float4x4 colorMatrix;\n"
@@ -179,7 +212,8 @@ static const char hlsl_yuv_planar_frag[] =
     "    float out_gamma;\n"
     "    float is_hlg;\n"
     "    float hdr_pass;\n"
-    "    float2 _pad1;\n"
+    "    float out_gamut;\n"
+    "    float out_pq;\n"
     "    float4 dovi_num_pieces;\n"
     "    float4 dovi_pivots[9];\n"
     "    float4 dovi_c0[8];\n"
@@ -208,7 +242,17 @@ static const char hlsl_yuv_planar_frag[] =
     "\n"
     "float sample_lanczos(Texture2D<float> tex, SamplerState samp,\n"
     "                     float2 uv, float2 tex_size) {\n"
-    "#if DSVP_DILATE\n"
+    "#if DSVP_DIRECT\n"
+    "    /* Exact-1:1 variant: viewport == source, so pixel centers sit\n"
+    "     * on texel centers and the whole Lanczos kernel collapses to\n"
+    "     * the identity — one fetch replaces 16. Only ever BOUND when\n"
+    "     * the selection site measures an exact match; upscale and\n"
+    "     * downscale keep their kernels. Chroma is NOT direct: its 2x\n"
+    "     * upsample keeps the full Catmull-Rom kernel — bilinear chroma\n"
+    "     * was rejected on sight-unseen principle (Holden 2026-08-20);\n"
+    "     * the picture is bit-identical to the fixed path. */\n"
+    "    return tex.SampleLevel(samp, uv, 0).r;\n"
+    "#elif DSVP_DILATE\n"
     "    /* Downscale dilation: when one output pixel spans df > 1 source\n"
     "     * texels, a fixed 4-tap kernel undersamples high frequencies and\n"
     "     * aliases (moire on 4K content in a small window / the internal\n"
@@ -259,10 +303,30 @@ static const char hlsl_yuv_planar_frag[] =
     "    float tap_min = 1e9;\n"
     "    float tap_max = -1e9;\n"
     "\n"
+    "#if DSVP_SCALE2X\n"
+    "    /* Exact 2.0x upscale: output phases per axis are only 0.25\n"
+    "     * and 0.75, so the Lanczos-2 weights are two constant vectors\n"
+    "     * (one the mirror of the other). Same 16 taps, same anti-ring,\n"
+    "     * same wsum normalisation — identical arithmetic, minus the\n"
+    "     * ~16 sin() per pixel the general path burns recomputing\n"
+    "     * these constants 8.3M times a frame. */\n"
+    "    const float4 W25 = float4(-0.084724804, 0.877354071,\n"
+    "                              0.235346678, -0.017905185);\n"
+    "    float4 wxv = (f.x < 0.5) ? W25 : W25.wzyx;\n"
+    "    float4 wyv = (f.y < 0.5) ? W25 : W25.wzyx;\n"
+    "#endif\n"
     "    [unroll] for (int j = -1; j <= 2; j++) {\n"
+    "#if DSVP_SCALE2X\n"
+    "        float wy = wyv[j + 1];\n"
+    "#else\n"
     "        float wy = lanczos2(float(j) - f.y);\n"
+    "#endif\n"
     "        [unroll] for (int i = -1; i <= 2; i++) {\n"
+    "#if DSVP_SCALE2X\n"
+    "            float wx = wxv[i + 1];\n"
+    "#else\n"
     "            float wx = lanczos2(float(i) - f.x);\n"
+    "#endif\n"
     "            float w  = wx * wy;\n"
     "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
     "                        / tex_size;\n"
@@ -275,11 +339,18 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "#endif\n"
     "\n"
+    "#if !DSVP_DIRECT\n"
+    "    /* Shared tail of the kernel branches — the DIRECT build\n"
+    "     * returned above and declares none of these (leaving it\n"
+    "     * unguarded was the shared-source trap: undeclared wsum et\n"
+    "     * al. failed the whole compile and the WARN fell back to\n"
+    "     * fixed, silently). */\n"
     "    float filtered = (wsum > 0.0) ? result / wsum : 0.0;\n"
     "    /* Anti-ringing: clamp to local tap range. Strength 0.8 per\n"
     "     * Artoriuz's scaler benchmarks (mpv community). */\n"
     "    float clamped  = clamp(filtered, tap_min, tap_max);\n"
     "    return lerp(filtered, clamped, 0.8);\n"
+    "#endif\n"
     "}\n"
     "\n"
     "/* Catmull-Rom weight for |t| in [0,2]. The dilated loop bounds\n"
@@ -330,11 +401,21 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "\n"
     "    float out_c = (wsum > 0.0) ? result / wsum : 0.0;\n"
-    "    /* Anti-ring, HDR files only: clamp to tap range, strength\n"
-    "     * 0.8 — parity with luma (Artoriuz benchmarks). PQ + wide\n"
-    "     * gamut make chroma overshoot visible as edge color bleed;\n"
-    "     * the SDR path is untouched. */\n"
+    "    /* Anti-ring: clamp to tap range, strength 0.8 — parity with\n"
+    "     * luma (Artoriuz benchmarks). Rationale: PQ + wide gamut make\n"
+    "     * chroma overshoot visible as edge color bleed. Since the\n"
+    "     * SDR-in-PQ arc, SDR content rides a PQ/BT.2020 container on\n"
+    "     * wide-gamut displays — the stated condition — so the clamp\n"
+    "     * follows the CONTAINER (out_pq), not just the content\n"
+    "     * (is_hdr). tap_min/max already accumulate unconditionally in\n"
+    "     * the tap loop; the old is_hdr-only gate threw them away on\n"
+    "     * every SDR frame (Knot gains #1, 2026-08-20).\n"
+    "     * DSVP_CHROMA_AR=hdr restores the old predicate for A/B. */\n"
+    "#ifdef DSVP_CHROMA_AR_HDR\n"
     "    if (is_hdr > 0.5)\n"
+    "#else\n"
+    "    if (is_hdr > 0.5 || out_pq > 0.5)\n"
+    "#endif\n"
     "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
     "    return out_c;\n"
     "#else\n"
@@ -363,11 +444,21 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "\n"
     "    float out_c = (wsum > 0.0) ? result / wsum : 0.0;\n"
-    "    /* Anti-ring, HDR files only: clamp to tap range, strength\n"
-    "     * 0.8 — parity with luma (Artoriuz benchmarks). PQ + wide\n"
-    "     * gamut make chroma overshoot visible as edge color bleed;\n"
-    "     * the SDR path is untouched. */\n"
+    "    /* Anti-ring: clamp to tap range, strength 0.8 — parity with\n"
+    "     * luma (Artoriuz benchmarks). Rationale: PQ + wide gamut make\n"
+    "     * chroma overshoot visible as edge color bleed. Since the\n"
+    "     * SDR-in-PQ arc, SDR content rides a PQ/BT.2020 container on\n"
+    "     * wide-gamut displays — the stated condition — so the clamp\n"
+    "     * follows the CONTAINER (out_pq), not just the content\n"
+    "     * (is_hdr). tap_min/max already accumulate unconditionally in\n"
+    "     * the tap loop; the old is_hdr-only gate threw them away on\n"
+    "     * every SDR frame (Knot gains #1, 2026-08-20).\n"
+    "     * DSVP_CHROMA_AR=hdr restores the old predicate for A/B. */\n"
+    "#ifdef DSVP_CHROMA_AR_HDR\n"
     "    if (is_hdr > 0.5)\n"
+    "#else\n"
+    "    if (is_hdr > 0.5 || out_pq > 0.5)\n"
+    "#endif\n"
     "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
     "    return out_c;\n"
     "#endif\n"
@@ -411,8 +502,14 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "\n"
     "    float2 out_c = (wsum > 0.0) ? result / wsum : float2(0.0, 0.0);\n"
-    "    /* Anti-ring, HDR files only — see sample_catmull. */\n"
+    "    /* Anti-ring, container-keyed — see sample_catmull. (This\n"
+    "     * function binds only on the zero-copy P010 route, HDR-class\n"
+    "     * by construction; updated for consistency.) */\n"
+    "#ifdef DSVP_CHROMA_AR_HDR\n"
     "    if (is_hdr > 0.5)\n"
+    "#else\n"
+    "    if (is_hdr > 0.5 || out_pq > 0.5)\n"
+    "#endif\n"
     "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
     "    return out_c;\n"
     "#else\n"
@@ -441,8 +538,14 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "\n"
     "    float2 out_c = (wsum > 0.0) ? result / wsum : float2(0.0, 0.0);\n"
-    "    /* Anti-ring, HDR files only — see sample_catmull. */\n"
+    "    /* Anti-ring, container-keyed — see sample_catmull. (This\n"
+    "     * function binds only on the zero-copy P010 route, HDR-class\n"
+    "     * by construction; updated for consistency.) */\n"
+    "#ifdef DSVP_CHROMA_AR_HDR\n"
     "    if (is_hdr > 0.5)\n"
+    "#else\n"
+    "    if (is_hdr > 0.5 || out_pq > 0.5)\n"
+    "#endif\n"
     "        out_c = lerp(out_c, clamp(out_c, tap_min, tap_max), 0.8);\n"
     "    return out_c;\n"
     "#endif\n"
@@ -502,6 +605,12 @@ static const char hlsl_yuv_planar_frag[] =
     " * the reference-faithful default (DSVP_OUTPUT_GAMMA overrides). */\n"
     "float3 encode_output(float3 lin) {\n"
     "    lin = max(lin, 0.0);\n"
+    "    /* PQ surface: encode instead of gamma. Only tone-mapped HDR and\n"
+    "     * DV reach here, and their reference white is the TONE-MAP\n"
+    "     * TARGET (T key) — rgb_tm is normalised so 1.0 means exactly\n"
+    "     * that. out_pq is the SDR reference white and must not be used\n"
+    "     * here, or lowering it would dim HDR content too. */\n"
+    "    if (out_pq > 0.5) return pq_oetf(lin * hdr_target_nits / 10000.0);\n"
     "    if (out_gamma < 0.5) {\n"
     "        return float3(\n"
     "            lin.r <= 0.0031308 ? 12.92*lin.r : 1.055*pow(lin.r, 1.0/2.4) - 0.055,\n"
@@ -669,13 +778,18 @@ static const char hlsl_yuv_planar_frag[] =
     "        float3 rgb_tm = (Y_l > 0.0) ? E * (Yt / Y_l) : float3(0,0,0);\n"
     "        rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
     "\n"
-    "        /* BT.2020→BT.709 gamut matrix */\n"
-    "        float3 r2 = rgb_tm;\n"
-    "        rgb_tm = float3(\n"
-    "             1.6605*r2.r - 0.5877*r2.g - 0.0728*r2.b,\n"
-    "            -0.1246*r2.r + 1.1330*r2.g - 0.0084*r2.b,\n"
-    "            -0.0182*r2.r - 0.1006*r2.g + 1.1187*r2.b);\n"
-    "        rgb_tm = max(rgb_tm, 0.0);\n"
+    "        /* BT.2020→BT.709 gamut matrix. Skipped when the display\n"
+    "         * itself is BT.2020 (out_gamut): DV decode already produced\n"
+    "         * BT.2020, so squeezing to 709 only to have the display\n"
+    "         * stretch it back is two lossy steps for nothing. */\n"
+    "        if (out_gamut < 0.5) {\n"
+    "            float3 r2 = rgb_tm;\n"
+    "            rgb_tm = float3(\n"
+    "                 1.6605*r2.r - 0.5877*r2.g - 0.0728*r2.b,\n"
+    "                -0.1246*r2.r + 1.1330*r2.g - 0.0084*r2.b,\n"
+    "                -0.0182*r2.r - 0.1006*r2.g + 1.1187*r2.b);\n"
+    "            rgb_tm = max(rgb_tm, 0.0);\n"
+    "        }\n"
     "\n"
     "        if (hdr_midtone_gain > 1.001) {\n"
     "            float inv = 1.0 / hdr_midtone_gain;\n"
@@ -743,12 +857,25 @@ static const char hlsl_yuv_planar_frag[] =
     "\n"
     "            rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
     "\n"
-    "            if (hdr_gamut > 0.5) {\n"
+    "            /* Gamut reconcile: source primaries (hdr_gamut) vs the\n"
+    "             * display's (out_gamut). Matching pairs convert nothing.\n"
+    "             * Both directions run here in LINEAR light — rgb_tm is\n"
+    "             * pre-encode_output — which is where a primaries change\n"
+    "             * belongs. */\n"
+    "            if (hdr_gamut > 0.5 && out_gamut < 0.5) {\n"
     "                float3 r2 = rgb_tm;\n"
     "                rgb_tm = float3(\n"
     "                     1.6605*r2.r - 0.5877*r2.g - 0.0728*r2.b,\n"
     "                    -0.1246*r2.r + 1.1330*r2.g - 0.0084*r2.b,\n"
     "                    -0.0182*r2.r - 0.1006*r2.g + 1.1187*r2.b);\n"
+    "                rgb_tm = max(rgb_tm, 0.0);\n"
+    "            }\n"
+    "            else if (hdr_gamut < 0.5 && out_gamut > 0.5) {\n"
+    "                float3 r7 = rgb_tm;\n"
+    "                rgb_tm = float3(\n"
+    "                     0.6274*r7.r + 0.3293*r7.g + 0.0433*r7.b,\n"
+    "                     0.0691*r7.r + 0.9195*r7.g + 0.0114*r7.b,\n"
+    "                     0.0164*r7.r + 0.0880*r7.g + 0.8956*r7.b);\n"
     "                rgb_tm = max(rgb_tm, 0.0);\n"
     "            }\n"
     "\n"
@@ -761,13 +888,13 @@ static const char hlsl_yuv_planar_frag[] =
     "            rgb = encode_output(rgb_tm);\n"
     "        }\n"
     "    }\n"
-    "    else if (hdr_gamut > 0.5) {\n"
-    "        /* SDR tagged BT.2020 (rare but legal): the 2020 YCbCr matrix\n"
-    "         * above produced BT.2020 RGB, but the swapchain is 709/sRGB —\n"
-    "         * displaying it unconverted is visibly desaturated. Convert\n"
-    "         * primaries in LINEAR light (BT.1886-ish 2.4 for SDR video),\n"
-    "         * then re-encode with the same curve (transfer unchanged —\n"
-    "         * this is a gamut conversion, not a tone map). */\n"
+    "    else if (hdr_gamut > 0.5 && out_gamut < 0.5 && out_pq < 0.5) {\n"
+    "        /* SDR tagged BT.2020 (rare but legal) on a 709 display: the\n"
+    "         * 2020 YCbCr matrix above produced BT.2020 RGB, and showing\n"
+    "         * it unconverted is visibly desaturated. Convert primaries in\n"
+    "         * LINEAR light (BT.1886-ish 2.4 for SDR video), then re-encode\n"
+    "         * with the same curve (transfer unchanged — this is a gamut\n"
+    "         * conversion, not a tone map). */\n"
     "        float3 lin = pow(max(rgb, 0.0), 2.4);\n"
     "        float3 l7 = float3(\n"
     "             1.6605*lin.r - 0.5877*lin.g - 0.0728*lin.b,\n"
@@ -775,7 +902,59 @@ static const char hlsl_yuv_planar_frag[] =
     "            -0.0182*lin.r - 0.1006*lin.g + 1.1187*lin.b);\n"
     "        rgb = pow(max(l7, 0.0), 1.0/2.4);\n"
     "    }\n"
+    "    else if (hdr_gamut < 0.5 && out_gamut > 0.5 && out_pq < 0.5) {\n"
+    "        /* The common case this whole uniform exists for: ordinary\n"
+    "         * BT.709 SDR on a display running BT.2020 primaries. Sending\n"
+    "         * 709 code values to a 2020 display means every colour is\n"
+    "         * read against wider primaries and stretched outward —\n"
+    "         * oversaturated, and worst on skin tones. Same linear-light\n"
+    "         * treatment as the branch above, opposite direction (the\n"
+    "         * matrices are numerically verified inverses). */\n"
+    "        float3 lin = pow(max(rgb, 0.0), 2.4);\n"
+    "        float3 l20 = float3(\n"
+    "             0.6274*lin.r + 0.3293*lin.g + 0.0433*lin.b,\n"
+    "             0.0691*lin.r + 0.9195*lin.g + 0.0114*lin.b,\n"
+    "             0.0164*lin.r + 0.0880*lin.g + 0.8956*lin.b);\n"
+    "        rgb = pow(max(l20, 0.0), 1.0/2.4);\n"
+    "    }\n"
     "    } /* end else (standard path) */\n"
+    "\n"
+    "    /* SDR content keeps its own transfer through the paths above\n"
+    "     * (they change primaries, never the curve), so it is the one\n"
+    "     * case still holding gamma-encoded values by here. Take it to\n"
+    "     * display-linear with the BT.1886 2.4 the gamut branches also\n"
+    "     * assume, convert primaries into the BT.2020 the HDR10\n"
+    "     * container is defined with, scale so 1.0 lands on the SDR\n"
+    "     * reference white, and PQ-encode. Tone-mapped and DV output\n"
+    "     * left through encode_output, which PQ-encodes on its own and\n"
+    "     * against its own reference white. */\n"
+    "    if (out_pq > 0.5 && is_hdr < 0.5 && is_dovi < 0.5) {\n"
+    "        /* Primaries AND encode in ONE trip through linear light.\n"
+    "         * The gamut branches above are skipped in this mode: doing\n"
+    "         * it there meant pow(2.4) -> matrix -> pow(1/2.4) and then\n"
+    "         * pow(2.4) again here, six wasted pow() per pixel — 8.3M\n"
+    "         * pixels at 60fps makes that a measurable frame cost on the\n"
+    "         * Deck iGPU, and it showed up as drops on 4K59.94. */\n"
+    "#if DSVP_PQ_LUT\n"
+    "        float3 lin = float3(lut_lin(rgb.r), lut_lin(rgb.g),\n"
+    "                            lut_lin(rgb.b));\n"
+    "#else\n"
+    "        float3 lin = pow(max(rgb, 0.0), 2.4);\n"
+    "#endif\n"
+    "        if (hdr_gamut < 0.5) {\n"
+    "            float3 l7 = lin;\n"
+    "            lin = float3(\n"
+    "                 0.6274*l7.r + 0.3293*l7.g + 0.0433*l7.b,\n"
+    "                 0.0691*l7.r + 0.9195*l7.g + 0.0114*l7.b,\n"
+    "                 0.0164*l7.r + 0.0880*l7.g + 0.8956*l7.b);\n"
+    "        }\n"
+    "#if DSVP_PQ_LUT\n"
+    "        /* nits scale baked into the LUT — see the decl comment. */\n"
+    "        rgb = float3(lut_pq(lin.r), lut_pq(lin.g), lut_pq(lin.b));\n"
+    "#else\n"
+    "        rgb = pq_oetf(max(lin, 0.0) * out_pq / 10000.0);\n"
+    "#endif\n"
+    "    }\n"
     "\n"
     "    /* Blue noise dither: ±0.5 LSB in 8-bit (±1/510 in [0,1]).\n"
     "     * 64x64 void-and-cluster texture, tiled via frac(). Temporal\n"
@@ -784,7 +963,7 @@ static const char hlsl_yuv_planar_frag[] =
     "    uint fc = (uint)frameCount;\n"
     "    float2 ditherCoord = pos.xy + float2(fc % 4u, (fc / 4u) % 4u);\n"
     "    /* LSB matches the output surface: 10-bit in HDR passthrough. */\n"
-    "    float dith_lsb = (hdr_pass > 0.5) ? 1023.0 : 255.0;\n"
+    "    float dith_lsb = (hdr_pass > 0.5 || out_pq > 0.5) ? 1023.0 : 255.0;\n"
     "    float d = (texNoise.SampleLevel(sampNoise, frac(ditherCoord / 64.0), 0).r - 0.5) / dith_lsb;\n"
     "    rgb += float3(d, d, d);\n"
     "\n"
@@ -816,14 +995,18 @@ static const char hlsl_overlay_frag[] =
     "\n"
     "cbuffer OvParams : register(b0, space3) {\n"
     "    float ov_pq;\n"
-    "    float3 _pad;\n"
+    "    float ov_nits;\n"
+    "    float2 _pad;\n"
     "};\n"
     "\n"
     "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
     "    float4 c = texOverlay.Sample(sampOverlay, uv);\n"
     "    if (ov_pq > 0.5) {\n"
-    "        /* SDR (2.2) → linear → 203-nit reference white → PQ OETF */\n"
-    "        float3 lin = pow(max(c.rgb, 0.0), 2.2) * (203.0 / 10000.0);\n"
+    "        /* SDR (2.2) → linear → reference-white nits → PQ OETF.\n"
+    "         * ov_nits: 203 (BT.2408 graphics white) over passthrough\n"
+    "         * HDR; the SDR reference white in SDR-in-PQ mode, so\n"
+    "         * overlay white matches video white. */\n"
+    "        float3 lin = pow(max(c.rgb, 0.0), 2.2) * (ov_nits / 10000.0);\n"
     "        float m1 = 0.1593017578125, m2 = 78.84375;\n"
     "        float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
     "        float3 Np = pow(lin, m1);\n"
@@ -859,6 +1042,17 @@ static SDL_GPUShader *compile_shader(
     SDL_ShaderCross_ShaderStage stage)
 {
     return compile_shader_pfx(device, source, entrypoint, stage, NULL);
+}
+
+/* Chroma anti-ring predicate switch (Knot gains #1, 2026-08-20): the
+ * clamp follows the CONTAINER (is_hdr || out_pq) by default;
+ * DSVP_CHROMA_AR=hdr restores the pre-change HDR-content-only gate
+ * for a one-binary A/B. Applied to every variant prefix so the
+ * shared-source sites stay in lockstep. */
+static const char *chroma_ar_defs(void) {
+    const char *v = SDL_getenv("DSVP_CHROMA_AR");
+    return (v && strcmp(v, "hdr") == 0)
+        ? "#define DSVP_CHROMA_AR_HDR 1\n" : "";
 }
 
 /* Compile with an optional #define prefix prepended to the source —
@@ -955,10 +1149,130 @@ static SDL_GPUShader *compile_shader_pfx(
  *   - gpu_pipeline_overlay: RGBA + alpha blend (1 texture, 1 sampler)
  */
 
+/* Build + upload the two SDR-in-PQ encode LUTs (1024×1 R16_UNORM,
+ * sampled with the linear/clamp video sampler). lut_lin stores x^1.2
+ * — the shader squares it to x^2.4, because a straight x^2.4 table in
+ * R16 quantises shadows into steps PQ amplifies to 5-17 ten-bit codes
+ * (found by simulating the full chain; §3's R16 note missed the
+ * output-quantisation cascade). lut_pq = PQ OETF of (u² · nits/10000),
+ * sqrt-domain index, nits baked in (out_pq_nits is fixed for the
+ * session). Whole-chain simulation incl. R16 rounding + bilinear PWL:
+ * worst error 0.11 (100 nits) / 0.37 (1000 nits) ten-bit codes —
+ * under the ±0.5-LSB dither floor. Returns 0 on success; any failure
+ * releases both and the caller compiles the pow-path shader instead. */
+#define PQ_LUT_N 1024
+static int gpu_pq_luts_create(PlayerState *ps) {
+    Uint16 lin_tab[PQ_LUT_N], pq_tab[PQ_LUT_N];
+    const double m1 = 0.1593017578125, m2 = 78.84375;
+    const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    for (int i = 0; i < PQ_LUT_N; i++) {
+        double u = (double)i / (PQ_LUT_N - 1);
+        lin_tab[i] = (Uint16)lround(pow(u, 1.2) * 65535.0);
+        double Y = u * u * (double)ps->out_pq_nits / 10000.0;
+        double p = pow(Y, m1);
+        double v = pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+        if (v < 0.0) v = 0.0;
+        if (v > 1.0) v = 1.0;
+        pq_tab[i] = (Uint16)lround(v * 65535.0);
+    }
+
+    SDL_GPUTextureCreateInfo ti;
+    SDL_zero(ti);
+    ti.type                 = SDL_GPU_TEXTURETYPE_2D;
+    ti.format               = SDL_GPU_TEXTUREFORMAT_R16_UNORM;
+    ti.width                = PQ_LUT_N;
+    ti.height               = 1;
+    ti.layer_count_or_depth = 1;
+    ti.num_levels           = 1;
+    ti.usage                = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    ps->gpu_tex_lut_lin = SDL_CreateGPUTexture(ps->gpu_device, &ti);
+    ps->gpu_tex_lut_pq  = SDL_CreateGPUTexture(ps->gpu_device, &ti);
+
+    SDL_GPUTransferBufferCreateInfo xi;
+    SDL_zero(xi);
+    xi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    xi.size  = 2 * PQ_LUT_N * sizeof(Uint16);
+    SDL_GPUTransferBuffer *xfer =
+        SDL_CreateGPUTransferBuffer(ps->gpu_device, &xi);
+
+    int ok = 0;
+    if (ps->gpu_tex_lut_lin && ps->gpu_tex_lut_pq && xfer) {
+        Uint16 *dst = SDL_MapGPUTransferBuffer(ps->gpu_device, xfer, false);
+        if (dst) {
+            memcpy(dst, lin_tab, sizeof(lin_tab));
+            memcpy(dst + PQ_LUT_N, pq_tab, sizeof(pq_tab));
+            SDL_UnmapGPUTransferBuffer(ps->gpu_device, xfer);
+            SDL_GPUCommandBuffer *cmd =
+                SDL_AcquireGPUCommandBuffer(ps->gpu_device);
+            if (cmd) {
+                SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+                SDL_GPUTextureTransferInfo si;
+                SDL_GPUTextureRegion dr;
+                SDL_zero(si);
+                SDL_zero(dr);
+                si.transfer_buffer = xfer;
+                si.pixels_per_row  = PQ_LUT_N;
+                si.rows_per_layer  = 1;
+                dr.w = PQ_LUT_N;
+                dr.h = 1;
+                dr.d = 1;
+                dr.texture = ps->gpu_tex_lut_lin;
+                SDL_UploadToGPUTexture(copy, &si, &dr, false);
+                si.offset  = PQ_LUT_N * sizeof(Uint16);
+                dr.texture = ps->gpu_tex_lut_pq;
+                SDL_UploadToGPUTexture(copy, &si, &dr, false);
+                SDL_EndGPUCopyPass(copy);
+                SDL_SubmitGPUCommandBuffer(cmd);
+                ok = 1;
+            }
+        }
+    }
+    if (xfer) SDL_ReleaseGPUTransferBuffer(ps->gpu_device, xfer);
+    if (!ok) {
+        log_msg("WARN: PQ LUT setup failed (%s) — pow-path shader",
+                SDL_GetError());
+        if (ps->gpu_tex_lut_lin) {
+            SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_lut_lin);
+            ps->gpu_tex_lut_lin = NULL;
+        }
+        if (ps->gpu_tex_lut_pq) {
+            SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_lut_pq);
+            ps->gpu_tex_lut_pq = NULL;
+        }
+        return -1;
+    }
+    log_msg("GPU: PQ encode LUTs created (2x %dx1 R16, %.0f nits baked, "
+            "sqrt-domain; DSVP_PQ_LUT=0 opts out)",
+            PQ_LUT_N, (double)ps->out_pq_nits);
+    return 0;
+}
+
 int gpu_create_pipelines(PlayerState *ps) {
     if (!ps->gpu_device || !ps->window) return -1;
 
     log_msg("GPU: compiling shaders...");
+
+    /* ── SDR-in-PQ encode LUTs (decide BEFORE the frag compiles: the
+     * DSVP_PQ_LUT define must match whether the textures exist) ──
+     * Only for PQ-container sessions; DSVP_PQ_LUT=0 is the in-app A/B
+     * back to the pow path. Textures are (re)created here because
+     * gpu_destroy_pipelines releases them alongside the noise texture
+     * on every HDR-flip rebuild. */
+    ps->pq_lut_active = 0;
+    {
+        const char *le = SDL_getenv("DSVP_PQ_LUT");
+        if (ps->out_pq_nits > 0.0f && !(le && strcmp(le, "0") == 0)
+                && gpu_pq_luts_create(ps) == 0)
+            ps->pq_lut_active = 1;
+    }
+    char frag_defs[192];
+    snprintf(frag_defs, sizeof(frag_defs),
+             "#define DSVP_DILATE 0\n#define DSVP_PQ_LUT %d\n"
+             "#define DSVP_DIRECT 0\n#define DSVP_SCALE2X 0\n%s",
+             ps->pq_lut_active, chroma_ar_defs());
+    log_msg("GPU: chroma anti-ring predicate: %s",
+            chroma_ar_defs()[0] ? "hdr-content only (DSVP_CHROMA_AR=hdr)"
+                                : "hdr-or-pq-container");
 
     /* ── Compile vertex shader (shared by both pipelines) ── */
     SDL_GPUShader *vert = compile_shader(
@@ -976,7 +1290,7 @@ int gpu_create_pipelines(PlayerState *ps) {
      * identical pixels, so selection never changes the picture. */
     SDL_GPUShader *frag_yuv = compile_shader_pfx(
         ps->gpu_device, hlsl_yuv_planar_frag, "main",
-        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, "#define DSVP_DILATE 0\n");
+        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, frag_defs);
     if (!frag_yuv) {
         SDL_ReleaseGPUShader(ps->gpu_device, vert);
         return -1;
@@ -1027,9 +1341,14 @@ int gpu_create_pipelines(PlayerState *ps) {
      * DSVP_NO_DILATE=1 skips it entirely — the one-run falsification
      * switch for "is the dilated sampler the problem". */
     if (!SDL_getenv("DSVP_NO_DILATE")) {
+        char frag_defs_dil[192];
+        snprintf(frag_defs_dil, sizeof(frag_defs_dil),
+                 "#define DSVP_DILATE 1\n#define DSVP_PQ_LUT %d\n"
+                 "#define DSVP_DIRECT 0\n#define DSVP_SCALE2X 0\n%s",
+                 ps->pq_lut_active, chroma_ar_defs());
         SDL_GPUShader *frag_dil = compile_shader_pfx(
             ps->gpu_device, hlsl_yuv_planar_frag, "main",
-            SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, "#define DSVP_DILATE 1\n");
+            SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, frag_defs_dil);
         if (frag_dil) {
             pipe_info.fragment_shader = frag_dil;
             ps->gpu_pipeline_yuv_dilated = SDL_CreateGPUGraphicsPipeline(
@@ -1049,6 +1368,74 @@ int gpu_create_pipelines(PlayerState *ps) {
         else
             log_msg("WARN: dilated YUV pipeline unavailable (%s) — "
                     "fixed kernels for downscale too", SDL_GetError());
+    }
+
+    /* Direct variant — exact-1:1 only (4K-on-4K fullscreen). The fixed
+     * kernel pays ~16 taps/plane to reproduce the identity there; at
+     * the Deck's SUSTAINED (post-boost) GPU clock that surplus is the
+     * difference between fitting the 16.7ms budget and missing it by
+     * ~1ms forever (clock trace 2026-08-20: LOCKED at 1480-1540MHz,
+     * metered drops at 1335-1450MHz). Non-fatal; DSVP_NO_DIRECT=1 is
+     * the falsification/eye-test switch. */
+    if (!SDL_getenv("DSVP_NO_DIRECT")) {
+        char frag_defs_dir[192];
+        snprintf(frag_defs_dir, sizeof(frag_defs_dir),
+                 "#define DSVP_DILATE 0\n#define DSVP_PQ_LUT %d\n"
+                 "#define DSVP_DIRECT 1\n#define DSVP_SCALE2X 0\n%s",
+                 ps->pq_lut_active, chroma_ar_defs());
+        SDL_GPUShader *frag_dir = compile_shader_pfx(
+            ps->gpu_device, hlsl_yuv_planar_frag, "main",
+            SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, frag_defs_dir);
+        if (frag_dir) {
+            pipe_info.fragment_shader = frag_dir;
+            ps->gpu_pipeline_yuv_direct = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &pipe_info);
+            color_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+            ps->gpu_pipeline_yuv_direct_frame = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &pipe_info);
+            color_desc.format = SDL_GetGPUSwapchainTextureFormat(
+                ps->gpu_device, ps->window);
+            SDL_ReleaseGPUShader(ps->gpu_device, frag_dir);
+        }
+        if (ps->gpu_pipeline_yuv_direct)
+            log_msg("GPU: YUV planar pipeline created (direct, exact 1:1)");
+        else
+            log_msg("WARN: direct YUV pipeline unavailable (%s) — "
+                    "fixed kernels at 1:1 too", SDL_GetError());
+    }
+
+    /* Scale2x variant — exact 2.0x upscale (1080p->4K out, and 2x
+     * letterboxed sources). Output phases are only 0.25/0.75 per
+     * axis, so the Lanczos weights become two constant vectors:
+     * identical taps, anti-ring and normalisation — the win is the
+     * ~16 sin()/px/plane the general path spends recomputing them
+     * (the transcendental-hog class the PQ pow chain belonged to).
+     * Non-fatal; DSVP_NO_SCALE2X=1 is the falsification switch. */
+    if (!SDL_getenv("DSVP_NO_SCALE2X")) {
+        char frag_defs_2x[192];
+        snprintf(frag_defs_2x, sizeof(frag_defs_2x),
+                 "#define DSVP_DILATE 0\n#define DSVP_PQ_LUT %d\n"
+                 "#define DSVP_DIRECT 0\n#define DSVP_SCALE2X 1\n%s",
+                 ps->pq_lut_active, chroma_ar_defs());
+        SDL_GPUShader *frag_2x = compile_shader_pfx(
+            ps->gpu_device, hlsl_yuv_planar_frag, "main",
+            SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT, frag_defs_2x);
+        if (frag_2x) {
+            pipe_info.fragment_shader = frag_2x;
+            ps->gpu_pipeline_yuv_scale2x = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &pipe_info);
+            color_desc.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
+            ps->gpu_pipeline_yuv_scale2x_frame = SDL_CreateGPUGraphicsPipeline(
+                ps->gpu_device, &pipe_info);
+            color_desc.format = SDL_GetGPUSwapchainTextureFormat(
+                ps->gpu_device, ps->window);
+            SDL_ReleaseGPUShader(ps->gpu_device, frag_2x);
+        }
+        if (ps->gpu_pipeline_yuv_scale2x)
+            log_msg("GPU: YUV planar pipeline created (scale2x, constant weights)");
+        else
+            log_msg("WARN: scale2x YUV pipeline unavailable (%s) — "
+                    "general kernels at 2x too", SDL_GetError());
     }
 
     /* Vertex shader done — safe to release now */
@@ -1289,14 +1676,77 @@ static void strip_ansi(char *s) {
     *w = '\0';
 }
 
+/* Read a kscreen-doctor property line's value.
+ * 1 = enabled, 0 = disabled, -1 = incapable or unrecognised.
+ * ("disabled" contains no "enabled" substring, so the order is safe.) */
+static int hdr_prop_state(const char *s) {
+    if (strstr(s, "incapable")) return -1;
+    if (strstr(s, "enabled"))   return  1;
+    if (strstr(s, "disabled"))  return  0;
+    return -1;
+}
+
+/* Is this the wide-colour-gamut property line? The label has been
+ * spelled several ways across Plasma releases, so match the key part
+ * case-insensitively rather than pinning one string — an unmatched
+ * label leaves WCG at "unknown", which is the safe state (we then
+ * never write it). */
+static int hdr_line_is_wcg(const char *s) {
+    char key[64];
+    size_t i = 0;
+    for (; i < sizeof(key) - 1 && s[i] && s[i] != ':'; i++)
+        key[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+    key[i] = '\0';
+    return strstr(key, "wide color gamut") != NULL
+        || strstr(key, "wide colour gamut") != NULL
+        || strstr(key, "wcg") != NULL;
+}
+
+/* Adopt this output if it is the one we can drive. Called at each
+ * block boundary because the properties we need can appear in any
+ * order within an output's block. */
+static int hdr_sys_adopt(PlayerState *ps, const char *name,
+                         int enabled, int hdr, int wcg) {
+    if (!enabled || !name[0] || hdr < 0) return 0;
+    /* Sanitize before this ever reaches an exec argument */
+    for (const char *c = name; *c; c++)
+        if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||
+              (*c>='0'&&*c<='9')||*c=='-')) return 0;
+    snprintf(ps->hdr_sys_output, sizeof(ps->hdr_sys_output), "%s", name);
+    ps->hdr_sys_prior_hdr = hdr;
+    ps->hdr_sys_prior_wcg = wcg;
+    return 1;
+}
+
 /* Find the connected, enabled output whose HDR capability is real
  * ("HDR: enabled|disabled" — the internal panel says "incapable").
- * Records the output name and its CURRENT HDR state so revert can
- * restore rather than blindly disable. Returns 1 if found.
+ * Records the output name and the CURRENT state of every property we
+ * are going to write, so revert restores rather than assumes.
+ *
+ * WCG is read here because hdr_sys_set writes it. It used to be
+ * written but never read: revert issued wcg.disable unconditionally,
+ * on the assumption that WCG tracked HDR. On a display where the user
+ * had wide gamut on with HDR off, that silently turned it off and
+ * LEFT it off — kscreen persists output properties, so the change
+ * outlived the process, the session, and reboots. Anything we write,
+ * we read first.
+ *
  * Parser is host-unit-tested against coloured, plain, and
  * prior-enabled fixtures built from real kscreen-doctor output. */
+static void hdr_sys_wait(void);
+
 static int hdr_sys_detect(PlayerState *ps) {
+    /* Serialize behind any in-flight kscreen-doctor child first. The
+     * close path fires a fire-and-forget disable; a playlist advance
+     * reopens within milliseconds and a probe here would read the
+     * PRE-disable state — latching prior_hdr=1, skipping the engage,
+     * and inverting the restore baseline for the whole session (review
+     * 2026-08-20 finding 4 — the F4 class of persistent display-state
+     * damage, resurrected through a race). */
+    hdr_sys_wait();
     ps->hdr_sys_output[0] = '\0';
+    ps->hdr_sys_prior_hdr = 0;
+    ps->hdr_sys_prior_wcg = -1;
     if (SDL_getenv("DSVP_NO_SYS_HDR")) return 0;
 
     FILE *fp = popen("kscreen-doctor -o 2>/dev/null", "r");
@@ -1307,8 +1757,9 @@ static int hdr_sys_detect(PlayerState *ps) {
 
     char line[512];
     char cur_name[32] = "";
-    int  cur_enabled = 0;
-    int  lines_seen = 0, outputs_seen = 0;
+    int  cur_enabled = 0, cur_hdr = -1, cur_wcg = -1;
+    int  lines_seen = 0, outputs_seen = 0, found = 0;
+
     while (fgets(line, sizeof(line), fp)) {
         lines_seen++;
         strip_ansi(line);
@@ -1316,64 +1767,369 @@ static int hdr_sys_detect(PlayerState *ps) {
         while (*s == ' ' || *s == '\t') s++;
 
         if (strncmp(s, "Output:", 7) == 0) {
+            /* Block boundary: decide on the block that just ended */
+            if (!found)
+                found = hdr_sys_adopt(ps, cur_name, cur_enabled,
+                                      cur_hdr, cur_wcg);
             /* "Output: 2 DP-1 <uuid>" — name is the third token */
             outputs_seen++;
             cur_name[0] = '\0';
             cur_enabled = 0;
+            cur_hdr = -1;
+            cur_wcg = -1;
             char idx[16];
             if (sscanf(s, "Output: %15s %31s", idx, cur_name) != 2)
                 cur_name[0] = '\0';
         } else if (strncmp(s, "enabled", 7) == 0 &&
                    (s[7]=='\n' || s[7]=='\0' || s[7]=='\r' || s[7]==' ')) {
             cur_enabled = 1;
-        } else if (strncmp(s, "HDR: ", 5) == 0) {
-            if (cur_enabled && cur_name[0] && !strstr(s, "incapable")) {
-                /* Sanitize before this ever reaches a shell */
-                int ok = 1;
-                for (const char *c = cur_name; *c; c++)
-                    if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||
-                          (*c>='0'&&*c<='9')||*c=='-')) { ok = 0; break; }
-                if (ok) {
-                    snprintf(ps->hdr_sys_output, sizeof(ps->hdr_sys_output),
-                             "%s", cur_name);
-                    ps->hdr_sys_prior_hdr = (strstr(s, "enabled") != NULL);
-                    pclose(fp);
-                    log_msg("HDR sys: output %s is HDR-capable (currently %s)",
-                            ps->hdr_sys_output,
-                            ps->hdr_sys_prior_hdr ? "enabled" : "disabled");
-                    return 1;
-                }
-            }
+        } else if (strncmp(s, "HDR:", 4) == 0) {
+            cur_hdr = hdr_prop_state(s);
+        } else if (hdr_line_is_wcg(s)) {
+            cur_wcg = hdr_prop_state(s);
         }
     }
+    if (!found)
+        found = hdr_sys_adopt(ps, cur_name, cur_enabled, cur_hdr, cur_wcg);
     pclose(fp);
+
+    if (found) {
+        log_msg("HDR sys: output %s is HDR-capable — baseline hdr=%s wcg=%s",
+                ps->hdr_sys_output,
+                ps->hdr_sys_prior_hdr ? "enabled" : "disabled",
+                ps->hdr_sys_prior_wcg < 0 ? "unknown"
+                    : (ps->hdr_sys_prior_wcg ? "enabled" : "disabled"));
+        return 1;
+    }
     log_msg("HDR sys: no HDR-capable enabled output found "
             "(read %d lines, %d outputs) — compositor-rendered fallback",
             lines_seen, outputs_seen);
     return 0;
 }
 
-/* Flip the output's HDR + wide-gamut state. Best-effort: a failure
- * leaves us on the compositor-rendered path, which still works. */
-static void hdr_sys_set(PlayerState *ps, int on) {
-    if (!ps->hdr_sys_output[0]) return;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "kscreen-doctor output.%s.hdr.%s output.%s.wcg.%s "
-             ">/dev/null 2>&1",
-             ps->hdr_sys_output, on ? "enable" : "disable",
-             ps->hdr_sys_output, on ? "enable" : "disable");
-    int rc = system(cmd);
-    log_msg("HDR sys: display HDR %s on %s (rc=%d)",
-            on ? "ENABLED" : "restored to disabled",
-            ps->hdr_sys_output, rc);
+/* ── Async kscreen-doctor execution ──
+ *
+ * kscreen-doctor takes ~2s to flip a display output's HDR/WCG state.
+ * The old synchronous system() call blocked the main loop for the
+ * entire duration — no events, no presents — and KWin dimmed the
+ * window as unresponsive.
+ *
+ * posix_spawnp runs the command without blocking.  hdr_sys_wait()
+ * serializes: each new spawn waits for the previous child (normally
+ * already exited, so instant; only blocks on rapid toggles, which is
+ * correct serialization).  Shutdown calls hdr_sys_wait() explicitly
+ * so the process doesn't exit with HDR still enabled on the display. */
+
+static pid_t s_hdr_sys_pid = 0;
+
+/* Exit code of the most recently reaped kscreen-doctor child. The
+ * status used to be discarded (waitpid(..., NULL, 0)) — a
+ * spawn-succeeds/command-fails enable was indistinguishable from
+ * success (review 2026-08-20 finding 14, PLAUSIBLE half, promoted
+ * by the field: a latched-but-never-landed launch enable is the
+ * exact "no badge, no pop, correct colour" phenotype). */
+static int s_hdr_sys_last_rc = 0;
+
+static void hdr_sys_wait(void) {
+    if (s_hdr_sys_pid > 0) {
+        int st = 0;
+        waitpid(s_hdr_sys_pid, &st, 0);
+        s_hdr_sys_pid = 0;
+        s_hdr_sys_last_rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        if (s_hdr_sys_last_rc != 0)
+            log_msg("HDR sys: kscreen-doctor exited rc=%d — the last "
+                    "display switch may NOT have landed",
+                    s_hdr_sys_last_rc);
+    }
 }
 
-/* Restore the display if we quit while an HDR file was playing.
- * player_close covers normal file close; this covers app exit. */
+/* ── Crash-restore stamp (review 2026-08-20 finding 18, Holden-
+ * approved design) ──
+ * kscreen persists HDR across sessions and reboots; a SIGKILL, SEGV
+ * or driver death while we hold display HDR strands the desktop
+ * there with no handler able to run — the F4 lesson: persistent
+ * display state is the damage that outlives the process. So: a
+ * stamp written when we flip the display, cleared when we restore,
+ * reconciled synchronously at the next launch before any probe. */
+/* Returns 0 (buf empty) when HOME is unset. The old fallback was the
+ * fixed world-writable path /tmp/.dsvp-hdr-restore — any local user
+ * could pre-seed it (its contents reach a popen'd command line) or
+ * symlink it for the fopen("w") to clobber (Knot audit finding 7).
+ * The stamp is crash insurance, not a feature worth a predictable
+ * path in /tmp: with no HOME we simply run without it. */
+static int hdr_stamp_path(char *buf, size_t n) {
+    const char *h = SDL_getenv("HOME");
+    if (!h || !h[0]) { buf[0] = '\0'; return 0; }
+    snprintf(buf, n, "%s/.dsvp-hdr-restore", h);
+    return 1;
+}
+
+static void hdr_stamp_update(PlayerState *ps, int held) {
+    char path[512];
+    if (!hdr_stamp_path(path, sizeof(path))) return;
+    if (!held) { unlink(path); return; }
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s %d %d %d\n", ps->hdr_sys_output,
+            ps->hdr_sys_prior_hdr, ps->hdr_sys_prior_wcg,
+            (int)getpid());
+    fclose(f);
+}
+
+/* True when the pid recorded in a stamp belongs to a LIVE dsvp
+ * process. Without this a second concurrent instance (shim daemon
+ * spawn beside a desktop session, or a plain double launch) read the
+ * first instance's stamp as "previous session died", restored the
+ * display baseline under its feet mid-passthrough, and unlinked its
+ * crash protection. The comm check keeps a recycled pid from
+ * counting as ours. */
+static int hdr_stamp_owner_alive(int pid) {
+    if (pid <= 0 || kill((pid_t)pid, 0) != 0) return 0;
+    char cpath[64], comm[32] = "";
+    snprintf(cpath, sizeof(cpath), "/proc/%d/comm", pid);
+    FILE *cf = fopen(cpath, "r");
+    if (!cf) return 0;
+    if (!fgets(comm, sizeof(comm), cf)) comm[0] = '\0';
+    fclose(cf);
+    comm[strcspn(comm, "\n")] = '\0';
+    /* Exact match: a prefix test would also accept the long-running
+     * dsvp-shim daemon, the likeliest home for a recycled pid. */
+    return strcmp(comm, "dsvp") == 0;
+}
+
+void hdr_sys_reconcile_stamp(void) {
+    char path[512];
+    if (!hdr_stamp_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char out[64] = "";
+    int phdr = 0, pwcg = -1, spid = 0;
+    int n = fscanf(f, "%63s %d %d %d", out, &phdr, &pwcg, &spid);
+    fclose(f);
+    /* Re-apply hdr_sys_adopt's character whitelist on the READ side:
+     * out reaches a popen'd command line below, and the write-side
+     * sanitisation does not protect a stamp file we did not write.
+     * The rule this tree already earned — anything we write to shared
+     * state we read first — has a mirror: anything read back from
+     * shared state is re-validated (Knot audit finding 7). */
+    for (const char *c = out; *c; c++) {
+        if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||
+              (*c>='0'&&*c<='9')||*c=='-')) {
+            log_msg("HDR sys: stamp output name rejected — not restoring");
+            unlink(path);
+            return;
+        }
+    }
+    if (n == 4 && hdr_stamp_owner_alive(spid)) {
+        /* The session that wrote this is still running and still owns
+         * the display — leave both the display and the stamp alone.
+         * (n == 3 is a pre-pid stamp: its writer predates this check,
+         * so it reconciles exactly as before.) */
+        log_msg("HDR sys: stamp belongs to live dsvp pid %d — "
+                "not reconciling", spid);
+        return;
+    }
+    if (n >= 3 && out[0]) {
+        /* Mirror hdr_sys_set's restore semantics: hdr back to the
+         * recorded baseline; wcg only if the dead session had turned
+         * it on itself (prior_wcg == 0). Synchronous — the session
+         * that follows must probe the TRUE baseline. */
+        char wcg_part[128] = "";
+        if (pwcg == 0)
+            snprintf(wcg_part, sizeof(wcg_part),
+                     " output.%s.wcg.disable", out);
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+                 "kscreen-doctor output.%s.hdr.%s%s 2>/dev/null",
+                 out, phdr ? "enable" : "disable", wcg_part);
+        log_msg("HDR sys: previous session died holding display HDR — "
+                "restoring baseline on %s (stamp file)", out);
+        FILE *p = popen(cmd, "r");
+        if (p) pclose(p);
+    }
+    unlink(path);
+}
+
+static void hdr_sys_set(PlayerState *ps, int on) {
+    if (!ps->hdr_sys_output[0]) return;
+
+    hdr_sys_wait();
+
+    /* HDR is ours to drive: on the way out it goes back to the state
+     * detect recorded, not to a hardcoded "disable". */
+    char hdr_arg[64], wcg_arg[64] = "";
+    snprintf(hdr_arg, sizeof(hdr_arg), "output.%s.hdr.%s",
+             ps->hdr_sys_output,
+             (on || ps->hdr_sys_prior_hdr) ? "enable" : "disable");
+
+    /* WCG is only ever written when detect actually read it AND it was
+     * off — i.e. only when engaging HDR requires turning it on, and
+     * then only to put it back exactly as found. Unknown (-1) or
+     * already-on means we never touch it: kscreen persists these
+     * properties, so a write we can't reverse is a permanent change to
+     * the user's display for a setting they didn't ask us to manage. */
+    int write_wcg = (ps->hdr_sys_prior_wcg == 0);
+    if (write_wcg)
+        snprintf(wcg_arg, sizeof(wcg_arg), "output.%s.wcg.%s",
+                 ps->hdr_sys_output, on ? "enable" : "disable");
+
+    extern char **environ;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+                                     "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO,
+                                     STDERR_FILENO);
+
+    char *argv[4];
+    int argn = 0;
+    argv[argn++] = "kscreen-doctor";
+    argv[argn++] = hdr_arg;
+    if (write_wcg) argv[argn++] = wcg_arg;
+    argv[argn] = NULL;
+
+    pid_t pid;
+    int rc = posix_spawnp(&pid, "kscreen-doctor", &actions, NULL,
+                          argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+
+    if (rc == 0) {
+        s_hdr_sys_pid = pid;
+        hdr_stamp_update(ps, on);
+        log_msg("HDR sys: display HDR %s on %s (wcg %s, async, pid=%d)",
+                on ? "ENABLED" : "restored to baseline",
+                ps->hdr_sys_output,
+                write_wcg ? (on ? "enabled" : "restored to disabled")
+                          : "untouched",
+                (int)pid);
+    } else {
+        log_msg("HDR sys: posix_spawnp failed (rc=%d)", rc);
+        /* No child to reap, so hdr_sys_wait will never record this
+         * failure — a stale rc of 0 let verify_hold certify a launch
+         * hold that was never even spawned and skip its retry. */
+        s_hdr_sys_last_rc = rc ? rc : -1;
+    }
+}
+
+/* Auto-selection input for PQ output: is the display we can drive
+ * currently running wide gamut? That is the exact condition under
+ * which plain BT.709 output is wrong — the display reads our 709 code
+ * values against BT.2020 primaries and stretches every colour outward.
+ * Returns 0 when there is no drivable HDR output at all, or when the
+ * display is an ordinary BT.709 one and the existing SDR path is
+ * already correct. Honours DSVP_NO_SYS_HDR through hdr_sys_detect. */
+int hdr_sys_display_is_wide_gamut(PlayerState *ps) {
+    if (!hdr_sys_detect(ps)) return 0;
+    return ps->hdr_sys_prior_wcg == 1;
+}
+
+/* Pre-enable display HDR at startup so fullscreen works immediately.
+ * The SDR fullscreen path on certain displays (LG C4 via DP dock)
+ * produces frozen glass — all app instruments healthy, below-compositor,
+ * windowed unaffected. Field-established 2026-08-17: the freeze tracks
+ * the DISPLAY's HDR state, not our launch path or any app state, and it
+ * survives reboot and TV wall-unplug. Holding the output in HDR for the
+ * whole session sidesteps it.
+ *
+ * COST, not yet eye-verified: the swapchain stays SDR until an HDR file
+ * opens, so SDR content is mapped up to a PQ/BT.2020 output by the
+ * compositor. That is NOT the DSVP_NO_SYS_HDR=1 baseline — that path
+ * leaves the display in SDR and shows SDR content natively. Whether the
+ * mapped-up picture is reference-accurate on this panel is an open
+ * question for the eye, and the reason this is a workaround for a
+ * below-app fault rather than an architecture we chose.
+ *
+ * OPT-IN (DSVP_FS_HDR_FALLBACK=1), because the cost is real: SDR
+ * content mapped up to a PQ output was judged clearly worse by eye
+ * (2026-08-17), and this fires for every HDR-capable display whether
+ * or not it has the fault. It stays in the tree as the fallback for
+ * a display that freezes in SDR fullscreen and has no better fix.
+ * DSVP_NO_SYS_HDR=1 still opts out of everything. */
+/* True when display HDR is a SESSION hold (PQ container, or the
+ * fullscreen-freeze fallback) rather than a per-content engage. The
+ * hold must survive HDR-file closes AND the failure branches — the
+ * fallback hold used to die on the first HDR close, resurrecting the
+ * exact freeze it shipped to prevent (review 2026-08-20 finding 9). */
+static int hdr_sys_session_hold(PlayerState *ps) {
+    return ps->out_pq_nits > 0.0f
+        || SDL_getenv("DSVP_FS_HDR_FALLBACK") != NULL;
+}
+
+/* DIAG (DSVP_PQ_NOMATH=1): feed the shader out_pq=0 while the
+ * swapchain stays HDR10/PQ. Colours are WRONG on purpose (gamma 2.2
+ * values PQ-decoded by the compositor) — this run isolates OUR PQ
+ * encode math from KWin's ingest of a PQ surface, the unmeasured
+ * split inside attribution v3's A−C (TODO-PACING item 0). Every
+ * uniform write goes through here so the probe can't miss a site. */
+static float out_pq_uniform(PlayerState *ps) {
+    static int nomath = -1;
+    if (nomath < 0) {
+        nomath = SDL_getenv("DSVP_PQ_NOMATH") != NULL;
+        if (nomath)
+            log_msg("DIAG: DSVP_PQ_NOMATH — shader PQ encode OFF on a "
+                    "PQ swapchain; colours wrong BY DESIGN (perf probe)");
+    }
+    return nomath ? 0.0f : ps->out_pq_nits;
+}
+
+void hdr_sys_preenable(PlayerState *ps) {
+    /* PQ output needs the display in HDR for the whole session, not just
+     * while an HDR file is open — the container is HDR10 even when the
+     * content is SDR. */
+    if (!hdr_sys_session_hold(ps))
+        return;
+    /* Reuse the startup wide-gamut probe when it ran (finding 25: the
+     * duplicate blocking kscreen-doctor popen showed as a double
+     * "HDR-capable — baseline" line in every field log). */
+    if ((ps->hdr_sys_output[0] != '\0' || hdr_sys_detect(ps))
+            && !ps->hdr_sys_prior_hdr) {
+        hdr_sys_set(ps, 1);
+        ps->hdr_sys_enabled_by_us = 1;
+        log_msg("HDR sys: pre-enabled on %s (%s)", ps->hdr_sys_output,
+                ps->out_pq_nits > 0.0f
+                    ? "PQ output — the container is HDR10 even for SDR, "
+                      "so the display stays in HDR for the session"
+                    : "DSVP_FS_HDR_FALLBACK — SDR picture is compromised "
+                      "while this is on");
+    }
+}
+
+/* One-shot, a few seconds after a session-hold launch: the pre-enable
+ * is async so the display's mode switch can overlap shader compile,
+ * which also means nothing ever CONFIRMED it landed. Reap the child
+ * with status, retry once on failure, and log the actual DRM wire
+ * state either way — every session's log then answers "was the
+ * display really in HDR while SDR content showed", which is exactly
+ * the question the no-badge/no-pop field reports could not settle
+ * (2026-08-20). */
+void hdr_sys_verify_hold(PlayerState *ps) {
+    if (!ps->hdr_sys_enabled_by_us) return;
+    hdr_sys_wait();
+    if (s_hdr_sys_last_rc != 0) {
+        log_msg("HDR sys: launch pre-enable FAILED (rc=%d) — retrying",
+                s_hdr_sys_last_rc);
+        hdr_sys_set(ps, 1);
+        hdr_sys_wait();
+        if (s_hdr_sys_last_rc != 0)
+            log_msg("HDR sys: retry also failed — display likely NOT "
+                    "in HDR; KWin will tone-map the PQ surface "
+                    "(flat highlights, no badge)");
+    }
+    hdrwire_log_state();
+}
+
+/* Backstop: restore the display if we exit while it is still ours.
+ * The normal path is hdr_output_apply on file close, which hands the
+ * display back the moment HDR content stops and clears the flag —
+ * so by the time we get here there is usually nothing to do. This
+ * catches the paths that skip it: quit mid-file, window close, and
+ * the signal handlers. The blocking wait is acceptable here and
+ * nowhere else: the process must not exit before kscreen-doctor has
+ * actually put the output back. */
 void hdr_output_shutdown(PlayerState *ps) {
     if (ps->hdr_sys_enabled_by_us) {
         hdr_sys_set(ps, 0);
+        hdr_sys_wait();
         ps->hdr_sys_enabled_by_us = 0;
     }
 }
@@ -1402,23 +2158,90 @@ void hdr_output_apply(PlayerState *ps) {
 
     /* Engage the DISPLAY first: without this, KWin accepts the PQ
      * surface but tone-maps it to an SDR output itself. The TV's own
-     * mode switch overlaps our pipeline recreation below. */
-    if (want) {
-        if (hdr_sys_detect(ps) && !ps->hdr_sys_prior_hdr) {
+     * mode switch overlaps our pipeline recreation below.
+     *
+     * The ordering is load-bearing, so this is the one site that waits
+     * for kscreen-doctor: hdr_sys_set is fire-and-forget everywhere
+     * else, but returning before the output is actually in HDR would
+     * hand KWin a PQ surface on an SDR output and silently lose
+     * passthrough. The wait costs nothing in practice — the TV blanks
+     * for its own 1-2 s mode switch either way.
+     *
+     * hdr_sys_enabled_by_us is the guard, not a fresh probe: when
+     * startup pre-enable already asked for HDR, its kscreen-doctor
+     * child may still be in flight, and a probe here would read the
+     * pre-flip state, report "not HDR", and fire a duplicate enable. */
+    if (want && !ps->hdr_sys_enabled_by_us) {
+        /* Reuse the session baseline when one exists: with the desktop
+         * already in HDR (prior_hdr=1) this block used to run a
+         * BLOCKING kscreen-doctor probe on every toggle into
+         * passthrough — 30-60ms drops per Z press in the 2026-08-20
+         * baseline-hdr-on field log. Same cached-probe pattern as
+         * hdr_sys_preenable; the trade is that a mid-session manual
+         * HDR change by the user is not re-read, which the fresh
+         * probe raced anyway. */
+        if ((ps->hdr_sys_output[0] != '\0' || hdr_sys_detect(ps))
+                && !ps->hdr_sys_prior_hdr) {
             hdr_sys_set(ps, 1);
+            hdr_sys_wait();
             ps->hdr_sys_enabled_by_us = 1;
         }
     }
 
+    /* Non-passthrough output can also ride the HDR10 container: BT.2020
+     * needs 10 bits by spec and the SDR swapchain is 8, so converting
+     * primaries into a narrower code range and quantising there is what
+     * made the wide-gamut picture look blocky and soft. A2R10G10B10
+     * gives the missing bits, and we PQ-encode SDR at a reference white
+     * ourselves rather than leaving the mapping to the compositor —
+     * which is what Windows and macOS do for SDR on an HDR display.
+     * (The extended-linear/scRGB route was tried first and changed
+     * nothing visible: KWin appears not to colour-manage that surface
+     * either. Removed rather than left as dead weight — 932e34a.) */
+    SDL_GPUSwapchainComposition comp =
+        (want || ps->out_pq_nits > 0.0f)
+            ? SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
+            : SDL_GPU_SWAPCHAINCOMPOSITION_SDR;
+    int comp_hdr10 = (comp == SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084);
+
+    /* ── Recreate-skip (TODO-PACING carried item, field-witnessed
+     * 2026-08-20) ── In PQ mode both sides of an HDR↔SDR passthrough
+     * flip ride the HDR10 composition, yet this function still tore
+     * down and recompiled every pipeline (~400 ms) behind a full
+     * WaitForGPUIdle — the log showed it as 731/761 ms freezes with
+     * drop cascades on every mid-playback Z toggle. When the
+     * composition is not actually changing, the entire transition is
+     * a uniform update. The display-handback tail is kept identical
+     * to the full path below; it is unreachable in PQ mode
+     * (out_pq_nits > 0 is what makes the composition stick), and
+     * outside PQ mode a want-flip always changes the composition, so
+     * this branch never skips a real rebuild. */
+    if (comp_hdr10 == ps->swapchain_hdr10) {
+        ps->hdr_out_active = want;
+        ps->gpu_uniforms.hdr_pass = want ? 1.0f : 0.0f;
+        ps->gpu_uniforms.out_pq   = want ? 0.0f : out_pq_uniform(ps);
+        ps->frame_render_dirty = 1;
+        log_msg("HDR out: %s (composition unchanged — no pipeline "
+                "rebuild)", want
+                ? "PASSTHROUGH — HDR10/ST2084 swapchain, display tone-maps"
+                : "SDR — tone-mapped output");
+        if (!want && ps->hdr_sys_enabled_by_us && !hdr_sys_session_hold(ps)) {
+            hdr_sys_set(ps, 0);
+            ps->hdr_sys_enabled_by_us = 0;
+        }
+        return;
+    }
+
     SDL_WaitForGPUIdle(ps->gpu_device);
     if (!SDL_SetGPUSwapchainParameters(ps->gpu_device, ps->window,
-            want ? SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
-                 : SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-            SDL_GPU_PRESENTMODE_VSYNC)) {
+            comp, SDL_GPU_PRESENTMODE_VSYNC)) {
         log_msg("HDR out: swapchain switch failed (%s) — staying %s",
                 SDL_GetError(), ps->hdr_out_active ? "HDR" : "SDR");
         ps->gpu_uniforms.hdr_pass = ps->hdr_out_active ? 1.0f : 0.0f;
-        if (want && ps->hdr_sys_enabled_by_us) {
+        ps->gpu_uniforms.out_pq =
+            ps->hdr_out_active ? 0.0f : out_pq_uniform(ps);
+        if (want && ps->hdr_sys_enabled_by_us
+                && !hdr_sys_session_hold(ps)) {
             hdr_sys_set(ps, 0);   /* don't leave the TV in HDR for SDR */
             ps->hdr_sys_enabled_by_us = 0;
         }
@@ -1433,6 +2256,7 @@ void hdr_output_apply(PlayerState *ps) {
                 "reverting to SDR");
         SDL_SetGPUSwapchainParameters(ps->gpu_device, ps->window,
             SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
+        ps->swapchain_hdr10 = 0;
         /* The failed attempt has no self-cleanup — destroy whatever it
          * did create before retrying, or the retry's unconditional
          * assignments orphan those GPU objects (review P2-26). */
@@ -1441,7 +2265,7 @@ void hdr_output_apply(PlayerState *ps) {
             log_msg("FATAL: SDR pipeline recreation also failed");
         ps->hdr_out_active = 0;
         ps->gpu_uniforms.hdr_pass = 0.0f;
-        if (ps->hdr_sys_enabled_by_us) {
+        if (ps->hdr_sys_enabled_by_us && !hdr_sys_session_hold(ps)) {
             hdr_sys_set(ps, 0);
             ps->hdr_sys_enabled_by_us = 0;
         }
@@ -1449,14 +2273,45 @@ void hdr_output_apply(PlayerState *ps) {
     }
 
     ps->hdr_out_active = want;
+    ps->swapchain_hdr10 = comp_hdr10;
     ps->gpu_uniforms.hdr_pass = want ? 1.0f : 0.0f;
+    /* PQ encode applies to OUR SDR output only. Passthrough already
+     * ships PQ code values straight from the stream and must not be
+     * re-encoded. */
+    ps->gpu_uniforms.out_pq = want ? 0.0f : out_pq_uniform(ps);
     ps->frame_render_dirty = 1;   /* render state changed */
     log_msg("HDR out: %s", want
             ? "PASSTHROUGH — HDR10/ST2084 swapchain, display tone-maps"
             : "SDR — tone-mapped output");
 
-    /* Leaving passthrough: restore the display to its prior state. */
-    if (!want && ps->hdr_sys_enabled_by_us) {
+    /* Leaving passthrough: hand the display back immediately. The
+     * whole point of the smart switch is that HDR is on ONLY while
+     * HDR content is on screen — the desktop, the browser and every
+     * SDR file that follows get the user's own configuration back.
+     *
+     * This was deferred to app exit for one day (194054c) as a
+     * workaround while the fullscreen freeze was misdiagnosed as
+     * "SDR output is the broken state". It wasn't: the freeze tracked
+     * WIDE GAMUT, which we were disabling here without ever having
+     * read it (fixed in aeed00c — hdr_sys_set now restores what
+     * detect actually found and never touches WCG it did not turn
+     * on). With the real cause fixed, deferring is just a bug: one
+     * HDR file left the display in HDR for the rest of the session
+     * and past app exit, which is the opposite of the feature.
+     *
+     * hdr_sys_set is fire-and-forget, and no ordering constraint
+     * applies on the way out — the swapchain is already back to SDR
+     * above, so the display can follow whenever it gets there.
+     *
+     * EXCEPT in PQ mode, where "leaving passthrough" does not mean
+     * leaving HDR: our SDR output is itself PQ/BT.2020 in an HDR10
+     * container, so the display has to stay in HDR for the whole
+     * session. Handing it back here left every SDR file after an HDR
+     * one sending PQ code values to a display that had returned to
+     * SDR — which is exactly the "colour fix never kicked in" case,
+     * and only after an HDR file, because a fresh launch never
+     * reached this branch. hdr_output_shutdown restores it at exit. */
+    if (!want && ps->hdr_sys_enabled_by_us && !hdr_sys_session_hold(ps)) {
         hdr_sys_set(ps, 0);
         ps->hdr_sys_enabled_by_us = 0;
     }
@@ -1479,6 +2334,15 @@ void gpu_destroy_pipelines(PlayerState *ps) {
         SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_noise);
         ps->gpu_tex_noise = NULL;
     }
+    if (ps->gpu_tex_lut_lin) {
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_lut_lin);
+        ps->gpu_tex_lut_lin = NULL;
+    }
+    if (ps->gpu_tex_lut_pq) {
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_lut_pq);
+        ps->gpu_tex_lut_pq = NULL;
+    }
+    ps->pq_lut_active = 0;
     if (ps->gpu_pipeline_yuv) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv);
         ps->gpu_pipeline_yuv = NULL;
@@ -1494,6 +2358,22 @@ void gpu_destroy_pipelines(PlayerState *ps) {
     if (ps->gpu_pipeline_yuv_dilated_frame) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_dilated_frame);
         ps->gpu_pipeline_yuv_dilated_frame = NULL;
+    }
+    if (ps->gpu_pipeline_yuv_direct) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_direct);
+        ps->gpu_pipeline_yuv_direct = NULL;
+    }
+    if (ps->gpu_pipeline_yuv_direct_frame) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_direct_frame);
+        ps->gpu_pipeline_yuv_direct_frame = NULL;
+    }
+    if (ps->gpu_pipeline_yuv_scale2x) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_scale2x);
+        ps->gpu_pipeline_yuv_scale2x = NULL;
+    }
+    if (ps->gpu_pipeline_yuv_scale2x_frame) {
+        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv_scale2x_frame);
+        ps->gpu_pipeline_yuv_scale2x_frame = NULL;
     }
     if (ps->gpu_pipeline_overlay) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_overlay);
@@ -1569,6 +2449,10 @@ static int gpu_frame_tex_ensure(PlayerState *ps, int w, int h) {
  * Both paths use the same YUV planar shader — Texture2D<float> reads
  * the .r channel from either format. The 10-bit path bypasses swscale
  * entirely; raw frame data goes straight to GPU. */
+/* get_buffer2 pool — defined after gpu_destroy_video_textures, which
+ * calls the destroy; declared here so the call site compiles. */
+static void xfer_pool_destroy(PlayerState *ps);
+
 static int gpu_create_video_textures(PlayerState *ps) {
     int w = ps->vid_w;
     int h = ps->vid_h;
@@ -1646,22 +2530,28 @@ static int gpu_create_video_textures(PlayerState *ps) {
         }
     }
 
-    /* Transfer buffers (CPU→GPU staging) */
+    /* Transfer buffers (CPU→GPU staging) — three sets, see dsvp.h:
+     * 0/1 decode-thread ping-pong, 2 main-thread fallback. */
     SDL_GPUTransferBufferCreateInfo xfer_info;
     SDL_zero(xfer_info);
     xfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
 
-    xfer_info.size = (Uint32)w * h * bpp;
-    ps->gpu_xfer_y = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+    for (int s = 0; s < 3; s++) {
+        xfer_info.size = (Uint32)w * h * bpp;
+        ps->gpu_xfer_y[s] = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
 
-    xfer_info.size = (Uint32)cw * ch * bpp;
-    ps->gpu_xfer_u = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
-    ps->gpu_xfer_v = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+        xfer_info.size = (Uint32)cw * ch * bpp;
+        ps->gpu_xfer_u[s] = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
+        ps->gpu_xfer_v[s] = SDL_CreateGPUTransferBuffer(ps->gpu_device, &xfer_info);
 
-    if (!ps->gpu_xfer_y || !ps->gpu_xfer_u || !ps->gpu_xfer_v) {
-        log_msg("ERROR: Failed to create transfer buffers: %s", SDL_GetError());
-        return -1;
+        if (!ps->gpu_xfer_y[s] || !ps->gpu_xfer_u[s] || !ps->gpu_xfer_v[s]) {
+            log_msg("ERROR: Failed to create transfer buffers: %s", SDL_GetError());
+            return -1;
+        }
     }
+    ps->xfer_fill          = 0;
+    ps->decoded_frame_xfer = -1;
+    ps->video_frame_xfer   = -1;
 
     log_msg("GPU: textures created (Y=%dx%d, UV=%dx%d, %s planar)",
             w, h, cw, ch,
@@ -1677,9 +2567,257 @@ static void gpu_destroy_video_textures(PlayerState *ps) {
     if (ps->gpu_tex_u)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_u);  ps->gpu_tex_u  = NULL; }
     if (ps->gpu_tex_v)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_v);  ps->gpu_tex_v  = NULL; }
     if (ps->gpu_tex_uv) { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_uv); ps->gpu_tex_uv = NULL; }
-    if (ps->gpu_xfer_y) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_y); ps->gpu_xfer_y = NULL; }
-    if (ps->gpu_xfer_u) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_u); ps->gpu_xfer_u = NULL; }
-    if (ps->gpu_xfer_v) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_v); ps->gpu_xfer_v = NULL; }
+    for (int s = 0; s < 3; s++) {
+        if (ps->gpu_xfer_y[s]) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_y[s]); ps->gpu_xfer_y[s] = NULL; }
+        if (ps->gpu_xfer_u[s]) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_u[s]); ps->gpu_xfer_u[s] = NULL; }
+        if (ps->gpu_xfer_v[s]) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_v[s]); ps->gpu_xfer_v[s] = NULL; }
+    }
+    ps->decoded_frame_xfer = -1;
+    ps->video_frame_xfer   = -1;
+
+    xfer_pool_destroy(ps);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * get_buffer2 Zero-Copy Decode Pool (TODO-PACING open item 1)
+ *
+ * The decoder writes frames directly into persistently-mapped SDL
+ * transfer buffers. See the XferSlot comment in dsvp.h for the
+ * ownership/cooling model. Deck is Vulkan-only, where SDL transfer
+ * buffers are persistently mapped (Unmap is a no-op), which is what
+ * makes holding the mapping for the file's lifetime legal.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Free callback for one plane's AVBufferRef. Runs on whatever thread
+ * drops the last frame ref (decoder workers, decode thread, main
+ * thread at consume, demux thread at seek flush) — hence the mutex
+ * and the atomic. When the last of the three planes goes, the slot
+ * starts cooling; it may not be handed to the decoder again until
+ * DSVP_XFER_POOL_COOL presents later, by which point the GPU has
+ * provably executed the copy pass that read it (queue order + the
+ * swapchain acquire throttle bound GPU lag to less than that). */
+static void xfer_pool_plane_free(void *opaque, uint8_t *data)
+{
+    XferSlot *slot = (XferSlot *)opaque;
+    (void)data;
+    if (SDL_AtomicDecRef(&slot->plane_refs)) {
+        PlayerState *psl = (PlayerState *)slot->ps;
+        SDL_LockMutex(psl->xfer_pool_mutex);
+        slot->state = XFER_SLOT_COOLING;
+        /* Cross-thread read of a long the main thread increments —
+         * staleness only delays reuse, which is the safe direction. */
+        slot->cool_stamp = (int)psl->presents;
+        SDL_UnlockMutex(psl->xfer_pool_mutex);
+    }
+}
+
+/* AVCodecContext.get_buffer2 — called by FFmpeg (from frame-thread
+ * workers too; must be thread-safe) whenever the decoder needs a
+ * frame buffer. Hands out a pool slot when one fits; anything else
+ * falls back to FFmpeg's own allocator, and such frames simply take
+ * the existing prestage path. A pool miss is a slow frame, never a
+ * wrong frame. */
+static int xfer_pool_get_buffer2(AVCodecContext *avctx, AVFrame *frame,
+                                 int flags)
+{
+    PlayerState *ps = (PlayerState *)avctx->opaque;
+
+    if (!ps || ps->xfer_pool_n <= 0
+            || frame->format != AV_PIX_FMT_YUV420P
+            || frame->width  > ps->xfer_pool_pitch_y
+            || frame->height > ps->xfer_pool_h)
+        return avcodec_default_get_buffer2(avctx, frame, flags);
+
+    XferSlot *slot = NULL;
+    SDL_LockMutex(ps->xfer_pool_mutex);
+    for (int i = 0; i < ps->xfer_pool_n; i++) {
+        XferSlot *s = &ps->xfer_pool[i];
+        if (s->state == XFER_SLOT_FREE ||
+            (s->state == XFER_SLOT_COOLING &&
+             (int)ps->presents - s->cool_stamp >= DSVP_XFER_POOL_COOL)) {
+            s->state = XFER_SLOT_BUSY;
+            SDL_SetAtomicInt(&s->plane_refs, 3);
+            slot = s;
+            break;
+        }
+    }
+    SDL_UnlockMutex(ps->xfer_pool_mutex);
+
+    if (!slot) {
+        ps->xfer_pool_misses++;   /* benign racy counter, diag only */
+        return avcodec_default_get_buffer2(avctx, frame, flags);
+    }
+
+    size_t sz_y = (size_t)ps->xfer_pool_pitch_y  * (ps->xfer_pool_h  + 1) + 64;
+    size_t sz_c = (size_t)ps->xfer_pool_pitch_uv * (ps->xfer_pool_ch + 1) + 64;
+
+    frame->buf[0] = av_buffer_create(slot->my, sz_y,
+                                     xfer_pool_plane_free, slot, 0);
+    frame->buf[1] = av_buffer_create(slot->mu, sz_c,
+                                     xfer_pool_plane_free, slot, 0);
+    frame->buf[2] = av_buffer_create(slot->mv, sz_c,
+                                     xfer_pool_plane_free, slot, 0);
+    if (!frame->buf[0] || !frame->buf[1] || !frame->buf[2]) {
+        /* Unref what exists (each unref fires the plane free cb);
+         * decrement manually for the ones never created so the slot
+         * still reaches zero and cools. */
+        for (int p = 0; p < 3; p++) {
+            if (frame->buf[p]) av_buffer_unref(&frame->buf[p]);
+            else               xfer_pool_plane_free(slot, NULL);
+        }
+        return AVERROR(ENOMEM);
+    }
+
+    frame->data[0] = slot->my;
+    frame->data[1] = slot->mu;
+    frame->data[2] = slot->mv;
+    frame->linesize[0] = ps->xfer_pool_pitch_y;
+    frame->linesize[1] = ps->xfer_pool_pitch_uv;
+    frame->linesize[2] = ps->xfer_pool_pitch_uv;
+    frame->extended_data = frame->data;
+    return 0;
+}
+
+/* Build the pool for the current file, or leave it off (pool_n = 0)
+ * when the file's decode path can't use it — every consumer then
+ * takes the prestage/upload fallbacks unchanged. Called from
+ * player_open after the codec is open and the textures exist,
+ * before the decode thread starts. */
+static void xfer_pool_create(PlayerState *ps)
+{
+    ps->xfer_pool_n        = 0;
+    ps->xfer_pool_misses   = 0;
+    ps->xfer_pool_served   = 0;
+    ps->decoded_frame_slot = -1;
+    ps->video_frame_slot   = -1;
+
+    if (ps->no_pool || ps->vaapi_active || ps->sws_ctx) return;
+    if (ps->video_codec_ctx->pix_fmt != AV_PIX_FMT_YUV420P) return;
+    /* Direct rendering must be supported for get_buffer2 frames. */
+    if (!ps->video_codec_ctx->codec ||
+        !(ps->video_codec_ctx->codec->capabilities & AV_CODEC_CAP_DR1))
+        return;
+
+    /* Size planes the way FFmpeg's own allocator would: aligned
+     * dimensions from the codec, 64-byte row pitch (covers every
+     * SIMD alignment FFmpeg requests), one spare row + 64 bytes of
+     * tail slack per plane for decoder over-read. */
+    int aw = ps->video_codec_ctx->width;
+    int ah = ps->video_codec_ctx->height;
+    {
+        int ls_align[AV_NUM_DATA_POINTERS];
+        avcodec_align_dimensions2(ps->video_codec_ctx, &aw, &ah, ls_align);
+    }
+    ps->xfer_pool_pitch_y  = (aw + 63) & ~63;
+    ps->xfer_pool_pitch_uv = (((aw + 1) / 2) + 63) & ~63;
+    ps->xfer_pool_h        = ah;
+    ps->xfer_pool_ch       = (ah + 1) / 2;
+
+    size_t sz_y = (size_t)ps->xfer_pool_pitch_y  * (ps->xfer_pool_h  + 1) + 64;
+    size_t sz_c = (size_t)ps->xfer_pool_pitch_uv * (ps->xfer_pool_ch + 1) + 64;
+
+    SDL_GPUTransferBufferCreateInfo ci;
+    SDL_zero(ci);
+    ci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+
+    int made = 0;
+    for (int i = 0; i < DSVP_XFER_POOL_SLOTS; i++) {
+        XferSlot *s = &ps->xfer_pool[i];
+        SDL_zerop(s);
+        s->ps = ps;
+        ci.size = (Uint32)sz_y;
+        s->xy = SDL_CreateGPUTransferBuffer(ps->gpu_device, &ci);
+        ci.size = (Uint32)sz_c;
+        s->xu = SDL_CreateGPUTransferBuffer(ps->gpu_device, &ci);
+        s->xv = SDL_CreateGPUTransferBuffer(ps->gpu_device, &ci);
+        if (!s->xy || !s->xu || !s->xv) break;
+        /* Map once, keep forever (cycle=false: fresh buffer, and we
+         * must never rotate the backing under FFmpeg's pointers). */
+        s->my = SDL_MapGPUTransferBuffer(ps->gpu_device, s->xy, false);
+        s->mu = SDL_MapGPUTransferBuffer(ps->gpu_device, s->xu, false);
+        s->mv = SDL_MapGPUTransferBuffer(ps->gpu_device, s->xv, false);
+        if (!s->my || !s->mu || !s->mv) break;
+        s->state = XFER_SLOT_FREE;
+        made = i + 1;
+    }
+
+    if (made < DSVP_XFER_POOL_SLOTS) {
+        /* Partial pool = none: releasing keeps the accounting simple
+         * and the fallback path is fully functional. */
+        for (int i = 0; i < DSVP_XFER_POOL_SLOTS; i++) {
+            XferSlot *s = &ps->xfer_pool[i];
+            if (s->xy) SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xy);
+            if (s->xu) SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xu);
+            if (s->xv) SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xv);
+            SDL_zerop(s);
+        }
+        log_msg("WARN: zero-copy decode pool allocation failed at slot %d "
+                "— falling back to staged uploads", made);
+        return;
+    }
+
+    ps->xfer_pool_mutex = SDL_CreateMutex();
+    if (!ps->xfer_pool_mutex) {
+        for (int i = 0; i < DSVP_XFER_POOL_SLOTS; i++) {
+            XferSlot *s = &ps->xfer_pool[i];
+            SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xy);
+            SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xu);
+            SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xv);
+            SDL_zerop(s);
+        }
+        return;
+    }
+
+    ps->xfer_pool_n = DSVP_XFER_POOL_SLOTS;
+    ps->video_codec_ctx->opaque      = ps;
+    ps->video_codec_ctx->get_buffer2 = xfer_pool_get_buffer2;
+    log_msg("GPU: zero-copy decode pool — %d slots, Y pitch %d, "
+            "%.0f MB (decoder writes straight into transfer buffers; "
+            "DSVP_NO_POOL=1 opts out)",
+            ps->xfer_pool_n, ps->xfer_pool_pitch_y,
+            (double)ps->xfer_pool_n * (sz_y + 2 * sz_c) / (1024.0 * 1024.0));
+}
+
+/* Called from gpu_destroy_video_textures, which player_close reaches
+ * only AFTER the decode/demux threads are joined, video_frame /
+ * decoded_frame are freed, and avcodec_free_context has flushed the
+ * decoder — i.e. every plane ref is gone and no callback can fire
+ * concurrently with this teardown. */
+static void xfer_pool_destroy(PlayerState *ps)
+{
+    if (ps->xfer_pool_n <= 0) return;
+    int busy = 0;
+    for (int i = 0; i < ps->xfer_pool_n; i++) {
+        XferSlot *s = &ps->xfer_pool[i];
+        if (s->state == XFER_SLOT_BUSY) busy++;
+        if (s->xy) { SDL_UnmapGPUTransferBuffer(ps->gpu_device, s->xy);
+                     SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xy); }
+        if (s->xu) { SDL_UnmapGPUTransferBuffer(ps->gpu_device, s->xu);
+                     SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xu); }
+        if (s->xv) { SDL_UnmapGPUTransferBuffer(ps->gpu_device, s->xv);
+                     SDL_ReleaseGPUTransferBuffer(ps->gpu_device, s->xv); }
+        SDL_zerop(s);
+    }
+    if (busy)
+        log_msg("WARN: zero-copy pool destroyed with %d slot(s) still "
+                "busy — a frame ref outlived the codec (should not "
+                "happen; see teardown ordering in player_close)", busy);
+    if (ps->xfer_pool_served || ps->xfer_pool_misses)
+        log_msg("Pool: %d frame(s) served zero-copy%s",
+                ps->xfer_pool_served,
+                ps->xfer_pool_misses ? "" : ", no fallbacks");
+    if (ps->xfer_pool_misses)
+        log_msg("Pool: %d frame(s) fell back to FFmpeg's allocator "
+                "(pool exhausted — staged-upload path served them)",
+                ps->xfer_pool_misses);
+    if (ps->xfer_pool_mutex) {
+        SDL_DestroyMutex(ps->xfer_pool_mutex);
+        ps->xfer_pool_mutex = NULL;
+    }
+    ps->xfer_pool_n = 0;
+    ps->decoded_frame_slot = -1;
+    ps->video_frame_slot   = -1;
 }
 
 
@@ -1865,14 +3003,25 @@ static void gpu_setup_uniforms(PlayerState *ps) {
                 cs_name);
 
     } else {
-        /* swscale fallback — outputs full-range YUV420P, identity range */
-        ps->gpu_uniforms.rangeY[0]  = 0.0f;
-        ps->gpu_uniforms.rangeY[1]  = 1.0f;
-        ps->gpu_uniforms.rangeUV[0] = 0.0f;
-        ps->gpu_uniforms.rangeUV[1] = 1.0f;
+        /* swscale fallback, 8-bit destination — since 2026-08-20 sws
+         * PRESERVES the source range (dst_range = src_range, Knot
+         * audit finding 9) and the shader expands, exactly like the
+         * 8-bit passthrough branch above. Full-range sources keep the
+         * identity-with-half-LSB-neutral math. */
+        if (is_full_range) {
+            ps->gpu_uniforms.rangeY[0]  = 0.0f;
+            ps->gpu_uniforms.rangeY[1]  = 1.0f;
+            ps->gpu_uniforms.rangeUV[0] = 0.5f / 255.0f;
+            ps->gpu_uniforms.rangeUV[1] = 1.0f;
+        } else {
+            ps->gpu_uniforms.rangeY[0]  = 16.0f / 255.0f;
+            ps->gpu_uniforms.rangeY[1]  = 255.0f / (235.0f - 16.0f);
+            ps->gpu_uniforms.rangeUV[0] = 16.0f / 255.0f;
+            ps->gpu_uniforms.rangeUV[1] = 255.0f / (240.0f - 16.0f);
+        }
 
-        log_msg("GPU: uniforms set (%s, full range via swscale)",
-                cs_name);
+        log_msg("GPU: uniforms set (%s, 8-bit %s range via swscale → shader)",
+                cs_name, is_full_range ? "full" : "limited");
     }
 
     /* Color matrix: row-major (matches HLSL row_major qualifier).
@@ -2118,7 +3267,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
 
         /* ── HDR10 static metadata → SDL window properties ──
          * Consumed by the local SDL patch (tools/sdl-patches/
-         * sdl-3.4.2-hdr-metadata.patch): on the next HDR10 swapchain
+         * sdl-3.4.14-hdr-metadata.patch): on the next HDR10 swapchain
          * (re)creation SDL calls vkSetHdrMetadataEXT and Mesa's WSI
          * hands the compositor a fully populated parametric image
          * description — KWin stops tone-mapping our surface blind.
@@ -2316,6 +3465,26 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
         ps->out_gamma_pref = pref;
     }
+    /* Output gamut, like the transfer above: a property of the DISPLAY,
+     * not of the file, so it survives file opens and is re-applied per
+     * file rather than re-derived. DSVP_OUT_GAMUT=2020 sets it at
+     * startup; the M key toggles it live for A/B against the same
+     * frame, which is the only way a primaries change can honestly be
+     * judged. Default stays BT.709 — flipping the default to follow
+     * the display's own wide-gamut state is a separate change, after
+     * the eye has ruled on this one. */
+    /* The HDR10 container is BT.2020 by definition, so PQ output forces
+     * the primaries conversion on regardless of the M-key preference —
+     * emitting 709 code values into a PQ/BT.2020 surface would be the
+     * original oversaturation bug wearing a different hat. */
+    int gamut_2020 = ps->out_gamut_pref || ps->out_pq_nits > 0.0f;
+    ps->gpu_uniforms.out_gamut = gamut_2020 ? 1.0f : 0.0f;
+    ps->gpu_uniforms.out_pq    = out_pq_uniform(ps);
+    log_msg("Output gamut: %s%s",
+            gamut_2020 ? "BT.2020 (wide-gamut display)"
+                       : "BT.709 (default)",
+            ps->out_pq_nits > 0.0f ? " — PQ/HDR10 container" : "");
+
     ps->gpu_uniforms.out_gamma =
         (ps->out_gamma_pref == 1.0f) ? 0.0f : ps->out_gamma_pref;
     log_msg("Output transfer: %s",
@@ -2449,15 +3618,14 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     /* Destroy old resources */
     gpu_overlay_destroy(ps);
 
-    /* Pause audio during GPU allocation — on shared-memory APUs, creating
-     * 33MB+ textures historically stalled the CPU for 200-350ms (pre
-     * exclusive-fullscreen fix). Post-fix, allocation is 1-11ms and the
-     * pause is effectively a no-op, but left in as cheap insurance against
-     * future regressions. */
-    int was_audio_playing = (ps->playing && ps->audio_stream && !ps->paused);
-    if (was_audio_playing) {
-        SDL_PauseAudioStreamDevice(ps->audio_stream);
-    }
+    /* No audio pause around this allocation, deliberately. The old
+     * pause/resume pair (insurance against a 200-350ms alloc stall
+     * that the exclusive-fullscreen fix reduced to 1-11ms) had both
+     * failure returns skip the resume — audio silent for the rest of
+     * the file, recoverable only by pausing twice (Knot audit finding
+     * 4). Deleting the mechanism deletes the bug. Likewise never reset
+     * frame_timer or audio clocks here — lies-to-the-clock accumulate
+     * drift on every overlay alloc / resize. */
     double alloc_start = get_time_sec();
 
     /* Create RGBA8888 texture */
@@ -2502,16 +3670,6 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
 
     log_msg("GPU: overlay texture created (%dx%d RGBA, alloc %.0fms)",
             width, height, (get_time_sec() - alloc_start) * 1000.0);
-
-    /* Resume audio after GPU allocation. Do NOT reset frame_timer or
-     * audio clocks — both are lies-to-the-clock that cause cumulative
-     * drift on every overlay alloc / window resize. The 1-11ms alloc
-     * is within pacing tolerance; let the clocks run undisturbed. */
-    if (ps->playing) {
-        if (was_audio_playing && ps->audio_stream) {
-            SDL_ResumeAudioStreamDevice(ps->audio_stream);
-        }
-    }
 
     return 1;
 }
@@ -2621,9 +3779,21 @@ void gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
     if (!ps->gpu_overlay_tex || !ps->gpu_pipeline_overlay || !ps->overlay_active)
         return;
 
-    /* SDR-authored overlay pixels need PQ re-encode on an HDR
-     * swapchain (see hlsl_overlay_frag). */
-    float ov_params[4] = { ps->hdr_out_active ? 1.0f : 0.0f, 0, 0, 0 };
+    /* SDR-authored overlay pixels need PQ re-encode whenever the
+     * SWAPCHAIN is HDR10 — which in PQ mode is the whole session,
+     * SDR content, browser and idle screen included. Keying this on
+     * hdr_out_active alone left every overlay un-encoded in PQ mode:
+     * white = PQ code 1.0 = 10,000 nits, the exact flashbang the
+     * shader comment warns about (review 2026-08-20 finding 1).
+     * Reference white: 203 nits over passthrough HDR (BT.2408
+     * graphics white); the SDR reference white in SDR-in-PQ mode so
+     * overlay white sits AT video white, not 2x above it. */
+    float ov_params[4] = {
+        ps->swapchain_hdr10 ? 1.0f : 0.0f,
+        (!ps->hdr_out_active && ps->out_pq_nits > 0.0f)
+            ? ps->out_pq_nits : 203.0f,
+        0, 0
+    };
     SDL_PushGPUFragmentUniformData(cmd, 0, ov_params, sizeof(ov_params));
 
     SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_overlay);
@@ -2860,9 +4030,13 @@ static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
  */
 
 
-/* ── SDL_GPU Internal Struct Offsets (SDL3 3.4.2, x86_64 Linux) ── */
+/* ── SDL_GPU Internal Struct Offsets (x86_64 Linux) ──
+ * Validated against SDL3 3.4.2 (session 11) and 3.4.14 (field, the
+ * deployed deck build). vaapi_zerocopy_init refuses the offset path
+ * on any OTHER SDL version (readback fallback) — extend its version
+ * whitelist and this comment together when a new build is validated. */
 
-/* SDL_GPUDevice[+664] → VulkanRenderer* (validated in session 11) */
+/* SDL_GPUDevice[+664] → VulkanRenderer* */
 #define DSVP_VK_WRAPPER_OFFSET     664
 #define DSVP_VK_INSTANCE_OFFSET    0
 #define DSVP_VK_PHYSDEV_OFFSET     8
@@ -2991,12 +4165,36 @@ static int vaapi_zerocopy_validate_vkimage(PlayerState *ps)
 
 
 /* ── Initialize zero-copy: extract Vulkan handles, create cmd pool ── */
+static int zc_sync_mode(void);   /* defined with the upload path below */
+
 int vaapi_zerocopy_init(PlayerState *ps)
 {
     ps->vaapi_zerocopy = 0;
 
     if (!ps->hw_device_ctx) return -1;
     if (!ps->gpu_device) return -1;
+
+    /* The renderer offsets below are hand-validated against SPECIFIC
+     * SDL builds (3.4.2 session 11; 3.4.14 field-verified on the
+     * deployed deck build). Unlike the texture offsets, which get a
+     * behavioural validation in vaapi_zerocopy_validate_vkimage, a
+     * wrong renderer offset is a segfault inside the Vulkan loader at
+     * the vkDeviceWaitIdle below — it dereferences the very pointer
+     * the offsets produced. So refuse the offset path on any other
+     * SDL version and take the readback fallback: a SteamOS SDL bump
+     * must degrade to slow-and-correct, not crash on the first
+     * decoded frame (Knot audit finding 5). When a new SDL version is
+     * validated, add it here AND update the offset comments. */
+    int sdl_ver = SDL_GetVersion();
+    if (sdl_ver != SDL_VERSIONNUM(3, 4, 2) &&
+        sdl_ver != SDL_VERSIONNUM(3, 4, 14)) {
+        log_msg("ZEROCOPY: SDL %d.%d.%d not offset-validated "
+                "(3.4.2/3.4.14 are) — readback fallback",
+                SDL_VERSIONNUM_MAJOR(sdl_ver),
+                SDL_VERSIONNUM_MINOR(sdl_ver),
+                SDL_VERSIONNUM_MICRO(sdl_ver));
+        return -1;
+    }
 
     /* Extract VkDevice, VkQueue from SDL_GPU VulkanRenderer */
     uint8_t *renderer = *(uint8_t **)((uint8_t *)ps->gpu_device + DSVP_VK_WRAPPER_OFFSET);
@@ -3008,6 +4206,20 @@ int vaapi_zerocopy_init(PlayerState *ps)
     ps->vk_device       = *(VkDevice *)(renderer + DSVP_VK_DEVICE_OFFSET);
     ps->vk_queue_family  = *(uint32_t *)(renderer + DSVP_VK_QFI_OFFSET);
     ps->vk_queue         = *(VkQueue *)(renderer + DSVP_VK_QUEUE_OFFSET);
+
+    /* Cheap non-dereferencing sanity before vkDeviceWaitIdle takes
+     * the first dereference: dispatchable Vulkan handles are pointers
+     * — NULL or misaligned means the offsets read garbage. A queue
+     * family index in the thousands means the same. */
+    if (!ps->vk_device || ((uintptr_t)ps->vk_device & 7) ||
+        !ps->vk_queue  || ((uintptr_t)ps->vk_queue & 7) ||
+        ps->vk_queue_family > 255) {
+        log_msg("ZEROCOPY: extracted Vulkan handles fail sanity "
+                "(dev=%p queue=%p qfi=%u) — readback fallback",
+                (void *)ps->vk_device, (void *)ps->vk_queue,
+                ps->vk_queue_family);
+        return -1;
+    }
 
     /* Validate VkDevice */
     if (vkDeviceWaitIdle(ps->vk_device) != VK_SUCCESS) {
@@ -3047,9 +4259,30 @@ int vaapi_zerocopy_init(PlayerState *ps)
         return -1;
     }
 
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    };
+    if (vkCreateFence(ps->vk_device, &fence_info, NULL,
+                      &ps->vk_copy_fence) != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkCreateFence failed");
+        vkDestroyCommandPool(ps->vk_device, ps->vk_cmd_pool, NULL);
+        ps->vk_cmd_pool = VK_NULL_HANDLE;
+        ps->vk_cmd_buf  = VK_NULL_HANDLE;
+        return -1;
+    }
+    ps->vk_copy_pending = 0;
+
     ps->vaapi_zerocopy = 1;
     log_msg("ZEROCOPY: initialized (VkDevice=%p, VADisplay=%p, qfi=%u)",
             (void *)ps->vk_device, ps->va_display, ps->vk_queue_family);
+    log_msg("ZEROCOPY: import cache %s",
+            SDL_getenv("DSVP_ZC_NOCACHE")
+                ? "DISABLED (DSVP_ZC_NOCACHE)" : "enabled");
+    log_msg("ZEROCOPY: copy sync mode: %s",
+            zc_sync_mode() == 2 ? "none (DSVP_ZC_NOSYNC)"
+          : zc_sync_mode() == 0 ? "own-submit fence"
+          : SDL_getenv("DSVP_ZC_SYNC") ? "queue drain (DSVP_ZC_SYNC)"
+          :        "queue drain (implied by DSVP_ZC_NOCACHE)");
     return 0;
 }
 
@@ -3057,10 +4290,40 @@ int vaapi_zerocopy_init(PlayerState *ps)
 /* ── Cleanup zero-copy resources ── */
 void vaapi_zerocopy_cleanup(PlayerState *ps)
 {
+    /* Drain the import cache. The per-frame wait-idle means no copy
+     * is in flight by the time close reaches here; the wait below
+     * covers the paths that skip it (submit failure, early close). */
+    int n = (int)(sizeof(ps->zc_imports) / sizeof(ps->zc_imports[0]));
+    int live = 0;
+    for (int i = 0; i < n; i++)
+        if (ps->zc_imports[i].valid) live++;
+    if ((live || ps->vk_copy_pending) && ps->vk_device) {
+        vkDeviceWaitIdle(ps->vk_device);
+        ps->vk_copy_pending = 0;
+        for (int i = 0; i < n; i++) {
+            if (!ps->zc_imports[i].valid) continue;
+            vkDestroyImage(ps->vk_device, ps->zc_imports[i].img_y, NULL);
+            vkDestroyImage(ps->vk_device, ps->zc_imports[i].img_uv, NULL);
+            vkFreeMemory(ps->vk_device, ps->zc_imports[i].mem_y, NULL);
+            vkFreeMemory(ps->vk_device, ps->zc_imports[i].mem_uv, NULL);
+            ps->zc_imports[i].valid = 0;
+        }
+    }
+    if (ps->zc_cache_hits || ps->zc_cache_misses)
+        log_msg("ZEROCOPY cache: %d hits, %d misses (%d surfaces), "
+                "%d rebuilds",
+                ps->zc_cache_hits, ps->zc_cache_misses, live,
+                ps->zc_cache_rebuilds);
+    ps->zc_cache_hits = ps->zc_cache_misses = ps->zc_cache_rebuilds = 0;
+
     if (ps->vk_cmd_pool && ps->vk_device) {
         vkDestroyCommandPool(ps->vk_device, ps->vk_cmd_pool, NULL);
         ps->vk_cmd_pool = VK_NULL_HANDLE;
         ps->vk_cmd_buf  = VK_NULL_HANDLE;
+    }
+    if (ps->vk_copy_fence && ps->vk_device) {
+        vkDestroyFence(ps->vk_device, ps->vk_copy_fence, NULL);
+        ps->vk_copy_fence = VK_NULL_HANDLE;
     }
     ps->vaapi_zerocopy = 0;
 }
@@ -3191,6 +4454,54 @@ static int import_dmabuf_plane(
  * and copies to the existing SDL_GPU textures via vkCmdCopyImage.
  *
  * Returns 0 on success, -1 on failure (caller falls back to readback). */
+/* ── Copy-synchronisation ladder (Knot gains #3) ──
+ * The old per-frame vkQueueWaitIdle waited on the ENTIRE shared
+ * queue — including the previous frame's SDL render and present — a
+ * hard serialisation point once per frame on the path TODO-RAMHACKS
+ * argues is serialisation-limited. Our command buffer already ends
+ * with a barrier to SHADER_READ_ONLY/FRAGMENT_SHADER, and submission
+ * order on the single queue makes that barrier binding for SDL_GPU's
+ * subsequent render pass.
+ *   default        — fence on OUR OWN submit: same guarantee for our
+ *                    copy, no waiting on SDL's work (ladder step 1).
+ *   DSVP_ZC_SYNC=1 — restore the full queue drain (old behaviour).
+ *   DSVP_ZC_NOSYNC=1 — no post-submit wait at all; the previous
+ *                    frame's fence is collected at the top of the
+ *                    next upload (ladder step 2 — needs the run; any
+ *                    visual difference refutes it, per the doc).
+ * Refutation risk is SDL_GPU's private layout tracking, not the
+ * Vulkan semantics — hence the one-binary A/B switches. */
+static int zc_sync_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        if (SDL_getenv("DSVP_ZC_SYNC"))        mode = 1;
+        else if (SDL_getenv("DSVP_ZC_NOSYNC")) mode = 2;
+        else if (SDL_getenv("DSVP_ZC_NOCACHE")) mode = 1;
+        /* NOCACHE implies the drain: the falsification switch must
+         * restore the PRE-CHANGE configuration, which was per-frame
+         * import + queue drain. Field 2026-08-21: per-frame import
+         * with fence-only sync is a config that never existed and it
+         * is pathological — 33% drops with visible jitter on 4K24
+         * HDR, vs 12% cache+drain and 3% cache+fence in the same
+         * seek-heavy session. The per-frame import path NEEDS the
+         * drain's throttling. Explicit DSVP_ZC_SYNC/NOSYNC still
+         * override for deliberate experiments. */
+        else                                    mode = 0;
+    }
+    return mode;
+}
+
+static void zc_fence_collect(PlayerState *ps) {
+    if (!ps->vk_copy_pending)
+        return;
+    VkResult r = vkWaitForFences(ps->vk_device, 1, &ps->vk_copy_fence,
+                                 VK_TRUE, 1000000000ull /* 1s */);
+    if (r != VK_SUCCESS)
+        log_msg("ZEROCOPY: copy fence wait returned %d", r);
+    vkResetFences(ps->vk_device, 1, &ps->vk_copy_fence);
+    ps->vk_copy_pending = 0;
+}
+
 static int vaapi_zerocopy_upload(PlayerState *ps)
 {
     AVFrame *frame = ps->video_frame;
@@ -3232,40 +4543,125 @@ static int vaapi_zerocopy_upload(PlayerState *ps)
     int cw = (w + 1) / 2;
     int ch = (h + 1) / 2;
 
-    /* Import Y plane */
+    /* Collect the previous frame's copy fence BEFORE anything that
+     * resets the command buffer or destroys images it may still read
+     * (the rebuild path below, vkResetCommandBuffer). Under the
+     * default sync mode this was already collected after submit and
+     * returns instantly; under DSVP_ZC_NOSYNC this is the only wait,
+     * and at 24fps the sub-ms copy finished long ago. */
+    zc_fence_collect(ps);
+
+    /* ── Import cache lookup (Knot gains #2, Tier A) ──
+     * The export above still runs every frame and is the authority on
+     * layout: an entry is reused ONLY when surface id, modifiers,
+     * offsets, pitches, and object sizes all match; any mismatch
+     * destroys and rebuilds. DSVP_ZC_NOCACHE=1 bypasses. */
+    int oy = desc.layers[0].object_index[0];
+    int ou = desc.layers[1].object_index[0];
+    uint64_t mod_y  = desc.objects[oy].drm_format_modifier;
+    uint64_t mod_uv = desc.objects[ou].drm_format_modifier;
+
+    static int zc_nocache = -1;
+    if (zc_nocache < 0)
+        zc_nocache = SDL_getenv("DSVP_ZC_NOCACHE") != NULL;
+
+    struct ZCImportEntry *ent = NULL;
+    int cached = 0;
+    if (!zc_nocache) {
+        struct ZCImportEntry *free_slot = NULL;
+        int n = (int)(sizeof(ps->zc_imports) / sizeof(ps->zc_imports[0]));
+        for (int i = 0; i < n; i++) {
+            if (ps->zc_imports[i].valid &&
+                ps->zc_imports[i].surface == (uint32_t)surface) {
+                ent = &ps->zc_imports[i];
+                break;
+            }
+            if (!ps->zc_imports[i].valid && !free_slot)
+                free_slot = &ps->zc_imports[i];
+        }
+        if (ent) {
+            if (ent->mod_y    == mod_y &&
+                ent->mod_uv   == mod_uv &&
+                ent->off_y    == desc.layers[0].offset[0] &&
+                ent->pitch_y  == desc.layers[0].pitch[0] &&
+                ent->off_uv   == desc.layers[1].offset[0] &&
+                ent->pitch_uv == desc.layers[1].pitch[0] &&
+                ent->size_y   == (size_t)desc.objects[oy].size &&
+                ent->size_uv  == (size_t)desc.objects[ou].size) {
+                cached = 1;
+                ps->zc_cache_hits++;
+            } else {
+                /* Layout changed under a live surface id — rebuild.
+                 * Safe to destroy: zc_fence_collect above guarantees
+                 * the previous frame's copy has retired. */
+                vkDestroyImage(ps->vk_device, ent->img_y, NULL);
+                vkDestroyImage(ps->vk_device, ent->img_uv, NULL);
+                vkFreeMemory(ps->vk_device, ent->mem_y, NULL);
+                vkFreeMemory(ps->vk_device, ent->mem_uv, NULL);
+                ent->valid = 0;
+                ps->zc_cache_rebuilds++;
+            }
+        } else if (free_slot) {
+            ent = free_slot;
+        }
+        /* No slot free (DPB larger than the cache): this frame takes
+         * the uncached path below; ent stays NULL. */
+    }
+
     VkImage vk_img_y = VK_NULL_HANDLE;
     VkDeviceMemory vk_mem_y = VK_NULL_HANDLE;
-    {
-        int obj_idx = desc.layers[0].object_index[0];
+    VkImage vk_img_uv = VK_NULL_HANDLE;
+    VkDeviceMemory vk_mem_uv = VK_NULL_HANDLE;
+
+    if (cached) {
+        vk_img_y  = ent->img_y;
+        vk_mem_y  = ent->mem_y;
+        vk_img_uv = ent->img_uv;
+        vk_mem_uv = ent->mem_uv;
+    } else {
+        /* Import Y plane */
         if (import_dmabuf_plane(ps->vk_device,
-                desc.objects[obj_idx].fd,
-                desc.objects[obj_idx].drm_format_modifier,
+                desc.objects[oy].fd,
+                mod_y,
                 VK_FORMAT_R16_UNORM,
                 w, h,
                 desc.layers[0].offset[0],
                 desc.layers[0].pitch[0],
-                desc.objects[obj_idx].size,
+                desc.objects[oy].size,
                 &vk_img_y, &vk_mem_y) < 0)
             goto fail_close_fds;
-    }
 
-    /* Import UV plane */
-    VkImage vk_img_uv = VK_NULL_HANDLE;
-    VkDeviceMemory vk_mem_uv = VK_NULL_HANDLE;
-    {
-        int obj_idx = desc.layers[1].object_index[0];
+        /* Import UV plane */
         if (import_dmabuf_plane(ps->vk_device,
-                desc.objects[obj_idx].fd,
-                desc.objects[obj_idx].drm_format_modifier,
+                desc.objects[ou].fd,
+                mod_uv,
                 VK_FORMAT_R16G16_UNORM,
                 cw, ch,
                 desc.layers[1].offset[0],
                 desc.layers[1].pitch[0],
-                desc.objects[obj_idx].size,
+                desc.objects[ou].size,
                 &vk_img_uv, &vk_mem_uv) < 0) {
             vkDestroyImage(ps->vk_device, vk_img_y, NULL);
             vkFreeMemory(ps->vk_device, vk_mem_y, NULL);
             goto fail_close_fds;
+        }
+
+        if (ent) {
+            ent->surface  = (uint32_t)surface;
+            ent->mod_y    = mod_y;
+            ent->mod_uv   = mod_uv;
+            ent->off_y    = desc.layers[0].offset[0];
+            ent->pitch_y  = desc.layers[0].pitch[0];
+            ent->off_uv   = desc.layers[1].offset[0];
+            ent->pitch_uv = desc.layers[1].pitch[0];
+            ent->size_y   = (size_t)desc.objects[oy].size;
+            ent->size_uv  = (size_t)desc.objects[ou].size;
+            ent->img_y    = vk_img_y;
+            ent->img_uv   = vk_img_uv;
+            ent->mem_y    = vk_mem_y;
+            ent->mem_uv   = vk_mem_uv;
+            ent->valid    = 1;
+            ps->zc_cache_misses++;
         }
     }
 
@@ -3288,6 +4684,13 @@ static int vaapi_zerocopy_upload(PlayerState *ps)
      * Source (imported): UNDEFINED → TRANSFER_SRC_OPTIMAL
      *   - Content is valid (DMA-BUF data from VAAPI) but Vulkan needs
      *     the layout transition for cache coherency.
+     *   - Also correct for a REUSED cached image: UNDEFINED discards
+     *     prior VULKAN contents only; the pixel data lives in the
+     *     DMA-BUF and is rewritten by VAAPI outside Vulkan each
+     *     decode. Same transition the uncached path performs on every
+     *     first use. (Gains #2 acceptance: verify explicitly on a
+     *     DRM-modifier tiled surface — that is where "discard" would
+     *     have teeth.)
      *
      * Destination (SDL texture): UNDEFINED → TRANSFER_DST_OPTIMAL
      *   - Using UNDEFINED as oldLayout because we're overwriting the
@@ -3400,22 +4803,38 @@ static int vaapi_zerocopy_upload(PlayerState *ps)
         .commandBufferCount = 1,
         .pCommandBuffers = &ps->vk_cmd_buf,
     };
-    VkResult vr = vkQueueSubmit(ps->vk_queue, 1, &submit_info, VK_NULL_HANDLE);
-
-    /* ── Wait for copy to complete before SDL renders ──
-     * On a single-queue GPU (Steam Deck), vkQueueWaitIdle ensures the
-     * copy finishes before we return to the main loop where SDL_GPU
-     * starts its render pass. Cost is negligible (<1ms for GPU copy). */
+    VkResult vr = vkQueueSubmit(ps->vk_queue, 1, &submit_info,
+                                ps->vk_copy_fence);
     if (vr == VK_SUCCESS)
-        vkQueueWaitIdle(ps->vk_queue);
+        ps->vk_copy_pending = 1;
 
-    /* ── Cleanup imported resources ── */
-    vkDestroyImage(dev, vk_img_y, NULL);
-    vkDestroyImage(dev, vk_img_uv, NULL);
-    vkFreeMemory(dev, vk_mem_y, NULL);
-    vkFreeMemory(dev, vk_mem_uv, NULL);
+    /* ── Copy-completion sync, per the ladder (see zc_sync_mode) ── */
+    if (vr == VK_SUCCESS) {
+        int mode = zc_sync_mode();
+        if (mode == 1)
+            vkQueueWaitIdle(ps->vk_queue);   /* old full drain (A/B) */
+        else if (mode == 0)
+            zc_fence_collect(ps);            /* our copy only        */
+        /* mode 2 (NOSYNC): collected at the top of the next upload */
+    }
 
-    /* Close DMA-BUF fds (vaExportSurfaceHandle opened them) */
+    /* ── Cleanup imported resources ──
+     * Cache-owned imports stay alive for the next frame with this
+     * surface; only uncached (slotless) imports are destroyed here. */
+    int owned = (ent && ent->valid && ent->img_y == vk_img_y);
+    if (!owned) {
+        /* This frame's copy reads these images — under NOSYNC the
+         * fence has not been collected yet, so collect before the
+         * destroy. Rare by construction (slotless frame). */
+        zc_fence_collect(ps);
+        vkDestroyImage(dev, vk_img_y, NULL);
+        vkDestroyImage(dev, vk_img_uv, NULL);
+        vkFreeMemory(dev, vk_mem_y, NULL);
+        vkFreeMemory(dev, vk_mem_uv, NULL);
+    }
+
+    /* Close DMA-BUF fds (vaExportSurfaceHandle opened them; the cache
+     * keeps its own references via the dup'd fds Vulkan owns) */
     for (uint32_t i = 0; i < desc.num_objects; i++)
         close(desc.objects[i].fd);
 
@@ -3444,7 +4863,7 @@ fail_close_fds:
  * Without this, reads from stale NFS mounts block indefinitely. */
 static int io_interrupt_cb(void *opaque) {
     PlayerState *ps = (PlayerState *)opaque;
-    if (ps->quit) return 1;
+    if (ps->quit || ps->closing) return 1;
     if (ps->io_deadline > 0.0 && get_time_sec() > ps->io_deadline) {
         log_msg("I/O timeout — aborting blocked read");
         return 1;
@@ -3483,9 +4902,30 @@ int player_open(PlayerState *ps, const char *filename) {
     /* "No networking whatsoever" is enforced, not just claimed: the
      * bundled FFmpeg has network protocols compiled in, so without this
      * whitelist a URL argument would happily demux over the network
-     * (DSVP main fdbb489). */
+     * (DSVP main fdbb489). A shim session (DSVP_SHIM=1, set only by the
+     * shim daemon that launched us) opens the one HTTP stream it was
+     * handed; the cold-start default stays file-only. */
     AVDictionary *open_opts = NULL;
-    av_dict_set(&open_opts, "protocol_whitelist", "file", 0);
+    av_dict_set(&open_opts, "protocol_whitelist",
+                getenv("DSVP_SHIM") ? "file,http,tcp" : "file", 0);
+    /* The protocol whitelist alone leaves the full demuxer set
+     * reachable — including hls and concat, which take sub-resource
+     * references from the file's OWN CONTENT. is_media_file() filters
+     * by extension but avformat probes by content, so a hostile file
+     * named .mkv whose bytes begin #EXTM3U opened as HLS, and with
+     * file whitelisted its playlist entries could name arbitrary
+     * local paths (Knot audit finding 8). Whitelist exactly the
+     * demuxers behind video_extensions[] in main.c — keep the two
+     * lists in step. This also makes the no-networking claim true at
+     * the demuxer layer, not just the protocol layer. */
+    av_dict_set(&open_opts, "format_whitelist",
+                "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2,avi,asf,flv,"
+                "mpegts,mpeg", 0);
+    /* Stream auth rides an HTTP header the daemon provides, never the
+     * URL — a token in the URL is a token in this very log file. */
+    const char *shim_hdrs = getenv("DSVP_SHIM_HEADERS");
+    if (getenv("DSVP_SHIM") && shim_hdrs && shim_hdrs[0])
+        av_dict_set(&open_opts, "headers", shim_hdrs, 0);
     ps->io_deadline = get_time_sec() + 10.0;
     ret = avformat_open_input(&ps->fmt_ctx, filename, NULL, &open_opts);
     ps->io_deadline = 0.0;
@@ -3668,7 +5108,14 @@ int player_open(PlayerState *ps, const char *filename) {
                 if (cid == AV_CODEC_ID_HEVC) {
                     tcount = 1;  /* software fallback only (VAAPI handles normal path) */
                 } else {
-                    tcount = 8;  /* Deck has 8 HW threads — no contention without HEVC decode */
+                    /* 8 threads, full stop. A >40fps→6T gate was tried
+                     * and FALSIFIED 2026-08-20 (same 1080p60 file, same
+                     * session: 6T=7.49%, 8T=3.45% — ce4c466 A/B).
+                     * Race-to-idle wins on the power-shared APU:
+                     * finishing decode fast and sleeping beats
+                     * trickling on fewer cores. DSVP_THREADS=N above
+                     * remains the experiment knob. */
+                    tcount = 8;
                 }
                 log_msg("Thread selection: codec=%s fps=%.2f → %d threads (adaptive)",
                         avcodec_get_name(cid), fps, tcount);
@@ -3935,8 +5382,17 @@ int player_open(PlayerState *ps, const char *filename) {
                 return -1;
             }
 
-            /* Error-diffusion dithering for format conversions */
-            av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
+            /* Error-diffusion dithering for format conversions.
+             * Was av_opt_set_int("dithering", 1, 0) — value 1 is
+             * SWS_DITHER_AUTO, not ED (ED is 3), so the startup log
+             * and debug overlay claimed a dither the code never asked
+             * for (Knot audit finding 12). Set by option/constant
+             * name, with the enum value as fallback, and say so if
+             * neither lands rather than claiming ED anyway. */
+            if (av_opt_set(ps->sws_ctx, "sws_dither", "ed", 0) < 0 &&
+                av_opt_set_int(ps->sws_ctx, "dithering", 3, 0) < 0)
+                log_msg("WARN: swscale ED dither not set — "
+                        "library default in effect");
 
             /* ── Colorspace and range ── */
             {
@@ -3960,7 +5416,16 @@ int player_open(PlayerState *ps, const char *filename) {
                 } else {
                     src_range = 0;
                 }
-                int dst_range = 1;
+                /* 8-bit destination: PRESERVE the source range and
+                 * let the shader's exact 8-bit branch expand, like
+                 * every passthrough path. dst_range=1 here stretched
+                 * 219 luma levels onto 256 in integer space — a
+                 * non-invertible rounding applied before all the
+                 * careful downstream work, on the one path with the
+                 * least eye time (Knot audit finding 9). The 10-bit
+                 * destination keeps the full-range stretch: it happens
+                 * with 4 bits of headroom, where it is harmless. */
+                int dst_range = ps->sws_out_10bit ? 1 : src_range;
 
                 int *inv_table, *table;
                 int cur_src_range, cur_dst_range, brightness, contrast, saturation;
@@ -3973,9 +5438,10 @@ int player_open(PlayerState *ps, const char *filename) {
                     sws_getCoefficients(dst_cs), dst_range,
                     brightness, contrast, saturation);
 
-                log_msg("swscale: colorspace=%s range=%s->full",
+                log_msg("swscale: colorspace=%s range=%s->%s",
                     (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
-                    src_range ? "full" : "limited");
+                    src_range ? "full" : "limited",
+                    dst_range ? "full" : "limited");
             }
 
             /* ── Chroma siting ──
@@ -4082,6 +5548,11 @@ int player_open(PlayerState *ps, const char *filename) {
         return -1;
     }
 
+    /* ── get_buffer2 zero-copy pool (8-bit yuv420p SW decode only;
+     * installs the callback on the codec when it activates, before
+     * the decode thread exists) ── */
+    xfer_pool_create(ps);
+
     /* ── Set up GPU color uniforms ── */
     /* ── Intermediate-texture aptness (per file) ──
      * The render-at-content-rate intermediate only pays when content
@@ -4100,8 +5571,14 @@ int player_open(PlayerState *ps, const char *filename) {
             content_fps = av_q2d(vs->avg_frame_rate);
 
         double refresh = 60.0;
-        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(
-            SDL_GetPrimaryDisplay());
+        /* The WINDOW's display, not the primary: on a docked deck the
+         * primary can be the (disabled) internal panel, and its refresh
+         * would drive the wrong intermediate/direct decision for the
+         * TV. (Known gap: decided once per file open; a mid-file
+         * display change keeps the old verdict.) */
+        SDL_DisplayID disp = SDL_GetDisplayForWindow(ps->window);
+        if (!disp) disp = SDL_GetPrimaryDisplay();
+        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(disp);
         if (dm && dm->refresh_rate > 0.0f)
             refresh = (double)dm->refresh_rate;
 
@@ -4155,6 +5632,7 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->pace_ring_pos      = 0;
     ps->pace_median        = 0.0;
     ps->pace_last_present  = 0.0;
+    ps->pace_content_ema   = 0.0;
     ps->pace_mode          = PACE_SCHEDULED;
     ps->pace_enter_streak  = 0;
     ps->pace_exit_streak   = 0;
@@ -4174,6 +5652,7 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->video_ready = 0;
     ps->last_frame_wall  = 0.0;
     ps->audio_stalled    = 0;
+    ps->bitstream_failed = 0;   /* stale cross-file flag (finding 3) */
 
     /* ── Reset diagnostics ── */
     ps->diag_frames_displayed = 0;
@@ -4190,6 +5669,7 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->rfps_window_frames = 0;
     ps->fps_content        = 0.0;
     ps->fps_render         = 0.0;
+    ps->active_variant     = -1;   /* no render pass yet this file */
 
     /* ── Probe HDMI sink for bitstream capabilities (once per session) ── */
     if (!ps->bitstream_caps.probed)
@@ -4202,8 +5682,17 @@ int player_open(PlayerState *ps, const char *filename) {
         int use_bitstream = 0;
         if (ps->audio_mode != AUDIO_MODE_PCM && ps->bitstream_caps.probed)
             use_bitstream = bitstream_start(ps);
-        if (!use_bitstream)
-            audio_open(ps);
+        if (!use_bitstream && audio_open(ps) < 0) {
+            /* Checked like every sibling site (the finding-2 freeze
+             * class, sixth site — the widest path in the program): a
+             * codec with no device fills audio_pq with nothing
+             * draining it and the demux throttle wedges all playback.
+             * Continue video-only instead. */
+            log_msg("Audio: device open failed at file open — "
+                    "continuing video-only");
+            avcodec_free_context(&ps->audio_codec_ctx);
+            audio_disable_public(ps, "Audio: device error, audio off");
+        }
     }
 
     /* ── Pre-allocate overlay at max display resolution ──
@@ -4260,7 +5749,13 @@ void player_close(PlayerState *ps) {
                 ps->av_bias * 1000.0);
     }
 
-    ps->quit = 1;
+    /* Stop this file's threads via the dedicated close flag. This was
+     * ps->quit = 1 until 2026-08-20: the reset block below then zeroed
+     * quit, silently undoing shim_session_end()'s exit request on the
+     * Q/O/gamepad-B paths — the appliance parked on the idle screen
+     * while dsvp-shim blocked in waitpid (Knot audit finding 1, a
+     * regression of range-review 6a/6b by its own fix). */
+    ps->closing = 1;
 
     /* Join async audio switch thread if running */
     if (ps->audio_switch_thread) {
@@ -4360,7 +5855,7 @@ void player_close(PlayerState *ps) {
     ps->playing            = 0;
     ps->paused             = 0;
     ps->eof                = 0;
-    ps->quit               = 0;
+    ps->closing            = 0;   /* ps->quit deliberately NOT touched */
     ps->vaapi_active       = 0;
     ps->vaapi_nv12         = 0;
     ps->video_stream_idx   = -1;
@@ -4421,7 +5916,7 @@ int demux_thread_func(void *arg) {
     AVPacket *pkt = av_packet_alloc();
     log_msg("Demux thread started");
 
-    while (!ps->quit) {
+    while (!ps->quit && !ps->closing) {
         /* ── Handle seek requests ── */
         if (ps->seek_request) {
             /* Clear the request BEFORE latching the target (P2-8): a
@@ -4511,6 +6006,8 @@ int demux_thread_func(void *arg) {
             SDL_LockMutex(ps->decode_mutex);
             av_frame_unref(ps->decoded_frame);
             ps->decode_frame_ready = 0;
+            ps->decoded_frame_xfer = -1;   /* staged planes die with the frame */
+            ps->decoded_frame_slot = -1;   /* pool ref freed by the unref above */
             ps->decode_eof = 0;
             SDL_SignalCondition(ps->decode_cond);
             SDL_UnlockMutex(ps->decode_mutex);
@@ -4659,6 +6156,12 @@ int demux_thread_func(void *arg) {
 }
 
 
+/* Defined in the GPU upload section below; the decode thread calls it
+ * for the pre-stage copy (review M1), which sits earlier in the file. */
+static int upload_plane(SDL_GPUDevice *device, SDL_GPUTransferBuffer *xfer,
+                        const uint8_t *src, int src_stride,
+                        int width, int height);
+
 /* ═══════════════════════════════════════════════════════════════════
  * Decode Thread
  * ═══════════════════════════════════════════════════════════════════
@@ -4687,17 +6190,19 @@ int decode_thread_func(void *arg) {
     int    diag_gate_count      = 0;    /* decode_frame_ready waits */
     int    diag_seekmtx_count   = 0;    /* seek_mutex contention hits */
 
-    while (!ps->quit) {
+    while (!ps->quit && !ps->closing) {
         /* ── Wait until main loop consumed the previous frame ── */
         SDL_LockMutex(ps->decode_mutex);
-        if (ps->decode_frame_ready && !ps->quit && !ps->seeking) {
+        if (ps->decode_frame_ready && !ps->quit && !ps->closing
+            && !ps->seeking) {
             diag_gate_count++;
         }
-        while (ps->decode_frame_ready && !ps->quit && !ps->seeking)
+        while (ps->decode_frame_ready && !ps->quit && !ps->closing
+               && !ps->seeking)
             SDL_WaitCondition(ps->decode_cond, ps->decode_mutex);
         SDL_UnlockMutex(ps->decode_mutex);
 
-        if (ps->quit) break;
+        if (ps->quit || ps->closing) break;
 
         /* Skip decode when paused, seeking, or not playing */
         if (ps->seeking || !ps->playing || ps->paused) {
@@ -4724,6 +6229,7 @@ int decode_thread_func(void *arg) {
         }
 
         int got_frame = 0;
+        int staged_set = -1;   /* transfer set pre-filled for this frame */
 #ifdef DSVP_PROFILE
         double t_dec0 = get_time_sec();
 #endif
@@ -4838,6 +6344,75 @@ int decode_thread_func(void *arg) {
             av_packet_unref(&pkt);
         }
 
+        /* ── Pre-stage planes into a GPU transfer set (review M1) ──
+         * The Y+U+V staging memcpy (12.4MB/frame at 4K) used to run on
+         * the vsync-gated main thread inside video_display, serial
+         * with present — the biggest recoverable chunk of the frame
+         * tick. Do it HERE instead, into the ping-pong set the main
+         * thread is not reading. Placement is load-bearing: seek_mutex
+         * is still held, and the seek flush (which unrefs
+         * decoded_frame) runs with seek_mutex held, so the frame
+         * cannot vanish mid-copy. Map(cycle=true) rotates off any
+         * backing the GPU still reads; the ping-pong plus the
+         * single-slot handoff guarantees the main thread has already
+         * recorded its copy pass from a set before this thread can
+         * come back around to refill it. Any frame this cannot serve
+         * (VAAPI, swscale, format/size mismatch, map failure,
+         * DSVP_NO_PRESTAGE=1) leaves staged_set at -1 and the main
+         * thread uploads into its own set 2 exactly as before. */
+        /* Pool-backed frame? Its planes ALREADY live in a transfer
+         * buffer — the decoder wrote them there via get_buffer2. No
+         * prestage memcpy at all; just carry the slot index. */
+        int pool_slot = -1;
+        if (got_frame && ps->xfer_pool_n > 0
+                && ps->decoded_frame->buf[0]) {
+            void *op = av_buffer_get_opaque(ps->decoded_frame->buf[0]);
+            if (op >= (void *)&ps->xfer_pool[0]
+                    && op < (void *)&ps->xfer_pool[ps->xfer_pool_n])
+                pool_slot = (int)((XferSlot *)op - &ps->xfer_pool[0]);
+            /* FFmpeg applies container cropping by SHIFTING the
+             * frame's data pointers inside the buffer we handed it.
+             * The pool copy pass binds the slot BASE, so a shifted
+             * frame would display offset by the crop — while the
+             * staged path copies from the shifted pointers and is
+             * correct for free (review 2026-08-20 finding 19).
+             * Cropped frames (rare: crop_top/left content) fall back
+             * to staging. */
+            if (pool_slot >= 0 &&
+                (ps->decoded_frame->data[0] != ps->xfer_pool[pool_slot].my ||
+                 ps->decoded_frame->data[1] != ps->xfer_pool[pool_slot].mu ||
+                 ps->decoded_frame->data[2] != ps->xfer_pool[pool_slot].mv))
+                pool_slot = -1;
+            if (pool_slot >= 0)
+                ps->xfer_pool_served++;   /* decode-thread-only counter */
+        }
+
+        if (got_frame && pool_slot < 0 && !ps->no_prestage
+                && !ps->vaapi_active && !ps->sws_ctx
+                && (ps->decoded_frame->format == AV_PIX_FMT_YUV420P ||
+                    ps->decoded_frame->format == AV_PIX_FMT_YUV420P10LE)
+                && ps->decoded_frame->width  == ps->vid_w
+                && ps->decoded_frame->height == ps->vid_h
+                && ps->gpu_xfer_y[0] && ps->gpu_xfer_y[1]) {
+            const AVFrame *df = ps->decoded_frame;
+            int bpp = (df->format == AV_PIX_FMT_YUV420P10LE) ? 2 : 1;
+            int cw  = (ps->vid_w + 1) / 2;
+            int chh = (ps->vid_h + 1) / 2;
+            int set = ps->xfer_fill;
+            if (upload_plane(ps->gpu_device, ps->gpu_xfer_y[set],
+                             df->data[0], df->linesize[0],
+                             ps->vid_w * bpp, ps->vid_h) == 0 &&
+                upload_plane(ps->gpu_device, ps->gpu_xfer_u[set],
+                             df->data[1], df->linesize[1],
+                             cw * bpp, chh) == 0 &&
+                upload_plane(ps->gpu_device, ps->gpu_xfer_v[set],
+                             df->data[2], df->linesize[2],
+                             cw * bpp, chh) == 0) {
+                staged_set   = set;
+                ps->xfer_fill = set ^ 1;
+            }
+        }
+
         SDL_UnlockMutex(ps->seek_mutex);
 
         /* ── Stall diagnostic: report when decode gap exceeds 200ms ── */
@@ -4888,8 +6463,22 @@ int decode_thread_func(void *arg) {
              * 24fps → 33ms, 60fps → 13ms. */
             double dec_thr = ps->frame_last_delay > 0.001
                 ? ps->frame_last_delay * 800.0 : 13.0;
-            if (dec_ms > dec_thr)
-                log_msg("PROF SPIKE: decode=%.1fms", dec_ms);
+            if (dec_ms > dec_thr) {
+                /* Same 1/s rate limit as the display-side spike line:
+                 * a steadily overloaded decode would otherwise log
+                 * per frame through the unbuffered log. */
+                static double s_dspike_last = 0.0;
+                static int    s_dspike_supp = 0;
+                double now_dsp = get_time_sec();
+                if (now_dsp - s_dspike_last >= 1.0) {
+                    log_msg("PROF SPIKE: decode=%.1fms (+%d suppressed)",
+                            dec_ms, s_dspike_supp);
+                    s_dspike_last = now_dsp;
+                    s_dspike_supp = 0;
+                } else {
+                    s_dspike_supp++;
+                }
+            }
         }
 #endif
 
@@ -4902,8 +6491,13 @@ int decode_thread_func(void *arg) {
              * hiccup (review P2-6). Only publish a frame that
              * survived. */
             SDL_LockMutex(ps->decode_mutex);
-            if (ps->decoded_frame->buf[0])
+            if (ps->decoded_frame->buf[0]) {
                 ps->decode_frame_ready = 1;
+                /* The staged-set / pool-slot index travels with the
+                 * frame it belongs to, published under the mutex. */
+                ps->decoded_frame_xfer = staged_set;
+                ps->decoded_frame_slot = pool_slot;
+            }
             SDL_UnlockMutex(ps->decode_mutex);
         } else {
             SDL_Delay(1); /* no packets or error — yield */
@@ -4964,14 +6558,14 @@ void player_update_display_rect(PlayerState *ps) {
  * Handles stride mismatch: FFmpeg's linesize may be wider than the
  * actual pixel width (alignment padding). The transfer buffer is
  * tightly packed at the target width. */
-static void upload_plane(
+static int upload_plane(
     SDL_GPUDevice *device,
     SDL_GPUTransferBuffer *xfer,
     const uint8_t *src, int src_stride,
     int width, int height)
 {
     uint8_t *dst = SDL_MapGPUTransferBuffer(device, xfer, true);
-    if (!dst) return;
+    if (!dst) return -1;
 
     if (src_stride == width) {
         /* Tightly packed — single memcpy */
@@ -4984,6 +6578,7 @@ static void upload_plane(
     }
 
     SDL_UnmapGPUTransferBuffer(device, xfer);
+    return 0;
 }
 
 
@@ -5704,13 +7299,14 @@ void video_display(PlayerState *ps) {
                 }
             }
 
-            /* Upload Y plane (1 byte/sample) */
-            upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+            /* Upload Y plane (1 byte/sample) — set 2, the main
+             * thread's own (decode thread never stages VAAPI). */
+            upload_plane(ps->gpu_device, ps->gpu_xfer_y[2],
                          f->data[0], f->linesize[0], w, h);
             /* Upload deinterleaved U and V planes (1 byte/sample) */
-            upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+            upload_plane(ps->gpu_device, ps->gpu_xfer_u[2],
                          ps->p010_u_plane, cw, cw, ch);
-            upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+            upload_plane(ps->gpu_device, ps->gpu_xfer_v[2],
                          ps->p010_v_plane, cw, cw, ch);
         } else {
             /* P010: uint16 interleaved UV → separate U[], V[] */
@@ -5724,13 +7320,13 @@ void video_display(PlayerState *ps) {
                 }
             }
 
-            /* Upload Y plane (2 bytes/sample) */
-            upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+            /* Upload Y plane (2 bytes/sample) — set 2, main-thread own */
+            upload_plane(ps->gpu_device, ps->gpu_xfer_y[2],
                          f->data[0], f->linesize[0], w * 2, h);
             /* Upload deinterleaved U and V planes (2 bytes/sample) */
-            upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+            upload_plane(ps->gpu_device, ps->gpu_xfer_u[2],
                          ps->p010_u_plane, cw * 2, cw * 2, ch);
-            upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+            upload_plane(ps->gpu_device, ps->gpu_xfer_v[2],
                          ps->p010_v_plane, cw * 2, cw * 2, ch);
         }
         } /* end if (!zerocopy_ok) */
@@ -5801,13 +7397,19 @@ void video_display(PlayerState *ps) {
 
     /* ── Upload plane data to GPU transfer buffers ──
      * (VAAPI readback path does its own upload above.
-     *  Zero-copy did vkCmdCopyImage — skip everything.) */
-    if (!ps->vaapi_active && !zerocopy_ok) {
-        upload_plane(ps->gpu_device, ps->gpu_xfer_y,
+     *  Zero-copy did vkCmdCopyImage — skip everything.)
+     * When the decode thread pre-staged this frame (review M1,
+     * video_frame_xfer >= 0), the planes already sit in that set and
+     * this 12.4MB main-thread memcpy — formerly the largest single
+     * CPU cost on the vsync-gated thread — is skipped entirely; the
+     * copy pass below binds the staged set instead. */
+    if (!ps->vaapi_active && !zerocopy_ok && ps->video_frame_xfer < 0
+            && ps->video_frame_slot < 0) {
+        upload_plane(ps->gpu_device, ps->gpu_xfer_y[2],
                      src_frame->data[0], src_frame->linesize[0], w * bpp, h);
-        upload_plane(ps->gpu_device, ps->gpu_xfer_u,
+        upload_plane(ps->gpu_device, ps->gpu_xfer_u[2],
                      src_frame->data[1], src_frame->linesize[1], cw * bpp, ch);
-        upload_plane(ps->gpu_device, ps->gpu_xfer_v,
+        upload_plane(ps->gpu_device, ps->gpu_xfer_v[2],
                      src_frame->data[2], src_frame->linesize[2], cw * bpp, ch);
     }
 
@@ -5823,8 +7425,34 @@ void video_display(PlayerState *ps) {
     }
 
     /* ── Copy pass: transfer buffers → GPU textures ──
-     * Skipped in zero-copy mode (data already in textures via Vulkan). */
+     * Skipped in zero-copy mode (data already in textures via Vulkan).
+     * xs = the set holding this frame's planes: the decode thread's
+     * staged set when prestaged, the main thread's set 2 otherwise. */
     if (!zerocopy_ok) {
+    int xs = (ps->video_frame_xfer >= 0 && ps->video_frame_xfer <= 1)
+             ? ps->video_frame_xfer : 2;
+    /* Pool-backed frame: bind the slot the DECODER wrote directly
+     * (get_buffer2 — no staging copy ever happened), with its padded
+     * pitch. pixels_per_row carries the pitch, so the padded layout
+     * uploads without repacking; pool is 8-bit, pixels == bytes. */
+    int psl = (ps->video_frame_slot >= 0
+               && ps->video_frame_slot < ps->xfer_pool_n)
+              ? ps->video_frame_slot : -1;
+    SDL_GPUTransferBuffer *tb_y, *tb_u, *tb_v;
+    Uint32 ppr_y, ppr_c;
+    if (psl >= 0) {
+        tb_y  = ps->xfer_pool[psl].xy;
+        tb_u  = ps->xfer_pool[psl].xu;
+        tb_v  = ps->xfer_pool[psl].xv;
+        ppr_y = (Uint32)ps->xfer_pool_pitch_y;
+        ppr_c = (Uint32)ps->xfer_pool_pitch_uv;
+    } else {
+        tb_y  = ps->gpu_xfer_y[xs];
+        tb_u  = ps->gpu_xfer_u[xs];
+        tb_v  = ps->gpu_xfer_v[xs];
+        ppr_y = (Uint32)w;
+        ppr_c = (Uint32)cw;
+    }
     SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
     {
         SDL_GPUTextureTransferInfo src_info;
@@ -5833,8 +7461,8 @@ void video_display(PlayerState *ps) {
         /* Y plane */
         SDL_zero(src_info);
         SDL_zero(dst_region);
-        src_info.transfer_buffer = ps->gpu_xfer_y;
-        src_info.pixels_per_row  = w;
+        src_info.transfer_buffer = tb_y;
+        src_info.pixels_per_row  = ppr_y;
         src_info.rows_per_layer  = h;
         dst_region.texture = ps->gpu_tex_y;
         dst_region.w = w;
@@ -5845,8 +7473,8 @@ void video_display(PlayerState *ps) {
         /* U plane */
         SDL_zero(src_info);
         SDL_zero(dst_region);
-        src_info.transfer_buffer = ps->gpu_xfer_u;
-        src_info.pixels_per_row  = cw;
+        src_info.transfer_buffer = tb_u;
+        src_info.pixels_per_row  = ppr_c;
         src_info.rows_per_layer  = ch;
         dst_region.texture = ps->gpu_tex_u;
         dst_region.w = cw;
@@ -5857,8 +7485,8 @@ void video_display(PlayerState *ps) {
         /* V plane */
         SDL_zero(src_info);
         SDL_zero(dst_region);
-        src_info.transfer_buffer = ps->gpu_xfer_v;
-        src_info.pixels_per_row  = cw;
+        src_info.transfer_buffer = tb_v;
+        src_info.pixels_per_row  = ppr_c;
         src_info.rows_per_layer  = ch;
         dst_region.texture = ps->gpu_tex_v;
         dst_region.w = cw;
@@ -5910,6 +7538,7 @@ void video_display(PlayerState *ps) {
                           zerocopy_ok && ps->gpu_tex_uv != NULL, 1);
     }
     SDL_SubmitGPUCommandBuffer(cmd);
+    ps->presents++;
 
 #ifdef DSVP_PROFILE
     {
@@ -5923,11 +7552,27 @@ void video_display(PlayerState *ps) {
          * 20ms total = missed VSync boundary by ~3ms. */
         if (ps->prof_peak_ms > 3.0 || ps->prof_upload_ms > 8.0
                 || ps->prof_display_ms > 20.0) {
-            log_msg("PROF SPIKE: upload=%.1f peak=%.1f vsync=%.1f "
-                    "render=%.1f total=%.1fms (frame %d)",
-                    ps->prof_upload_ms, ps->prof_peak_ms,
-                    ps->prof_vsync_ms, ps->prof_render_ms,
-                    ps->prof_display_ms, ps->diag_frames_displayed);
+            /* Rate-limited to 1/s: with the loop ticking 19-21ms the
+             * 20ms line fires on ~every other frame, and each line is
+             * 3 unbuffered write syscalls — the profiler was
+             * perturbing the loop it measures. Suppressed spikes are
+             * counted onto the next emitted line; the 10s DIAG means
+             * are unaffected either way. */
+            static double s_spike_last = 0.0;
+            static int    s_spike_supp = 0;
+            double now_sp = get_time_sec();
+            if (now_sp - s_spike_last >= 1.0) {
+                log_msg("PROF SPIKE: upload=%.1f peak=%.1f vsync=%.1f "
+                        "render=%.1f total=%.1fms (frame %d, +%d suppressed)",
+                        ps->prof_upload_ms, ps->prof_peak_ms,
+                        ps->prof_vsync_ms, ps->prof_render_ms,
+                        ps->prof_display_ms, ps->diag_frames_displayed,
+                        s_spike_supp);
+                s_spike_last = now_sp;
+                s_spike_supp = 0;
+            } else {
+                s_spike_supp++;
+            }
         }
 
         /* Running stats (reset by main.c every 10s DIAG) */
@@ -5994,19 +7639,57 @@ static void render_video_pass(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
          * variant falls back to the fixed FRAME pipeline — never to a
          * swapchain-format pipeline on a frame target. */
         int to_frame = (target == ps->gpu_tex_frame && target != NULL);
+        /* Exact 1:1 (4K-on-4K fullscreen): the kernels reproduce the
+         * identity at ~16 taps/plane; the direct variant fetches once.
+         * Exactness matters — a half-pixel mismatch would bilinear-blur
+         * the whole frame, so anything not an exact match keeps its
+         * kernel. */
+        /* Size alone is not exactness: with a fractional viewport
+         * ORIGIN every fragment lands between texel centres, so the
+         * LINEAR sampler blends — bilinear across the whole frame on
+         * the one path that exists to be exact — and scale2x's
+         * constant weights are valid only at phases {0.25, 0.75},
+         * which hold only for integer origins (Knot audit finding 6).
+         * Benign today (fullscreen/letterboxed origins are 0 or
+         * integer), fires under fractional display scaling or any
+         * future inset/PiP rect. The transition log reports the
+         * honest fallback to the fixed kernel. */
+        int origin_integer = viewport.x == floorf(viewport.x)
+                          && viewport.y == floorf(viewport.y);
+        int one2one = fabsf(viewport.w - (float)ps->vid_w) < 0.5f
+                   && fabsf(viewport.h - (float)ps->vid_h) < 0.5f
+                   && origin_integer;
+        /* Exact 2.0x on both axes (the HiDPI-2.0 fullscreen shape for
+         * 1080p-class sources): constant-weight Lanczos applies. */
+        int two_x = fabsf(viewport.w - 2.0f * (float)ps->vid_w) < 0.5f
+                 && fabsf(viewport.h - 2.0f * (float)ps->vid_h) < 0.5f
+                 && origin_integer;
         SDL_GPUGraphicsPipeline *pipe_fixed = to_frame
             ? ps->gpu_pipeline_yuv_frame : ps->gpu_pipeline_yuv;
         SDL_GPUGraphicsPipeline *pipe_dil = to_frame
             ? ps->gpu_pipeline_yuv_dilated_frame : ps->gpu_pipeline_yuv_dilated;
+        SDL_GPUGraphicsPipeline *pipe_dir = to_frame
+            ? ps->gpu_pipeline_yuv_direct_frame : ps->gpu_pipeline_yuv_direct;
+        SDL_GPUGraphicsPipeline *pipe_2x = to_frame
+            ? ps->gpu_pipeline_yuv_scale2x_frame : ps->gpu_pipeline_yuv_scale2x;
         SDL_GPUGraphicsPipeline *pipe =
-            (downscale && pipe_dil) ? pipe_dil : pipe_fixed;
+            (downscale && pipe_dil) ? pipe_dil
+          : (one2one && pipe_dir)   ? pipe_dir
+          : (two_x && pipe_2x)      ? pipe_2x
+          : pipe_fixed;
         {
-            static int last_dilated = -1;
-            int now_dilated = (downscale && pipe_dil != NULL);
-            if (now_dilated != last_dilated) {
-                last_dilated = now_dilated;
+            /* State lives in PlayerState (not a local static) so the
+             * debug panel reports the variant actually bound. */
+            int now_variant = (downscale && pipe_dil) ? 1
+                            : (one2one && pipe_dir)   ? 2
+                            : (two_x && pipe_2x)      ? 3 : 0;
+            if (now_variant != ps->active_variant) {
+                ps->active_variant = now_variant;
                 log_msg("GPU: sampler variant → %s (vp %.0fx%.0f vs src %dx%d)",
-                        now_dilated ? "dilated (downscale)" : "fixed 4x4",
+                        now_variant == 1 ? "dilated (downscale)"
+                      : now_variant == 2 ? "direct (exact 1:1)"
+                      : now_variant == 3 ? "scale2x (constant weights)"
+                                         : "fixed 4x4",
                         viewport.w, viewport.h, ps->vid_w, ps->vid_h);
             }
         }
@@ -6043,7 +7726,7 @@ static void render_video_pass(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
         SDL_PushGPUFragmentUniformData(cmd, 0,
             &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
 
-        SDL_GPUTextureSamplerBinding bindings[4] = {
+        SDL_GPUTextureSamplerBinding bindings[6] = {
             { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
             { .texture = (use_zc_uv && ps->gpu_tex_uv)
                          ? ps->gpu_tex_uv : ps->gpu_tex_u,
@@ -6051,7 +7734,18 @@ static void render_video_pass(PlayerState *ps, SDL_GPUCommandBuffer *cmd,
             { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
             { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
         };
-        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
+        Uint32 nbind = 4;
+        if (ps->pq_lut_active) {
+            /* LUT-variant shaders declare t4/t5 — bind count must
+             * match the compiled variant (linear+clamp sampler is
+             * exactly what a 1D LUT wants). */
+            bindings[4].texture = ps->gpu_tex_lut_lin;
+            bindings[4].sampler = ps->gpu_sampler;
+            bindings[5].texture = ps->gpu_tex_lut_pq;
+            bindings[5].sampler = ps->gpu_sampler;
+            nbind = 6;
+        }
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, nbind);
 
         SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
 
@@ -6106,10 +7800,21 @@ void video_reblit(PlayerState *ps) {
     if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, ps->window,
             &swapchain_tex, &sc_w, &sc_h)) {
         SDL_CancelGPUCommandBuffer(cmd);
+        /* Was silent — a freeze living entirely on reblit ticks left
+         * zero log evidence (2026-08-14 FS investigation). Throttled:
+         * first failure and every 60th thereafter. */
+        static int s_reblit_acq_fail = 0;
+        if (s_reblit_acq_fail++ % 60 == 0)
+            log_msg("WARN: reblit swapchain acquire failed (x%d): %s",
+                    s_reblit_acq_fail, SDL_GetError());
         return;
     }
     if (!swapchain_tex) {
         SDL_CancelGPUCommandBuffer(cmd);
+        static int s_reblit_null_tex = 0;
+        if (s_reblit_null_tex++ % 60 == 0)
+            log_msg("WARN: reblit acquire returned no texture (x%d)",
+                    s_reblit_null_tex);
         return;
     }
 
@@ -6132,6 +7837,7 @@ void video_reblit(PlayerState *ps) {
                           ps->vaapi_zerocopy && ps->gpu_tex_uv != NULL, 1);
     }
     SDL_SubmitGPUCommandBuffer(cmd);
+    ps->presents++;
 }
 
 
@@ -6319,9 +8025,10 @@ void player_build_debug_info(PlayerState *ps) {
     int   off = 0;
 
     INFO_APPEND("=== DEBUG ===\n");
+    INFO_APPEND("Build:       %s\n", DSVP_GIT_COMMIT);
     INFO_APPEND("Output:      %dx%d (%s)\n",
         ps->sc_w, ps->sc_h,
-        ps->fullscreen ? "exclusive" : "windowed");
+        ps->fullscreen ? "borderless" : "windowed");
 
     /* Real-time FPS + scaler resolution (video streams only) */
     if (ps->video_stream_idx >= 0) {
@@ -6347,8 +8054,6 @@ void player_build_debug_info(PlayerState *ps) {
     }
 
     INFO_APPEND("Renderer: SDL_GPU\n");
-    INFO_APPEND("A/V Bias:    %.1f ms\n",
-        ps->av_bias * 1000.0);
     INFO_APPEND("Video Queue: %d pkts (%d KB)\n",
         ps->video_pq.nb_packets, ps->video_pq.size / 1024);
     INFO_APPEND("Audio Queue: %d pkts (%d KB)\n",
@@ -6387,8 +8092,25 @@ void player_build_debug_info(PlayerState *ps) {
                 "SWS: format convert%s (SWS_LANCZOS + ED dither)\n",
                 ps->sws_out_10bit ? " to 10-bit" : "");
         }
-        INFO_APPEND(
-            "GPU: Lanczos-2 luma, Catmull-Rom chroma, blue noise dither\n");
+        /* Report the kernel actually BOUND — the old static "Lanczos-2
+         * luma" line lied on three of the four variants. */
+        {
+            /* "exact-2x", not "scale2x": same Lanczos-2 kernel, weights
+             * precomputed (identical phase at exactly 2.0x — output is
+             * bit-comparable to the sin path, verified at landing).
+             * The old label read like the pixel-art Scale2x algorithm
+             * and got flagged as a fidelity downgrade in the field. */
+            static const char *variant_names[] = {
+                "fixed 4x4 Lanczos-2",
+                "dilated Lanczos",
+                "direct 1:1 (single fetch)",
+                "exact-2x Lanczos-2 (const weights)",
+            };
+            int v = ps->active_variant;
+            INFO_APPEND("Sampler: %s luma, Catmull-Rom chroma\n",
+                (v >= 0 && v <= 3) ? variant_names[v] : "(no frame yet)");
+            INFO_APPEND("Dither:  blue noise 64x64\n");
+        }
 
         {
             static const char *chroma_names[] = {
@@ -6441,6 +8163,16 @@ void player_build_debug_info(PlayerState *ps) {
         INFO_APPEND("Source:  %s %s %dHz %dch (%s)\n",
             acodec, afmt ? afmt : "?", src_rate, src_ch, layout_desc);
 
+        /* Passthrough truth: with bitstream active the SDL PCM spec
+         * below describes a device that is NOT running — say what the
+         * audio path actually is instead. */
+        if (ps->bitstream_active) {
+            INFO_APPEND("Output:  IEC 61937 passthrough (PipeWire)\n");
+            INFO_APPEND("Pipeline: compressed bits to the sink — no "
+                        "decode, no resample\n");
+            goto audio_done;
+        }
+
         /* Determine output format name from SDL spec */
         const char *out_fmt = (ps->audio_spec.format == SDL_AUDIO_F32) ? "F32" :
                               (ps->audio_spec.format == SDL_AUDIO_S16) ? "S16" : "???";
@@ -6468,6 +8200,7 @@ void player_build_debug_info(PlayerState *ps) {
         else
             INFO_APPEND(
                 "Pipeline: format convert %s->%s\n", afmt ? afmt : "?", out_fmt);
+audio_done:;
     } else {
         INFO_APPEND("No audio\n");
     }
@@ -6481,8 +8214,7 @@ void player_build_debug_info(PlayerState *ps) {
         INFO_APPEND("Active:  %s\n",
             ps->bitstream_active ? "yes" : "no");
         if (ps->bitstream_caps.probed) {
-            INFO_APPEND("Sink:    %s\n",
-                ps->bitstream_caps.alsa_device[0] ? ps->bitstream_caps.alsa_device : "none");
+            INFO_APPEND("Via:     PipeWire (sink chosen at start)\n");
             INFO_APPEND("Codecs:  %s%s%s%s%s\n",
                 ps->bitstream_caps.support_ac3    ? "AC3 " : "",
                 ps->bitstream_caps.support_eac3   ? "EAC3 " : "",
@@ -6494,11 +8226,40 @@ void player_build_debug_info(PlayerState *ps) {
         }
     }
 
+    /* Pacing — the live contract state, same numbers as PACE-DIAG */
+    INFO_APPEND("\n--- Pacing ---\n");
+    INFO_APPEND("Mode:    %s\n",
+        ps->pace_mode == PACE_LOCKED ? "LOCKED" : "SCHEDULED");
+    if (ps->pace_median > 0.0)
+        INFO_APPEND("Cadence: median %.2f ms vs content %.2f ms\n",
+            ps->pace_median * 1000.0, ps->pace_content_ema * 1000.0);
+    else
+        INFO_APPEND("Cadence: sensor filling (content %.2f ms)\n",
+            ps->pace_content_ema * 1000.0);
+
+    /* Zero-copy (VAAPI DMA-BUF route only) */
+    if (ps->vaapi_zerocopy) {
+        INFO_APPEND("\n--- Zero-copy ---\n");
+        INFO_APPEND("Cache:   %d hit / %d miss / %d rebuild\n",
+            ps->zc_cache_hits, ps->zc_cache_misses, ps->zc_cache_rebuilds);
+        INFO_APPEND("Sync:    %s\n",
+            zc_sync_mode() == 1 ? "queue drain"
+          : zc_sync_mode() == 2 ? "none (NOSYNC)" : "own-submit fence");
+    }
+
     /* Playback diagnostics */
     INFO_APPEND("\n--- Diagnostics ---\n");
     INFO_APPEND("Decoded:     %d\n", ps->diag_frames_decoded);
     INFO_APPEND("Displayed:   %d\n", ps->diag_frames_displayed);
-    INFO_APPEND("Dropped:     %d\n", ps->diag_frames_dropped);
+    /* Same formula as the close-out summary (dropped/decoded) — the
+     * panel and the log must never disagree about the same number. */
+    INFO_APPEND("Dropped:     %d (%.2f%%)\n", ps->diag_frames_dropped,
+        ps->diag_frames_decoded > 0
+            ? 100.0 * ps->diag_frames_dropped / ps->diag_frames_decoded
+            : 0.0);
+    if (ps->xfer_pool_served || ps->xfer_pool_misses)
+        INFO_APPEND("Pool:        %d zero-copy, %d fallback\n",
+            ps->xfer_pool_served, ps->xfer_pool_misses);
     INFO_APPEND("Multi-ticks: %d\n", ps->diag_multi_decodes);
     INFO_APPEND("Stall snaps: %d\n", ps->diag_timer_snaps);
     INFO_APPEND("Peak drift:  %.1f ms\n",

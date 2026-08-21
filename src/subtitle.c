@@ -13,7 +13,22 @@
 #include "dsvp.h"
 #include <libavcodec/codec_desc.h>   /* avcodec_descriptor_get — text-vs-bitmap track dispatch */
 #include <limits.h>
+#include <stdlib.h>                  /* getenv — DSVP_SUB_DEBUG gate */
 #include <zlib.h>
+
+/* Per-packet decode tracing is bring-up instrumentation. Left
+ * unconditional it was a burst of unbuffered write syscalls (log file
+ * is _IONBF + a stderr mirror: two syscalls per line, no limit) on
+ * the vsync-gated main thread, inside sub_decode_pending which runs
+ * immediately before overlay_render and video_display every tick —
+ * the exact self-perturbation PROF SPIKE was rate-limited for at
+ * cb75bb2 (Knot audit finding 11). DSVP_SUB_DEBUG=1 turns it back on;
+ * decode ERRORS stay logged unconditionally. */
+static int sub_debug_active(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DSVP_SUB_DEBUG") != NULL;
+    return v;
+}
 
 /* ── Font state (module-level) ─────────────────────────────────────── */
 
@@ -288,6 +303,7 @@ void sub_text_cues_clear(PlayerState *ps) {
     for (int i = 0; i < SUB_TEXT_CUES; i++)
         ps->sub_cues[i].valid = 0;
     ps->sub_cue_count = 0;
+    ps->sub_cue_gen++;
 }
 
 
@@ -457,44 +473,81 @@ static void sub_decode_pending_locked(PlayerState *ps);
  * clear-packet/END-inject machinery stays exactly as field-verified. */
 
 static void sub_text_cue_push(PlayerState *ps, const char *text,
-                              double start, double end) {
+                              double start, double end, double now) {
     int slot = -1;
     for (int i = 0; i < SUB_TEXT_CUES; i++) {
         if (!ps->sub_cues[i].valid) { slot = i; break; }
     }
     if (slot < 0) {
-        /* Full: evict the cue that ends soonest — it has the least
-         * display time left to lose. */
-        slot = 0;
-        for (int i = 1; i < SUB_TEXT_CUES; i++)
-            if (ps->sub_cues[i].end_pts < ps->sub_cues[slot].end_pts)
+        /* Full: prefer evicting a cue that has NOT started (latest
+         * start first — it loses the least), and only displace a cue
+         * that is on screen when every slot is on screen (then the
+         * one ending soonest). The old strict-min-end scan could
+         * replace the live caption with a not-yet-due cue, and with
+         * several same-end rects in one packet it hammered slot 0
+         * (review 2026-08-20 finding 13). */
+        for (int i = 0; i < SUB_TEXT_CUES; i++) {
+            if (ps->sub_cues[i].start_pts > now &&
+                (slot < 0 ||
+                 ps->sub_cues[i].start_pts > ps->sub_cues[slot].start_pts))
                 slot = i;
+        }
+        /* Apply the same metric to the INCOMING cue: when it is itself
+         * not yet due and starts even later than the latest stored
+         * future cue, it is the one that loses the least — drop it
+         * instead of displacing a caption due sooner (staggered
+         * karaoke/typeset bursts hit this). */
+        if (slot >= 0 && start > now &&
+            start > ps->sub_cues[slot].start_pts)
+            return;
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < SUB_TEXT_CUES; i++)
+                if (ps->sub_cues[i].end_pts < ps->sub_cues[slot].end_pts)
+                    slot = i;
+        }
     }
     snprintf(ps->sub_cues[slot].text, SUB_TEXT_SIZE, "%s", text);
     ps->sub_cues[slot].start_pts = start;
     ps->sub_cues[slot].end_pts   = end;
     ps->sub_cues[slot].valid     = 1;
+    ps->sub_cue_gen++;
 }
 
 static void sub_text_drain_multi(PlayerState *ps, PacketQueue *spq, double now) {
     /* Expire first so eviction never has to fight cues that are
      * already off screen. */
     for (int i = 0; i < SUB_TEXT_CUES; i++)
-        if (ps->sub_cues[i].valid && now > ps->sub_cues[i].end_pts)
+        if (ps->sub_cues[i].valid && now > ps->sub_cues[i].end_pts) {
             ps->sub_cues[i].valid = 0;
+            ps->sub_cue_gen++;
+        }
 
     AVPacket pkt;
+    int nopts_consumed = 0;
     for (;;) {
         /* Due-only gate — same rule as the bitmap drain below: never
-         * consume a packet whose time has not come. */
+         * consume a packet whose time has not come. A NOPTS head is
+         * treated as due NOW but rationed to ONE packet per tick —
+         * the old gate simply skipped for NOPTS, draining the whole
+         * queue in one tick, timestamping every cue at 0.0 and then
+         * discarding it as already expired: tracks without packet
+         * pts never showed a single subtitle (review 2026-08-20
+         * finding 10). */
         {
             int64_t head_pts;
-            if (pq_peek_pts(spq, &head_pts) && head_pts != AV_NOPTS_VALUE) {
-                AVStream *head_st =
-                    ps->fmt_ctx->streams[ps->sub_active_idx];
-                double head_sec =
-                    (double)head_pts * av_q2d(head_st->time_base);
-                if (head_sec > now) break;
+            if (pq_peek_pts(spq, &head_pts)) {
+                if (head_pts != AV_NOPTS_VALUE) {
+                    AVStream *head_st =
+                        ps->fmt_ctx->streams[ps->sub_active_idx];
+                    double head_sec =
+                        (double)head_pts * av_q2d(head_st->time_base);
+                    if (head_sec > now) break;
+                } else if (nopts_consumed) {
+                    break;
+                } else {
+                    nopts_consumed = 1;
+                }
             }
         }
         if (pq_get(spq, &pkt, 0) <= 0) break;
@@ -503,8 +556,9 @@ static void sub_text_drain_multi(PlayerState *ps, PacketQueue *spq, double now) 
         int got_sub = 0;
         int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub,
                                            &got_sub, &pkt);
-        log_msg("Sub: MAIN-LOOP pkt_size=%d got_sub=%d rects=%u ret=%d",
-                pkt.size, got_sub, got_sub ? sub.num_rects : 0, ret);
+        if (sub_debug_active())
+            log_msg("Sub: MAIN-LOOP pkt_size=%d got_sub=%d rects=%u ret=%d",
+                    pkt.size, got_sub, got_sub ? sub.num_rects : 0, ret);
         if (ret < 0) {
             log_msg("Sub: decode error ret=%d", ret);
             av_packet_unref(&pkt);
@@ -516,7 +570,9 @@ static void sub_text_drain_multi(PlayerState *ps, PacketQueue *spq, double now) 
         }
 
         AVStream *st = ps->fmt_ctx->streams[ps->sub_active_idx];
-        double pkt_pts = 0.0;
+        /* NOPTS packets anchor to the playback clock, not to 0.0 —
+         * a 0.0 anchor put every cue's end in the distant past. */
+        double pkt_pts = now;
         if (pkt.pts != AV_NOPTS_VALUE)
             pkt_pts = (double)pkt.pts * av_q2d(st->time_base);
 
@@ -554,7 +610,7 @@ static void sub_text_drain_multi(PlayerState *ps, PacketQueue *spq, double now) 
                 log_msg("Sub [ASS] %.1f-%.1f: \"%.*s\"", start, end, 60, text);
             }
             if (text[0])
-                sub_text_cue_push(ps, text, start, end);
+                sub_text_cue_push(ps, text, start, end, now);
         }
 
         avsubtitle_free(&sub);
@@ -676,14 +732,16 @@ static void sub_decode_pending_locked(PlayerState *ps) {
 
         int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub, &got_sub, &decode_pkt);
 
-        if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
-            log_msg("Sub: MAIN-LOOP pkt_size=%d%s got_sub=%d rects=%u ret=%d seg=0x%02X",
-                    pkt.size, decompressed ? " (zlib)" : "",
-                    got_sub, got_sub ? sub.num_rects : 0, ret,
-                    decode_pkt.size > 0 ? decode_pkt.data[0] : 0);
-        } else {
-            log_msg("Sub: MAIN-LOOP pkt_size=%d got_sub=%d rects=%u ret=%d",
-                    pkt.size, got_sub, got_sub ? sub.num_rects : 0, ret);
+        if (sub_debug_active()) {
+            if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
+                log_msg("Sub: MAIN-LOOP pkt_size=%d%s got_sub=%d rects=%u ret=%d seg=0x%02X",
+                        pkt.size, decompressed ? " (zlib)" : "",
+                        got_sub, got_sub ? sub.num_rects : 0, ret,
+                        decode_pkt.size > 0 ? decode_pkt.data[0] : 0);
+            } else {
+                log_msg("Sub: MAIN-LOOP pkt_size=%d got_sub=%d rects=%u ret=%d",
+                        pkt.size, got_sub, got_sub ? sub.num_rects : 0, ret);
+            }
         }
 
         av_free(decompressed);  /* NULL-safe */

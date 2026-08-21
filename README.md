@@ -78,6 +78,7 @@ File Explorer:
 | T              | —                | Cycle SDR target nits (203 / 300 / 400) |
 | G              | —                | Cycle midtone gain (1.0–1.4)            |
 | E              | —                | Cycle output gamma (sRGB / 2.2 / 2.4)   |
+| M              | —                | Output gamut: BT.709 / BT.2020 (match your display) |
 | Z              | —                | Toggle HDR passthrough / tone-map (choice sticks for the session) |
 
 ## Installing on Steam Deck
@@ -168,6 +169,8 @@ Enables GPU validation layers, console output, verbose FFmpeg logging, and debug
 | `DSVP_HWDEC=0` | Disable VAAPI hardware decode, force software |
 | `DSVP_PCM=1` | Force PCM audio decode (skip bitstream passthrough logic) |
 | `DSVP_NO_SYS_HDR=1` | Never touch the display's HDR mode (tone-map only) |
+| `DSVP_OUT_PQ=0` | Don't carry SDR in an HDR10 container, even on a wide-gamut display |
+| `DSVP_OUT_PQ=<nits>` | Force that container on, at this SDR reference white (default 100) |
 | `DSVP_NO_HDR_META=1` | Don't stage HDR10 static metadata for the compositor |
 | `DSVP_NO_DILATE=1` | Disable the dilated downscale sampler variant |
 | `DSVP_OUTPUT_GAMMA=2.2` | Output transfer for tone-mapped content: `srgb` or any gamma 1.0–3.0 (the E key cycles sRGB/2.2/2.4 live) |

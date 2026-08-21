@@ -142,6 +142,21 @@ static int       s_dirty_y1 = 0;  /* last dirty row (exclusive)  */
 static int       s_frame_y0 = 0;  /* current frame accumulator   */
 static int       s_frame_y1 = 0;
 
+/* ── Debug-panel diet (field-convicted 2026-08-21) ──
+ * With the panel visible, every tick re-rastered the full text block
+ * and re-uploaded its row band (~15-20MB/tick at 4K output). That
+ * inflated median tick from ~16.7ms to ~17.5-18.1ms on the scale2x
+ * path — over the 16.67ms budget — pinning pacing in SCHEDULED at
+ * ~5 drops/s while the overlay's own FPS counter honestly reported
+ * the 55fps it was causing. The instrument perturbed the loop it
+ * measures (the PROF SPIKE class, third appearance). Diet: rebuild
+ * the text at 10Hz, and when the debug panel is the ONLY overlay
+ * visible, skip clear/raster/upload entirely on ticks where the text
+ * did not change — the texture already holds the right pixels. */
+static double    s_debug_built_at = 0.0;
+static char      s_debug_prev[4096] = {0};
+static int       s_solo_streak = 0;  /* last drawn frame was solo-debug */
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * Pixel Drawing Primitives
@@ -716,10 +731,20 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
                 int t = order[a]; order[a] = order[b]; order[b] = t;
             }
 
-    /* Combined stacked text — the raster cache keys on this string. */
+    /* Combined stacked text — the raster cache keys on this string.
+     * Rebuilding the join every rendered frame (up to 16KB of snprintf
+     * at 60Hz) defeated the point of that cache (review 2026-08-20
+     * cleanup 23); rebuild only when the visible set or any cue's
+     * content (sub_cue_gen) changed. */
     static char combined[SUB_TEXT_CUES * SUB_TEXT_SIZE];
-    combined[0] = '\0';
-    {
+    static int s_last_order[SUB_TEXT_CUES];
+    static int s_last_nshow = -1;
+    static int s_last_gen   = -1;
+    int same = (nshow == s_last_nshow && ps->sub_cue_gen == s_last_gen);
+    for (int k = 0; same && k < nshow; k++)
+        if (order[k] != s_last_order[k]) same = 0;
+    if (!same) {
+        combined[0] = '\0';
         int pos = 0;
         for (int k = 0; k < nshow; k++) {
             int wrote = snprintf(combined + pos, sizeof(combined) - pos,
@@ -729,6 +754,10 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
             pos += wrote;
             if (pos >= (int)sizeof(combined) - 1) break;
         }
+        s_last_nshow = nshow;
+        s_last_gen   = ps->sub_cue_gen;
+        for (int k = 0; k < nshow; k++)
+            s_last_order[k] = order[k];
     }
     if (combined[0] == '\0') return;
 
@@ -1208,8 +1237,11 @@ static void draw_controls_overlay(uint8_t *buf, int bw, int bh, PlayerState *ps)
         "T           Cycle SDR Target Nits",
         "G           Cycle Midtone Gain",
         "E           Cycle Output Gamma",
+        "M           Output Gamut Toggle",
         "Z           HDR Passthrough Toggle",
         "P           Cycle Audio Mode",
+        "F           Fullscreen Toggle",
+        "I           Media Info",
         NULL
     };
 
@@ -1283,13 +1315,47 @@ void overlay_render(PlayerState *ps) {
     if (!need_seekbar && !need_debug && !need_info &&
         !need_pause && !need_osd && !need_sub && !need_controls && !need_transport) {
         ps->overlay_active = 0;
+        s_solo_streak = 0;
         return;
+    }
+
+    /* Debug text refresh at 10Hz — the counters underneath integrate
+     * every tick in main.c; only the DISPLAY is paced. debug_dirty
+     * means the visible text actually changed since the last raster. */
+    int debug_dirty = 0;
+    if (need_debug) {
+        if (now - s_debug_built_at >= 0.1 || s_debug_built_at <= 0.0) {
+            player_build_debug_info(ps);
+            s_debug_built_at = now;
+            if (strcmp(ps->debug_info, s_debug_prev) != 0) {
+                snprintf(s_debug_prev, sizeof(s_debug_prev), "%s",
+                         ps->debug_info);
+                debug_dirty = 1;
+            }
+        }
+    } else {
+        s_debug_built_at = 0.0;   /* rebuild immediately on next toggle */
+        s_debug_prev[0]  = '\0';
     }
 
     /* ── Ensure GPU overlay texture matches window size ── */
     int tex_fresh = gpu_overlay_ensure(ps, w, h);
     if (tex_fresh < 0) {
         ps->overlay_active = 0;
+        s_solo_streak = 0;
+        return;
+    }
+
+    /* Solo-debug fast path: panel is the only overlay, its text is
+     * unchanged, the texture is not fresh, and the previous drawn
+     * frame was also solo-debug — the texture already shows exactly
+     * this frame. Skip the clear/raster/upload. */
+    int solo_debug = need_debug && !need_seekbar && !need_transport &&
+                     !need_info && !need_pause && !need_osd &&
+                     !need_sub && !need_controls;
+    if (solo_debug && s_solo_streak && !debug_dirty &&
+        tex_fresh == 0 && s_pix_w == w && s_pix_h == h) {
+        ps->overlay_active = 1;
         return;
     }
 
@@ -1336,7 +1402,8 @@ void overlay_render(PlayerState *ps) {
     }
     
     if (need_debug) {
-        player_build_debug_info(ps);  /* refresh live data */
+        /* Text was refreshed (at 10Hz) before the fast-path check —
+         * do NOT rebuild here, or the strcmp gate never sees "same". */
         draw_text_panel(s_pixels, w, h, ps->debug_info,
                         10 * s_ui_scale, 40 * s_ui_scale, 2 * s_ui_scale);
     }
@@ -1373,6 +1440,9 @@ void overlay_render(PlayerState *ps) {
     /* ── Upload to GPU ── */
     gpu_overlay_upload(ps, s_pixels, w, h, up_y0, up_y1);
     ps->overlay_active = 1;
+    /* Arm the solo-debug fast path only after a full draw whose
+     * contents were exactly the solo panel. */
+    s_solo_streak = solo_debug;
 }
 
 

@@ -98,7 +98,8 @@ static int path_accessible(const char *path, int timeout_ms) {
     int ok = SDL_WaitSemaphoreTimeout(a->sem, timeout_ms);
     int result = ok ? a->result : 0;
     if (!ok)
-        log_msg("browser: path check timed out (%dms): %s", timeout_ms, path);
+        log_msg("browser: path check timed out (%dms): %s", timeout_ms,
+                log_path(path));
     path_check_release(a);
     return result;
 }
@@ -308,7 +309,7 @@ void browser_scan(PlayerState *ps) {
      * Fall back to $HOME if the current path is stuck. */
     if (!path_accessible(ps->browser_path, 2000)) {
         log_msg("browser: path inaccessible, falling back to HOME: %s",
-                ps->browser_path);
+                log_path(ps->browser_path));
         const char *home = getenv("HOME");
         snprintf(ps->browser_path, sizeof(ps->browser_path), "%s/",
                  home ? home : "/");
@@ -323,7 +324,8 @@ void browser_scan(PlayerState *ps) {
     /* POSIX directory scan */
     DIR *d = opendir(ps->browser_path);
     if (!d) {
-        log_msg("browser: cannot open directory: %s", ps->browser_path);
+        log_msg("browser: cannot open directory: %s",
+                log_path(ps->browser_path));
         free(entries);
         return;
     }
@@ -391,7 +393,7 @@ void browser_scan(PlayerState *ps) {
                 if (stat(mpath, &mst) != 0 || !S_ISDIR(mst.st_mode))
                     continue;
 
-                log_msg("browser:   user dir: %s", mpath);
+                log_msg("browser:   user dir: %s", log_path(mpath));
 
                 /* Recurse one level into user dirs under /run/media/user/ */
                 DIR *ud = opendir(mpath);
@@ -406,7 +408,7 @@ void browser_scan(PlayerState *ps) {
                     if (stat(upath, &ust) != 0 || !S_ISDIR(ust.st_mode))
                         continue;
 
-                    log_msg("browser:     mount found: %s", upath);
+                    log_msg("browser:     mount found: %s", log_path(upath));
 
                     /* Check not already listed */
                     int dup = 0;
@@ -472,7 +474,7 @@ void browser_scan(PlayerState *ps) {
     ps->browser_scroll = 0;
 
     log_msg("browser: scanned %s — %d entries",
-            log_anon_active() ? "[redacted]" : ps->browser_path, count);
+            log_path(ps->browser_path), count);
 }
 
 
@@ -485,7 +487,7 @@ void browser_init(PlayerState *ps) {
     browser_scan(ps);
     ps->browser_active = 1;
     log_msg("browser: initialized at %s",
-            log_anon_active() ? "[redacted]" : ps->browser_path);
+            log_path(ps->browser_path));
 }
 
 void browser_navigate(PlayerState *ps, int delta) {

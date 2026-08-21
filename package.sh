@@ -4,9 +4,10 @@
 #
 # Usage:
 #   ./package.sh
-#   ./package.sh --skip-build   (reuse existing build/dsvp — it must have
-#                                been built with `make PORTABLE=1`; the
-#                                rpath check below enforces this)
+#   ./package.sh --skip-build   (reuse existing build-portable/dsvp — it
+#                                must have been built with
+#                                `make PORTABLE=1`; the rpath check below
+#                                enforces this)
 
 set -e
 
@@ -22,6 +23,11 @@ fi
 VERSION="$(sed -n 's/^#define DSVP_VERSION *"\(.*\)".*/\1/p' src/dsvp.h)"
 [ -n "$VERSION" ] || { echo "ERROR: cannot read DSVP_VERSION from src/dsvp.h"; exit 1; }
 OUTDIR="DSVP-portable"
+# Portable builds live in their own tree (Makefile PORTDIR). Packaging must
+# never touch build/ — that is the dev binary, and it is linked WITH rpath so
+# it runs bare from the tree. They shared one tree until 2026-08-18, so every
+# package run left ./build/dsvp unable to start.
+BUILD_DIR="build-portable"
 SKIP_BUILD=0
 
 # Builder lib prefixes — must mirror the Makefile defaults (override via
@@ -44,7 +50,8 @@ echo "=== DSVP Packager v${VERSION} ==="
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo -e "\n[1/6] Building (PORTABLE=1, no rpath)..."
-    make clean 2>/dev/null || true
+    # Clear only OUR tree — `make clean` would also delete the dev build.
+    rm -rf "$BUILD_DIR"
     make PORTABLE=1
     echo "      Build OK"
 else
@@ -53,8 +60,8 @@ fi
 
 # ── Verify binary ─────────────────────────────────────────────────
 
-if [ ! -f "build/dsvp" ]; then
-    echo "ERROR: build/dsvp not found."
+if [ ! -f "$BUILD_DIR/dsvp" ]; then
+    echo "ERROR: $BUILD_DIR/dsvp not found."
     exit 1
 fi
 
@@ -62,9 +69,17 @@ fi
 # the closure check below pass on this machine while the bundle fails on
 # a user's — missing libs would resolve through the builder's prefixes
 # (review P1-8 + P2-24). Refuse to package such a binary.
-if readelf -d build/dsvp | grep -qE '\(RPATH\)|\(RUNPATH\)'; then
-    echo "ERROR: build/dsvp carries an rpath — not a portable build."
-    echo "       Rebuild with: make clean && make PORTABLE=1"
+# readelf must exist or the guard silently no-ops: the pipeline failure
+# is swallowed by the if-condition, grep finds nothing, and the closure
+# check below explicitly trusts "no rpath (checked above)" (review
+# 2026-08-20 finding 16).
+command -v readelf >/dev/null 2>&1 || {
+    echo "ERROR: readelf (binutils) is required — the rpath guard cannot run."
+    exit 1
+}
+if readelf -d "$BUILD_DIR/dsvp" | grep -qE '\(RPATH\)|\(RUNPATH\)'; then
+    echo "ERROR: $BUILD_DIR/dsvp carries an rpath — not a portable build."
+    echo "       Rebuild with: rm -rf $BUILD_DIR && make PORTABLE=1"
     echo "       (--skip-build reusing a dev binary?)"
     exit 1
 fi
@@ -78,7 +93,7 @@ mkdir -p "$OUTDIR/lib"
 # ── Copy binary ───────────────────────────────────────────────────
 
 echo "[3/6] Copying binary..."
-cp build/dsvp "$OUTDIR/"
+cp "$BUILD_DIR/dsvp" "$OUTDIR/"
 
 # SteamOS.md ships in the bundle — the README points gamepad users at it,
 # so it has to actually be there, not just in the repo.
@@ -97,7 +112,7 @@ SYSTEM_LIBS="linux-vdso|ld-linux|libc\.so|libm\.so|libpthread|libdl|librt\.so|li
 # `awk '{print $3}' | while [ -f ]` pipeline turned "libX.so => not found"
 # into the token "not" and dropped it silently, then printed "Package
 # complete!" over a broken bundle (review P1-8).
-WALK=$(LD_LIBRARY_PATH="$BUILDER_LIBS" ldd build/dsvp)
+WALK=$(LD_LIBRARY_PATH="$BUILDER_LIBS" ldd "$BUILD_DIR/dsvp")
 if echo "$WALK" | grep -q "not found"; then
     echo "ERROR: unresolved libraries in the dependency walk:"
     echo "$WALK" | grep "not found"
@@ -190,6 +205,10 @@ Controls:
   T          Cycle SDR target nits      (HDR content only: 203/300/400)
   G          Cycle midtone gain         (HDR content only: 1.0-1.4)
   E          Cycle output transfer      (HDR content only: sRGB/2.2/2.4)
+  M          Output gamut: BT.709 / BT.2020
+             (Set this to BT.2020 only if your display is running in
+             wide-gamut mode. On a normal SDR display, leave it alone —
+             BT.709 is correct and is the default.)
   Z          HDR output: display passthrough vs player tone-map
              (HDR content only. Your choice is remembered for the whole
              session, across files — press Z again to switch back.)

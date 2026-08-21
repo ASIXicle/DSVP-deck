@@ -1,76 +1,91 @@
-# DSVP-deck 0.3.7-beta
+# DSVP-deck 0.3.8-beta
 
-The biggest update since launch. Since 0.2.7: real HDR output, PipeWire-native
-bitstream passthrough, a rebuilt frame-pacing engine, multi-cue subtitles,
-FFmpeg 9.0, and a top-to-bottom review-and-fix cycle shipped in
-field-verified batches.
+## ⚠️ KNOWN ISSUE — READ THIS FIRST ⚠️
 
-## HDR, played as HDR
+**On current SteamOS, KWin (the compositor) can freeze fullscreen SDR
+playback when Desktop Mode is NOT in HDR mode.** Playback continues
+underneath — audio runs, seeking works — but the screen shows a frozen
+frame. This is a compositor bug, not a DSVP bug; we have root-caused
+it and are waiting on a SteamOS/KWin update.
 
-- **True HDR output on an HDR display** — per-file HDR10/ST2084 swapchain
-  carries the content's PQ/BT.2020 code values untouched; the display does
-  the tone mapping with its own hardware. DSVP engages and reverts the
-  display's HDR mode automatically per file — the desktop never leaves SDR,
-  and there is nothing to configure.
-- **Z** toggles passthrough ↔ player tone-map live for an instant A/B
-  against your TV (your choice sticks for the session).
-- Dolby Vision Profile 5 (per-frame RPU, polynomial + MMR reshaping) and
-  Profile 8; HLG converts in-shader and rides the same paths.
-- The HDR→SDR tone map (BT.2390, scene-adaptive peak detection) remains the
-  fallback and internal-panel path, with live SDR-target (**T**), midtone
-  gain (**G**), and output-transfer (**E**) controls.
-- HDR10 static metadata is parsed, sanitized, and staged for the compositor;
-  the final metadata-to-display hop lights up as SteamOS support matures.
-  Every HDR session logs the actual wire infoframe (`HDRWIRE:`).
+**Any ONE of these avoids it entirely:**
 
-## Bitstream passthrough (PipeWire-native)
+1. Enable **HDR for Desktop Mode** (Display settings) — recommended;
+   DSVP is tuned for this configuration.
+2. Launch with `DSVP_FS_HDR_FALLBACK=1`.
+3. Play **windowed** — unaffected.
 
-- **AC3 and DTS pass through to your TV/AVR end-to-end** — no setup, no
-  root, no config. Sink capability is probed via ELD; passthrough survives
-  seeks and restarts automatically on audio-track switches.
-- **P** toggles passthrough/PCM live; the OSD shows the active audio mode.
-- E-AC3, TrueHD, and DTS-HD MA currently decode to PCM: SteamOS cannot yet
-  carry high-bitrate IEC to the display. That limitation is upstream, and
-  DSVP falls back cleanly until it lifts.
+---
 
-## Frame pacing, rebuilt
+## Why you should update anyway: a display-safety fix
 
-- Two-mode engine driven by a measured display heartbeat: vsync-locked at
-  true 1:1, slot-assignment scheduling everywhere else. Drops and repeats
-  are planned and evenly spaced instead of threshold-reactive, so A/V sync
-  holds without stutter storms — including windowed, where compositors
-  deliver fewer slots than the content needs.
-- Audio is never resampled, stretched, or paused for pacing.
+**0.3.7-beta could permanently disable your display's wide color gamut
+setting** after HDR playback — surviving reboots, and looking like a
+broken TV. 0.3.8 fixes this completely: DSVP now reads display state
+before ever writing it, restores **exactly** what it found on exit,
+and — new — if the player is killed mid-playback, the next launch
+detects the interrupted session and restores your display's baseline
+automatically. If 0.3.7 already did this to you: re-enable wide gamut
+once in Display settings (or play one HDR file in 0.3.8 and exit).
 
-## Subtitles
+## Performance
 
-- **Multi-cue text subtitles** — up to 4 overlapping cues display at once,
-  stacked broadcast-style (signs + dialogue, second speakers). SRT and
-  ASS/SSA.
-- PGS robustness: zlib-compressed tracks decode correctly, END-stripped
-  MKV muxes display instead of accumulating silently, and seek storms with
-  subtitles enabled are clean.
+- **60fps playback overhauled.** A month-long pacing investigation
+  closed: dropped frames on 60fps content reduced from ~10% to ~0.1%
+  in the tested fullscreen configurations. 4K60 holds locked cadence.
+- **4K HDR (HEVC) decode path**: the Vulkan zero-copy route now caches
+  its per-frame GPU imports (~48 kernel-side DMA-BUF imports/second
+  eliminated) and synchronizes on its own copies instead of draining
+  the shared GPU queue.
+- Debug overlay no longer perturbs playback while open (it previously
+  cost enough to cause drops on the tightest paths — it now updates at
+  10Hz and uploads only on change).
 
-## Under the hood
+## Picture quality
 
-- FFmpeg 9.0, SDL3 3.4.14 (with the bundled HDR-metadata patch),
-  SDL3_shadercross 3.0.0.
+- SDR on a wide-gamut/HDR desktop now rides a properly encoded
+  PQ container with LUT-exact encoding (sqrt-domain, verified
+  numerically end to end).
+- Chroma anti-ringing now applies whenever the output container is
+  PQ — previously HDR-only, leaving SDR-in-PQ content with visible
+  edge color bleed. (Restore old behavior: `DSVP_CHROMA_AR=hdr`.)
+- Exact 2× upscales use a constant-weight Lanczos-2 path —
+  bit-comparable output, a fraction of the GPU cost.
+- The rare software-scaling fallback (8-bit non-4:2:0 sources) now
+  preserves source range exactly instead of a lossy integer stretch.
+- Error-diffusion dithering in format conversion is now actually
+  requested (a mislabeled constant selected "auto" before).
 
-## Install
+## Reliability
 
-Extract the tarball in Desktop Mode and run `dsvp.sh` — see the bundled
-`README.txt` and `SteamOS.md` for Game Mode setup, gamepad mapping, and
-USB/SD drive notes. No root, no installer; survives SteamOS updates.
+- Closed a class of total-playback-freeze bugs where losing the audio
+  device (dock bump, TV input switch) mid-session wedged the pipeline
+  — all six call sites now degrade to video-only with an on-screen
+  notice.
+- Passthrough capability detection now asks PipeWire (the component
+  that actually enforces it) instead of scanning `/proc` — also
+  groundwork for a future Flatpak.
+- Container format whitelist: a file's contents can no longer select
+  an unexpected demuxer (e.g. a renamed playlist).
+- Crash-restore state is validated on read and never placed in
+  world-writable locations.
+- `DSVP_LOG_ANON=1` now redacts every file path in the log (it
+  previously missed most of them), so logs are safe to share.
 
-## Known limitations
+## Debug overlay (D)
 
-- E-AC3 / TrueHD / DTS-HD MA decode to PCM (SteamOS IEC limitation — not
-  the player).
-- Windowed 60fps content drops frames structurally; fullscreen plays clean.
-- Media on a network share freezes if the network drops (kernel-level;
-  every player behaves this way).
-- The Z toggle can take a few seconds on a TV — that's the TV's own HDR
-  mode switch.
-- If fullscreen ever freezes while audio keeps playing: see the README's
-  Troubleshooting section (wedged TV/display state — power-cycle the TV at
-  the wall).
+Rebuilt as a trustworthy instrument: shows the build hash, the
+sampler kernel actually bound, live pacing state and cadence,
+zero-copy cache statistics, drop percentage (same formula as the
+close-out summary), and honest audio-output state during passthrough.
+
+## Known issues (besides the banner above)
+
+- Windowed 60fps has a compositor-side frame-rate ceiling
+  (~54–58 fps) under investigation.
+- Seeking in long-GOP (large keyframe interval) files can show a
+  brief burst of catch-up jerk after the seek lands.
+
+---
+*DSVP — Dead Simple Video Player. Reference-grade playback, no
+settings maze.*

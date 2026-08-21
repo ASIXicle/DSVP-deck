@@ -87,15 +87,25 @@ int audio_decode_frame(PlayerState *ps) {
                     &out_layout, AV_SAMPLE_FMT_FLT, ps->audio_spec.freq,
                     &ps->audio_frame->ch_layout, ps->audio_frame->format,
                     ps->audio_frame->sample_rate, 0, NULL);
-                if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
-                    log_msg("ERROR: swr init failed: %s", av_err2str(ret));
+                int init_err = (ret < 0) ? ret : swr_init(ps->swr_ctx);
+                if (init_err < 0) {
+                    /* Free the half-built ctx or the next callback sees
+                     * a non-NULL swr_ctx with stale in-shape records and
+                     * re-runs this alloc/fail cycle every frame — while
+                     * the old log printed av_err2str(0) = "Success"
+                     * (review 2026-08-20 finding 15). */
+                    log_msg("ERROR: swr init failed: %s", av_err2str(init_err));
+                    swr_free(&ps->swr_ctx);
                     return -1;
                 }
                 ps->swr_in_fmt  = ps->audio_frame->format;
                 ps->swr_in_rate = ps->audio_frame->sample_rate;
                 av_channel_layout_uninit(&ps->swr_in_layout);
-                av_channel_layout_copy(&ps->swr_in_layout,
-                                       &ps->audio_frame->ch_layout);
+                if (av_channel_layout_copy(&ps->swr_in_layout,
+                                           &ps->audio_frame->ch_layout) < 0) {
+                    swr_free(&ps->swr_ctx);
+                    return -1;
+                }
             }
 
             int out_samples = swr_get_out_samples(ps->swr_ctx, ps->audio_frame->nb_samples);
@@ -394,6 +404,12 @@ static void audio_disable(PlayerState *ps, const char *osd_msg) {
     ps->aud_osd_until = get_time_sec() + 2.0;
 }
 
+/* Main-loop entry to the same disable (the bitstream-failed fallback
+ * path needs it and lives in main.c). */
+void audio_disable_public(PlayerState *ps, const char *osd_msg) {
+    audio_disable(ps, osd_msg);
+}
+
 void audio_cycle(PlayerState *ps) {
     if (ps->aud_count <= 1) {
         snprintf(ps->aud_osd, sizeof(ps->aud_osd),
@@ -564,8 +580,19 @@ void audio_cycle(PlayerState *ps) {
             SDL_UnlockMutex(ps->seek_mutex);
             return;
         }
-        /* Bitstream failed -- fall back to PCM */
-        audio_open(ps);
+        /* Bitstream failed -- fall back to PCM. Checked like the open
+         * above: an unchecked failure here left a codec with no device
+         * — audio_pq fills, the demux throttle gates on it forever,
+         * total playback freeze (review 2026-08-20 finding 2, the
+         * 7f09ae0 class this file already documents). */
+        if (audio_open(ps) < 0) {
+            log_msg("Audio: PCM fallback open failed after bitstream "
+                    "failure — continuing video-only");
+            avcodec_free_context(&ps->audio_codec_ctx);
+            audio_disable(ps, "Audio: device error, audio off");
+            SDL_UnlockMutex(ps->seek_mutex);
+            return;
+        }
         log_msg("Audio: bitstream restart failed, falling back to PCM decode");
     }
 
@@ -579,135 +606,31 @@ void audio_cycle(PlayerState *ps) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * Bitstream Probe — HDMI sink capability detection via ALSA ELD
+ * Bitstream Probe — sink capability detection via PipeWire
  *
- * Scans /proc/asound/cardN/eld#M.X files for a connected HDMI monitor.
- * Parses Short Audio Descriptors (SADs) to determine which compressed
- * codecs the sink supports. Maps the ELD index to an ALSA PCM device
- * via /proc/asound/cardN/pcmDp/info matching.
+ * Asks the audio server (bitstream_pw_probe_caps) which compressed
+ * codecs the connected sinks advertise (iec958.codecs, ELD-derived by
+ * WirePlumber server-side). Called once at startup or when the user
+ * toggles audio mode; results cached in ps->bitstream_caps (re-probe
+ * by clearing .probed).
  *
- * Called once at startup or when the user toggles audio mode.
- * Results cached in ps->bitstream_caps (re-probe by clearing .probed).
+ * History: until 2026-08-20 this walked /proc/asound ELD files and
+ * matched PCM ids against the literal "HDMI <n>" to fill alsa_device,
+ * which bitstream_start then gated on — but the PipeWire backend
+ * never read it, /proc/asound does not exist in the Flatpak sandbox
+ * (the shipping target), and any sink whose PCM id was not literally
+ * "HDMI <n>" lost passthrough (Knot audit finding 2; the P6 batch
+ * that deleted the ALSA transport stopped one file short). The server
+ * that enforces the codec list is now also the one asked about it.
  * ═══════════════════════════════════════════════════════════════════ */
 
 void bitstream_probe(PlayerState *ps) {
     memset(&ps->bitstream_caps, 0, sizeof(BitstreamCaps));
-
-    /* ── Scan ELD files for a connected HDMI monitor ── */
-    int card = -1, eld_idx = -1;
-    char eld_path[256];
-
-    for (int c = 0; c < 8; c++) {
-        for (int i = 0; i < 16; i++) {
-            snprintf(eld_path, sizeof(eld_path),
-                     "/proc/asound/card%d/eld#0.%d", c, i);
-            FILE *f = fopen(eld_path, "r");
-            if (!f) continue;
-
-            int present = 0, valid = 0;
-            char line[256];
-            while (fgets(line, sizeof(line), f)) {
-                sscanf(line, " monitor_present %d", &present);
-                sscanf(line, " eld_valid %d", &valid);
-            }
-            fclose(f);
-
-            if (present && valid) {
-                card = c;
-                eld_idx = i;
-                break;
-            }
-        }
-        if (card >= 0) break;
-    }
-
-    if (card < 0) {
-        log_msg("Bitstream: no HDMI monitor detected in ELD scan");
+    /* probed stays 0 when the server is unreachable, so the next file
+     * open retries — mirrors the old no-monitor early return. */
+    if (!bitstream_pw_probe_caps(&ps->bitstream_caps))
         return;
-    }
-
-    /* ── Parse SADs from the active ELD ── */
-    snprintf(eld_path, sizeof(eld_path),
-             "/proc/asound/card%d/eld#0.%d", card, eld_idx);
-    FILE *f = fopen(eld_path, "r");
-    if (!f) return;
-
-    char line[256];
-    char monitor[128] = "";
-
-    while (fgets(line, sizeof(line), f)) {
-        sscanf(line, " monitor_name %127[^\n]", monitor);
-
-        /* Parse SAD coding types: "sadN_coding_type  [0xHEX] ..." */
-        int sad_idx, coding_type;
-        if (sscanf(line, " sad%d_coding_type [0x%x]", &sad_idx, &coding_type) == 2) {
-            switch (coding_type) {
-                case 0x2:  ps->bitstream_caps.support_ac3    = 1; break;
-                case 0x7:  ps->bitstream_caps.support_dts    = 1; break;
-                case 0xa:  ps->bitstream_caps.support_eac3   = 1; break;
-                case 0xb:  ps->bitstream_caps.support_dtshd  = 1; break;
-                case 0xc:  ps->bitstream_caps.support_truehd = 1; break;
-            }
-        }
-
-        /* Track max channel count across all SADs */
-        int channels;
-        if (sscanf(line, " sad%d_channels %d", &sad_idx, &channels) == 2) {
-            if (channels > ps->bitstream_caps.max_channels)
-                ps->bitstream_caps.max_channels = channels;
-        }
-    }
-    fclose(f);
-
-    /* TrueHD requires HBR — if the sink reports TrueHD, it supports HBR */
-    if (ps->bitstream_caps.support_truehd)
-        ps->bitstream_caps.hbr_capable = 1;
-
-    /* ── Map ELD index → ALSA PCM device ──
-     *
-     * ELD index N corresponds to "HDMI N" in the ALSA PCM device info.
-     * Scan /proc/asound/cardC/pcmDp/info files for a matching id line.
-     */
-    char search_id[32];
-    snprintf(search_id, sizeof(search_id), "HDMI %d", eld_idx);
-
-    for (int dev = 0; dev < 32; dev++) {
-        char info_path[256];
-        snprintf(info_path, sizeof(info_path),
-                 "/proc/asound/card%d/pcm%dp/info", card, dev);
-        FILE *info = fopen(info_path, "r");
-        if (!info) continue;
-
-        char info_line[256];
-        while (fgets(info_line, sizeof(info_line), info)) {
-            char id[64];
-            if (sscanf(info_line, " id: %63[^\n]", id) == 1) {
-                if (strcmp(id, search_id) == 0) {
-                    snprintf(ps->bitstream_caps.alsa_device,
-                             sizeof(ps->bitstream_caps.alsa_device),
-                             "hw:%d,%d", card, dev);
-                }
-                break;  /* id is always near the top — stop reading */
-            }
-        }
-        fclose(info);
-        if (ps->bitstream_caps.alsa_device[0]) break;
-    }
-
     ps->bitstream_caps.probed = 1;
-
-    log_msg("Bitstream: probed %s via ELD (card%d, eld#0.%d)",
-            monitor[0] ? monitor : "unknown", card, eld_idx);
-    log_msg("Bitstream: AC3=%d EAC3=%d TrueHD=%d DTS=%d DTS-HD=%d "
-            "HBR=%d maxch=%d device=%s",
-            ps->bitstream_caps.support_ac3,
-            ps->bitstream_caps.support_eac3,
-            ps->bitstream_caps.support_truehd,
-            ps->bitstream_caps.support_dts,
-            ps->bitstream_caps.support_dtshd,
-            ps->bitstream_caps.hbr_capable,
-            ps->bitstream_caps.max_channels,
-            ps->bitstream_caps.alsa_device[0] ? ps->bitstream_caps.alsa_device : "none");
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -908,6 +831,12 @@ static int bitstream_pw_thread_func(void *arg) {
              * check lands (TrueHD ~1200 pkt/s keeps re-rolling the
              * window) — unref like the quit path below or it leaks. */
             if (ret > 0) av_packet_unref(&pkt);
+            /* audio_stalled has no sleep anywhere on its path (pause
+             * sleeps at the loop top, seek resets instantly) — this
+             * continue used to busy-spin a full core for the whole
+             * duration of a video stall, exactly when the decoder
+             * needs CPU to recover (review 2026-08-20 finding 7). */
+            SDL_Delay(5);
             continue;
         }
         if (ret <= 0 || ps->bitstream_quit) {
@@ -984,8 +913,8 @@ static int bitstream_pw_thread_func(void *arg) {
 
 int bitstream_start(PlayerState *ps) {
     ps->bitstream_failed = 0;
-    if (!ps->audio_codec_ctx || !ps->bitstream_caps.alsa_device[0]) {
-        log_msg("Bitstream: no codec or no HDMI sink probed — cannot start");
+    if (!ps->audio_codec_ctx) {
+        log_msg("Bitstream: no audio codec — cannot start");
         return 0;
     }
 
@@ -1001,9 +930,8 @@ int bitstream_start(PlayerState *ps) {
     int channels = 2;  /* IEC 61937 is always stereo (except TrueHD HBR=8ch) */
     if (codec_id == AV_CODEC_ID_TRUEHD) channels = 8;
 
-    log_msg("Bitstream: starting %s passthrough at %d Hz %dch on %s",
-            avcodec_get_name(codec_id), rate, channels,
-            ps->bitstream_caps.alsa_device);
+    log_msg("Bitstream: starting %s passthrough at %d Hz %dch (PipeWire)",
+            avcodec_get_name(codec_id), rate, channels);
 
     /* ── Allocate IEC 61937 output buffer ── */
     ps->spdif_buf = (uint8_t *)av_malloc(SPDIF_MAX_BUF);

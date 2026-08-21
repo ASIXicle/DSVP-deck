@@ -375,6 +375,210 @@ static void bpw_destroy(BitstreamPW *b) {
     free(b);
 }
 
+static void bpw_ensure_init(void) {
+    static int pw_inited = 0;
+    if (!pw_inited) {
+        pw_init(NULL, NULL);
+        pw_inited = 1;
+    }
+}
+
+/* ── Capability probe (replaces the /proc/asound ELD scan) ──────────
+ *
+ * TODO-BITSTREAM P1/P6: capability questions are answered by the
+ * AUDIO SERVER, not by walking /proc — a Flatpak sandbox gets exactly
+ * one audio surface (the PipeWire socket) and no /proc/asound.
+ * WirePlumber publishes each sink's ELD-derived codec list as
+ * iec958.codecs in the node's FULL prop dict (info event; registry
+ * globals carry only a subset — same field lesson as the open path,
+ * 2026-08-09). We take the UNION across Audio/Sink nodes because the
+ * caps cache answers pre-decision questions (e.g. TrueHD track
+ * selection) before any stream exists to target one sink; the open
+ * path then targets a specific sink and negotiation stays the
+ * authority. Quoted-token match so "DTS" cannot false-hit "DTS-HD" —
+ * needle names must stay identical to bpw_map_codec's. */
+
+typedef struct BPWProbeNode {
+    struct BPWProbe *owner;
+    struct pw_proxy *proxy;
+    struct spa_hook  hook;
+} BPWProbeNode;
+
+typedef struct BPWProbe {
+    struct pw_thread_loop *loop;
+    struct pw_context     *context;
+    struct pw_core        *core;
+    struct spa_hook        core_listener;
+    struct pw_registry    *registry;
+    struct spa_hook        registry_listener;
+    int   roundtrip_done;
+    int   roundtrip_seq;
+    int   core_error;
+    BPWProbeNode nodes[BPW_MAX_CANDIDATES];
+    int   n_nodes;
+    int   n_with_codecs;      /* sinks that advertised iec958.codecs   */
+    char  codecs_union[512];  /* concatenated iec958.codecs values     */
+} BPWProbe;
+
+static void probe_on_core_done(void *data, uint32_t id, int seq) {
+    BPWProbe *p = (BPWProbe *)data;
+    if (id == PW_ID_CORE && seq == p->roundtrip_seq) {
+        p->roundtrip_done = 1;
+        pw_thread_loop_signal(p->loop, false);
+    }
+}
+
+static void probe_on_core_error(void *data, uint32_t id, int seq, int res,
+                                const char *message) {
+    BPWProbe *p = (BPWProbe *)data;
+    (void)seq;
+    log_msg("Bitstream[pw]: probe core error id=%u res=%d: %s",
+            id, res, message);
+    p->core_error = 1;
+    pw_thread_loop_signal(p->loop, false);
+}
+
+static const struct pw_core_events probe_core_events = {
+    PW_VERSION_CORE_EVENTS,
+    .done  = probe_on_core_done,
+    .error = probe_on_core_error,
+};
+
+static void probe_on_node_info(void *data, const struct pw_node_info *info) {
+    BPWProbeNode *n = (BPWProbeNode *)data;
+    BPWProbe *p = n->owner;
+    if (!info || !info->props)
+        return;
+    const char *codecs = spa_dict_lookup(info->props, "iec958.codecs");
+    if (!codecs)
+        return;
+    p->n_with_codecs++;
+    size_t len = strlen(p->codecs_union);
+    if (len < sizeof(p->codecs_union) - 2)
+        snprintf(p->codecs_union + len, sizeof(p->codecs_union) - len,
+                 "%s ", codecs);
+}
+
+static const struct pw_node_events probe_node_events = {
+    PW_VERSION_NODE_EVENTS,
+    .info = probe_on_node_info,
+};
+
+static void probe_on_registry_global(void *data, uint32_t id,
+                                     uint32_t permissions, const char *type,
+                                     uint32_t version,
+                                     const struct spa_dict *props) {
+    BPWProbe *p = (BPWProbe *)data;
+    (void)permissions; (void)version;
+    if (!props || p->n_nodes >= BPW_MAX_CANDIDATES)
+        return;
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+        return;
+    const char *mc = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    if (!mc || strcmp(mc, "Audio/Sink") != 0)
+        return;
+    BPWProbeNode *n = &p->nodes[p->n_nodes];
+    memset(n, 0, sizeof(*n));
+    n->owner = p;
+    n->proxy = (struct pw_proxy *)pw_registry_bind(p->registry, id,
+        PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
+    if (!n->proxy)
+        return;
+    pw_node_add_listener((struct pw_node *)n->proxy, &n->hook,
+                         &probe_node_events, n);
+    p->n_nodes++;
+}
+
+static const struct pw_registry_events probe_registry_events = {
+    PW_VERSION_REGISTRY_EVENTS,
+    .global = probe_on_registry_global,
+};
+
+static void probe_destroy(BPWProbe *p) {
+    if (p->loop)
+        pw_thread_loop_stop(p->loop);
+    for (int i = 0; i < p->n_nodes; i++) {
+        if (p->nodes[i].proxy) {
+            spa_hook_remove(&p->nodes[i].hook);
+            pw_proxy_destroy(p->nodes[i].proxy);
+        }
+    }
+    if (p->registry) {
+        spa_hook_remove(&p->registry_listener);
+        pw_proxy_destroy((struct pw_proxy *)p->registry);
+    }
+    if (p->core) {
+        spa_hook_remove(&p->core_listener);
+        pw_core_disconnect(p->core);
+    }
+    if (p->context)
+        pw_context_destroy(p->context);
+    if (p->loop)
+        pw_thread_loop_destroy(p->loop);
+    free(p);
+}
+
+int bitstream_pw_probe_caps(BitstreamCaps *caps) {
+    bpw_ensure_init();
+
+    BPWProbe *p = (BPWProbe *)calloc(1, sizeof(*p));
+    if (!p)
+        return 0;
+
+    p->loop = pw_thread_loop_new("dsvp-bpw-probe", NULL);
+    if (!p->loop) { free(p); return 0; }
+    if (pw_thread_loop_start(p->loop) < 0) {
+        pw_thread_loop_destroy(p->loop);
+        free(p);
+        return 0;
+    }
+
+    pw_thread_loop_lock(p->loop);
+    p->context = pw_context_new(pw_thread_loop_get_loop(p->loop), NULL, 0);
+    p->core = p->context ? pw_context_connect(p->context, NULL, 0) : NULL;
+    if (!p->core) {
+        log_msg("Bitstream[pw]: probe cannot connect to PipeWire");
+        pw_thread_loop_unlock(p->loop);
+        probe_destroy(p);
+        return 0;
+    }
+    pw_core_add_listener(p->core, &p->core_listener, &probe_core_events, p);
+    p->registry = pw_core_get_registry(p->core, PW_VERSION_REGISTRY, 0);
+    pw_registry_add_listener(p->registry, &p->registry_listener,
+                             &probe_registry_events, p);
+
+    /* Two roundtrips, same shape as the open path: globals first
+     * (sinks get bound), then the bound nodes' info events. NO early
+     * exit — the union wants every sink heard from. */
+    for (int rt = 0; rt < 2 && !p->core_error; rt++) {
+        p->roundtrip_done = 0;
+        p->roundtrip_seq = pw_core_sync(p->core, PW_ID_CORE, 0);
+        while (!p->roundtrip_done && !p->core_error) {
+            if (pw_thread_loop_timed_wait(p->loop,
+                                          BPW_ROUNDTRIP_TIMEOUT_S) != 0)
+                break;
+        }
+    }
+    int ok = !p->core_error;
+    int sinks = p->n_nodes, advertised = p->n_with_codecs;
+
+    caps->support_ac3    = strstr(p->codecs_union, "\"AC3\"")    != NULL;
+    caps->support_eac3   = strstr(p->codecs_union, "\"EAC3\"")   != NULL;
+    caps->support_truehd = strstr(p->codecs_union, "\"TrueHD\"") != NULL;
+    caps->support_dts    = strstr(p->codecs_union, "\"DTS\"")    != NULL;
+    caps->support_dtshd  = strstr(p->codecs_union, "\"DTS-HD\"") != NULL;
+
+    pw_thread_loop_unlock(p->loop);
+    probe_destroy(p);
+
+    log_msg("Bitstream: probed via PipeWire (%d sinks, %d advertising "
+            "iec958.codecs): AC3=%d EAC3=%d TrueHD=%d DTS=%d DTS-HD=%d",
+            sinks, advertised,
+            caps->support_ac3, caps->support_eac3, caps->support_truehd,
+            caps->support_dts, caps->support_dtshd);
+    return ok;
+}
+
 /* ── Public API (called from audio.c) ─────────────────────────────── */
 
 int bitstream_pw_open(PlayerState *ps, int av_codec_id, int rate,
@@ -386,11 +590,7 @@ int bitstream_pw_open(PlayerState *ps, int av_codec_id, int rate,
         return 0;
     }
 
-    static int pw_inited = 0;
-    if (!pw_inited) {
-        pw_init(NULL, NULL);
-        pw_inited = 1;
-    }
+    bpw_ensure_init();
 
     BitstreamPW *b = (BitstreamPW *)calloc(1, sizeof(*b));
     if (!b)

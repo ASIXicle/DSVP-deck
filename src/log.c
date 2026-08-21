@@ -86,3 +86,14 @@ void log_msg(const char *fmt, ...) {
 }
 
 int log_anon_active(void) { return g_log_anon; }
+
+/* Path argument for log lines — honours DSVP_LOG_ANON. Every log_msg
+ * that prints a filesystem path routes through this one helper: the
+ * flag exists so a dsvp.log can be shared, and a redaction switch
+ * that misses sites is worse than none because it is trusted (Knot
+ * audit finding 10 — 4 sites redacted, ~10 leaked, including the
+ * full path of every file reached by playlist nav or auto-advance). */
+const char *log_path(const char *path) {
+    if (!path) return "(null)";
+    return g_log_anon ? "[redacted]" : path;
+}

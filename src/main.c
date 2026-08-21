@@ -55,11 +55,33 @@ static void pacing_v2_present_tick(PlayerState *ps, double now) {
     if (!ps->playing)
         return;
 
+    /* Content cadence: EMA of pts deltas, not the last delta. A
+     * 1ms-quantized container timebase makes 59.94fps deltas
+     * alternate ~16/17ms; comparing the 32-median against ONE such
+     * sample can never hold the 0.25ms entry tolerance for 30
+     * straight presents (PACE-DIAG conviction 2026-08-20: streak
+     * peaked at 6 in 124s while the median sat rock-steady). The
+     * machine locks to the AVERAGE cadence; per-delta wobble is
+     * quantization, not content. */
+    if (ps->frame_last_delay > 0.0) {
+        if (ps->pace_content_ema <= 0.0)
+            ps->pace_content_ema = ps->frame_last_delay;
+        else
+            ps->pace_content_ema = ps->pace_content_ema * 0.95
+                                 + ps->frame_last_delay * 0.05;
+    }
+
     /* Measure: interval between presents; transients >100ms are
-     * stall/seek boundaries, not cadence. */
+     * stall/seek boundaries, not cadence. Gaps spanning DROPPED
+     * ticks are not cadence either — a drop presents nothing, so
+     * the next present's dt is ~2 slots and each slip-crossing
+     * burst poisoned the median for ~half a second (field:
+     * median=20.00ms right after the startup burst). */
     if (ps->pace_last_present > 0.0) {
         double dt = now - ps->pace_last_present;
-        if (dt < 0.1) {
+        if (dt < 0.1
+                && (ps->pace_content_ema <= 0.0
+                    || dt < ps->pace_content_ema * 1.5)) {
             ps->pace_ring[ps->pace_ring_pos] = dt;
             ps->pace_ring_pos = (ps->pace_ring_pos + 1) % 32;
             if (ps->pace_ring_n < 32)
@@ -83,8 +105,9 @@ static void pacing_v2_present_tick(PlayerState *ps, double now) {
     }
     ps->pace_last_present = now;
 
-    /* Mode machine — cadence contracts. */
-    double content_dt = ps->frame_last_delay;
+    /* Mode machine — cadence contracts (smoothed content side). */
+    double content_dt = (ps->pace_content_ema > 0.0)
+                        ? ps->pace_content_ema : ps->frame_last_delay;
     int rate_ok = (content_dt > 0.001 && content_dt < 0.020);
     if (ps->pace_median <= 0.0 || !rate_ok) {
         ps->pace_enter_streak = 0;
@@ -103,6 +126,25 @@ static void pacing_v2_present_tick(PlayerState *ps, double now) {
     }
 
     double err = fabs(ps->pace_median - content_dt);
+    /* PACE-DIAG (rate-limited): the entry contract's live state, so a
+     * never-locking file names WHICH gate fails instead of leaving it
+     * to inference. Added hunting the 1080p60 case: 138s in SCHEDULED
+     * with clean ticks and (apparently) satisfiable gates, zero
+     * entries — and the periodic drop bursts feed ~33ms present gaps
+     * into the cadence ring, so the median may be resetting the
+     * streak every slip crossing. This line settles it in one run. */
+    if (ps->pace_mode == PACE_SCHEDULED) {
+        static double s_pace_diag_last = 0.0;
+        if (now - s_pace_diag_last >= 5.0) {
+            s_pace_diag_last = now;
+            log_msg("PACE-DIAG: median=%.2fms content=%.2fms "
+                    "err=%.2fms streak=%d av_diff=%.1fms bias=%.1fms",
+                    ps->pace_median * 1000.0, content_dt * 1000.0,
+                    err * 1000.0,
+                    ps->pace_enter_streak,
+                    ps->last_av_diff * 1000.0, ps->av_bias * 1000.0);
+        }
+    }
     if (ps->pace_mode == PACE_SCHEDULED) {
         if (err < content_dt * 0.015) {
             ps->pace_enter_streak++;
@@ -174,6 +216,10 @@ static void pacing_v2_window_hint(PlayerState *ps) {
  * the browser and playlist — EOF auto-advance hitting a coverless
  * soundtrack file dumped the user back to the browser (review P2-15).
  * Re-add them when audio-only playback exists. */
+/* Adding an extension here means adding its demuxer to the
+ * format_whitelist in player_open (player.c) — the two lists must
+ * stay in step or the new type opens in the browser and fails in the
+ * player. */
 const char *video_extensions[] = {
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
     ".ts", ".m2ts", ".mpg", ".mpeg", ".3gp",
@@ -285,7 +331,8 @@ static void playlist_scan(PlayerState *ps) {
     {
         DIR *d = opendir(dir);
         if (!d) {
-            log_msg("playlist_scan: cannot open directory: %s", dir);
+            log_msg("playlist_scan: cannot open directory: %s",
+                    log_path(dir));
             free(files);
             return;
         }
@@ -378,10 +425,19 @@ static void gpu_draw_idle(PlayerState *ps) {
     if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, ps->window,
             &swapchain_tex, &sc_w, &sc_h)) {
         SDL_CancelGPUCommandBuffer(cmd);
+        /* Was silent (same class as the reblit acquire — see player.c). */
+        static int s_idle_acq_fail = 0;
+        if (s_idle_acq_fail++ % 60 == 0)
+            log_msg("WARN: idle swapchain acquire failed (x%d): %s",
+                    s_idle_acq_fail, SDL_GetError());
         return;
     }
     if (!swapchain_tex) {
         SDL_CancelGPUCommandBuffer(cmd);
+        static int s_idle_null_tex = 0;
+        if (s_idle_null_tex++ % 60 == 0)
+            log_msg("WARN: idle acquire returned no texture (x%d)",
+                    s_idle_null_tex);
         return;
     }
 
@@ -401,6 +457,7 @@ static void gpu_draw_idle(PlayerState *ps) {
     SDL_EndGPURenderPass(pass);
 
     SDL_SubmitGPUCommandBuffer(cmd);
+    ps->presents++;
 }
 
 
@@ -494,6 +551,40 @@ static void toggle_fullscreen(PlayerState *ps, SDL_Window *window) {
     set_fullscreen(ps, window, !is_fs);
 }
 
+/* Shim position hand-off: atomically rewrite DSVP_POS_FILE so the shim
+ * daemon can turn positions into server progress reports. Write-tmp-
+ * then-rename so the daemon can never see a partial line. ENDED marks
+ * natural end-of-file (daemon reports the item finished) as opposed to
+ * a user stop (position becomes the resume point). */
+/* Every path that ends playback in a shim session must report the stop
+ * and EXIT — the daemon blocks in waitpid on this process; parking in
+ * the local browser instead hangs it and loses the stop report (review
+ * 2026-08-20 finding 6: gamepad B, the O key, window close and startup
+ * open-failure all did exactly that). Returns 1 in shim mode so UI
+ * callers skip their browser path; call BEFORE player_close so the
+ * position fields are still live. */
+static void shim_write_pos(const char *path, PlayerState *ps, int ended);
+static int shim_session_end(PlayerState *ps, int shim,
+                            const char *pos_file, int ended) {
+    if (!shim) return 0;
+    if (pos_file) shim_write_pos(pos_file, ps, ended);
+    ps->quit = 1;
+    return 1;
+}
+
+static void shim_write_pos(const char *path, PlayerState *ps, int ended) {
+    char tmp[1088];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    double dur = (ps->fmt_ctx && ps->fmt_ctx->duration > 0)
+               ? ps->fmt_ctx->duration / (double)AV_TIME_BASE : 0.0;
+    fprintf(f, "POS %.3f DUR %.3f PAUSED %d ENDED %d\n",
+            ps->video_clock, dur, ps->paused ? 1 : 0, ended);
+    fclose(f);
+    rename(tmp, path);
+}
+
 int main(int argc, char *argv[]) {
     /* ── Initialize logging (before anything else) ── */
     log_init();
@@ -506,6 +597,17 @@ int main(int argc, char *argv[]) {
     log_msg("Starting DSVP v" DSVP_VERSION " build " DSVP_GIT_COMMIT " (argc=%d)", argc);
     log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),
             LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR);
+
+    /* ── Shim session (DSVP_SHIM=1, set only by the shim daemon) ──
+     * Single-stream appliance mode: HTTP whitelist opens (player.c),
+     * every close path exits instead of returning to the browser (the
+     * daemon owns what happens next), and position is handed off via
+     * DSVP_POS_FILE for server progress reports. */
+    const int s_shim = (getenv("DSVP_SHIM") != NULL);
+    const char *s_pos_file = getenv("DSVP_POS_FILE");
+    if (s_shim)
+        log_msg("Shim session: HTTP whitelist active, exit-on-close%s",
+                s_pos_file ? ", position hand-off on" : "");
 
     /* ── Get filepath from command line ── */
     char *open_path = NULL;
@@ -639,7 +741,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* A previous session that died holding display HDR left a stamp;
+     * restore the recorded baseline BEFORE any probe of our own reads
+     * the stranded state as "the user's configuration" (review
+     * 2026-08-20 finding 18). */
+    hdr_sys_reconcile_stamp();
+
     /* ── Set VSync via swapchain parameters ── */
+    /* Claimed as SDR; the real choice needs the display probe and is made
+     * once player state exists, still before any pipeline is built. */
     SDL_SetGPUSwapchainParameters(gpu_device, window,
         SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
         SDL_GPU_PRESENTMODE_VSYNC);
@@ -679,8 +789,121 @@ int main(int argc, char *argv[]) {
      * test settles whether desktop-mode KWin truly switches the
      * display or tone-maps our surface itself. */
     ps.hdr_out_mode = 1;
+    /* Output gamut: which primaries the DISPLAY expects. BT.709 is the
+     * safe default and what every previous build assumed unconditionally.
+     * Set DSVP_OUT_GAMUT=2020 when the output is running wide gamut
+     * (KDE's "Wide Color Gamut", DRM Colorspace BT2020_RGB) — otherwise
+     * 709 code values are read against wider primaries and everything
+     * comes out oversaturated. M toggles it live for the A/B. */
+    /* Carry SDR in an HDR10/PQ container when the display needs it.
+     *
+     * AUTOMATIC: if the output we can drive is running wide gamut, plain
+     * BT.709 output is wrong there — the display reads our 709 code
+     * values against BT.2020 primaries and stretches every colour
+     * outward. Converting primaries into the 8-bit SDR swapchain fixes
+     * the hue but costs precision: Rec.2020 wants 10 bits and that
+     * surface has 8. So on a wide-gamut display we hand over a proper
+     * HDR10 signal instead — BT.2020 primaries, PQ-encoded at the SDR
+     * reference white, 10-bit container. On an ordinary BT.709 display
+     * none of this applies and the plain SDR path is already correct,
+     * so nothing changes.
+     *
+     * 100 nits because that is what SDR is mastered against (the
+     * BT.1886 / studio reference), so mapping SDR white to 100 nits in
+     * the container reproduces the grading intent. BT.2408's 203 nits
+     * is HDR *graphics* white and reads too hot for SDR content —
+     * confirmed by eye on the C4, which is the instrument that settles
+     * this. Affects SDR only: tone-mapped HDR keeps using the T-key
+     * target as its reference white.
+     *
+     * The cost is that the display stays in HDR for the session, which
+     * hdr_sys_preenable engages and hdr_output_shutdown restores.
+     *   DSVP_OUT_PQ=0     force off (plain SDR output)
+     *   DSVP_OUT_PQ=1     force on at 100 nits
+     *   DSVP_OUT_PQ=<n>   force on at n nits
+     *   DSVP_NO_SYS_HDR=1 opts out of display control entirely
+     */
+    {
+        const char *pq = SDL_getenv("DSVP_OUT_PQ");
+        if (pq && (strcmp(pq, "0") == 0 || strcmp(pq, "off") == 0)) {
+            log_msg("Output: PQ container disabled by DSVP_OUT_PQ=%s", pq);
+        } else if (pq) {
+            double v = atof(pq);
+            ps.out_pq_nits = (v >= 50.0 && v <= 1000.0) ? (float)v : 100.0f;
+            log_msg("Output: PQ container forced on at %.0f nits "
+                    "(DSVP_OUT_PQ=%s)", ps.out_pq_nits, pq);
+        } else if (hdr_sys_display_is_wide_gamut(&ps)) {
+            ps.out_pq_nits = 100.0f;
+            log_msg("Output: %s is running wide gamut — SDR will ride an "
+                    "HDR10/PQ container at 100 nits. DSVP_OUT_PQ=0 opts out.",
+                    ps.hdr_sys_output);
+        }
+
+        if (ps.out_pq_nits > 0.0f
+                && !SDL_WindowSupportsGPUSwapchainComposition(gpu_device,
+                        window, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084)) {
+            log_msg("WARN: PQ container wanted but this window has no HDR10 "
+                    "swapchain — staying SDR");
+            ps.out_pq_nits = 0.0f;
+        }
+        if (ps.out_pq_nits > 0.0f) {
+            /* The return matters: support was probed above, but support
+             * is not success. Latching swapchain_hdr10 on a failed set
+             * would make the recreate-skip trust a wrong mirror for the
+             * whole session — PQ-encoding uniforms into an SDR surface
+             * with no log line anywhere (review 2026-08-20 finding 8). */
+            if (SDL_SetGPUSwapchainParameters(gpu_device, window,
+                    SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084,
+                    SDL_GPU_PRESENTMODE_VSYNC)) {
+                ps.swapchain_hdr10 = 1;   /* recreate-skip tracks composition */
+                log_msg("GPU: swapchain → HDR10/ST2084 (10-bit, SDR in an HDR "
+                        "container)");
+            } else {
+                log_msg("WARN: HDR10 swapchain set FAILED (%s) — staying "
+                        "SDR, PQ container off", SDL_GetError());
+                ps.out_pq_nits = 0.0f;
+            }
+        }
+    }
+
+    {
+        const char *og = SDL_getenv("DSVP_OUT_GAMUT");
+        if (og && (strcmp(og, "2020") == 0 || strcmp(og, "bt2020") == 0))
+            ps.out_gamut_pref = 1;
+        else if (og && strcmp(og, "709") != 0 && strcmp(og, "bt709") != 0)
+            log_msg("WARN: DSVP_OUT_GAMUT='%s' ignored (want 709 or 2020)", og);
+    }
+
+    /* ── Session display-HDR hold: engage NOW, not after shader
+     * compilation. PQ mode holds display HDR for the whole session
+     * (and DSVP_FS_HDR_FALLBACK=1 opts into the same hold for
+     * displays that freeze in SDR fullscreen — visibly worse for SDR,
+     * kept for the case where restoring output properties isn't
+     * enough). This used to run AFTER the ~1.5s shader compile, so
+     * every wide-gamut launch presented PQ on a still-SDR output for
+     * ~2s — the inverse of the ordering hdr_output_apply documents as
+     * load-bearing (review 2026-08-20 finding 14). Firing the async
+     * kscreen switch here lets the display's mode change overlap the
+     * compile instead of following it. */
+    hdr_sys_preenable(&ps);
+    /* Verify the hold once the async switch has had time to land
+     * (~3s covers kscreen + the TV's own mode change). */
+    double hold_verify_at =
+        ps.hdr_sys_enabled_by_us ? get_time_sec() + 3.0 : 0.0;
+
     /* Opt-out for the render-at-content-rate intermediate (see dsvp.h) */
     ps.no_intermediate = (SDL_getenv("DSVP_NO_INTERMEDIATE") != NULL);
+    /* Falsification switch for the decode-thread staging (review M1):
+     * DSVP_NO_PRESTAGE=1 restores the old main-thread upload path. */
+    ps.no_prestage = (SDL_getenv("DSVP_NO_PRESTAGE") != NULL);
+    if (ps.no_prestage)
+        log_msg("Decode-thread staging disabled (DSVP_NO_PRESTAGE)");
+    /* Falsification switch for the get_buffer2 zero-copy pool
+     * (TODO-PACING item 1): DSVP_NO_POOL=1 restores decode into
+     * FFmpeg-owned buffers + the prestage path. */
+    ps.no_pool = (SDL_getenv("DSVP_NO_POOL") != NULL);
+    if (ps.no_pool)
+        log_msg("Zero-copy decode pool disabled (DSVP_NO_POOL)");
     if (ps.no_intermediate)
         log_msg("Render: DSVP_NO_INTERMEDIATE set — direct render path");
     {
@@ -744,10 +967,29 @@ int main(int argc, char *argv[]) {
     /* ── Open file from command line if provided ── */
     if (open_path) {
         if (player_open(&ps, open_path) != 0) {
-            log_msg("ERROR: Failed to open: %s", open_path);
+            log_msg("ERROR: Failed to open: %s", log_path(open_path));
+            /* Shim: a failed open (401, expired token, dead server)
+             * must end the session, not park an appliance process on
+             * the idle screen forever (finding 6d). NULL pos_file:
+             * nothing ever played, and a POS 0.000 stop report would
+             * clobber the server-side resume point — the daemon seeds
+             * its stop report with the resume position when no
+             * position file appears. */
+            shim_session_end(&ps, s_shim, NULL, 0);
         } else {
             gain_reset(&ps);
-            playlist_scan(&ps);
+            if (!s_shim) {
+                playlist_scan(&ps);
+            } else {
+                /* No folder playlist for a URL; resume where the
+                 * server left off instead (relative seek from 0). */
+                const char *ss = getenv("DSVP_START_SEC");
+                double start = ss ? atof(ss) : 0.0;
+                if (start > 1.0) {
+                    log_msg("Shim session: resuming at %.1fs", start);
+                    player_seek(&ps, start);
+                }
+            }
         }
         free(open_path);
         open_path = NULL;
@@ -776,8 +1018,12 @@ int main(int argc, char *argv[]) {
     browser_init(&ps);
     if (!ps.game_mode)
         ps.browser_active = 0;  /* Desktop: show idle screen first */
-    if (ps.playing && ps.filepath[0]) {
-        /* Set browser to directory of the opened file */
+    if (ps.playing && ps.filepath[0] && !s_shim) {
+        /* Set browser to directory of the opened file. Shim excluded:
+         * the "file" is an HTTP URL — strrchr-truncating it into
+         * browser_path persisted a fake directory the next desktop
+         * launch spent a 2s accessibility timeout rejecting
+         * (finding 11). */
         char dir[1024];
         snprintf(dir, sizeof(dir), "%s", ps.filepath);
         char *sep = strrchr(dir, '/');
@@ -791,16 +1037,29 @@ int main(int argc, char *argv[]) {
 
     /* ── Main loop ── */
     double pr_t0 = 0.0;   /* PRESENT DIAG window start (VRR investigation) */
-    int    pr_n  = 0;     /* iterations (≈presents) in current window */
+    int    pr_n  = 0;     /* iterations in current window */
+    long   pr_presents_last = 0;  /* ps.presents at window start */
     const int s_diag = (getenv("DSVP_DIAG") != NULL);
     while (!ps.quit) {
         if (g_signal_quit) { log_msg("Signal received — shutting down cleanly"); ps.quit = 1; break; }
+        /* One-shot launch-hold verification (see hdr_sys_verify_hold). */
+        if (hold_verify_at > 0.0 && get_time_sec() >= hold_verify_at) {
+            hold_verify_at = 0.0;
+            hdr_sys_verify_hold(&ps);
+        }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
 
             case SDL_EVENT_QUIT:
-                if (ps.playing) player_close(&ps);
+                /* Flush the shim position BEFORE close zeroes
+                 * ps.playing — the exit backstop is gated on playing
+                 * and could never fire for window close despite its
+                 * comment claiming to cover it (finding 6c). */
+                if (ps.playing) {
+                    shim_session_end(&ps, s_shim, s_pos_file, 0);
+                    player_close(&ps);
+                }
                 ps.quit = 1;
                 break;
 
@@ -835,7 +1094,7 @@ int main(int argc, char *argv[]) {
                         if (browser_enter(&ps)) {
                             ps.show_controls = 0;
                             log_msg("Browser: opening %s",
-                                    log_anon_active() ? "[redacted]" : ps.browser_selected_file);
+                                    log_path(ps.browser_selected_file));
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
                                 log_msg("ERROR: Failed to open file");
                             } else {
@@ -871,7 +1130,12 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_Q:
-                    if (ps.playing) {
+                    if (ps.playing && shim_session_end(&ps, s_shim,
+                                                       s_pos_file, 0)) {
+                        /* Shim session: close means done; position
+                         * flushed before the state vanished. */
+                        player_close(&ps);
+                    } else if (ps.playing) {
                         /* Update browser to current file's directory */
                         if (ps.filepath[0]) {
                             char dir[1024];
@@ -894,9 +1158,17 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_O: {
                     /* Open integrated file browser (replaces external dialog).
-                     * If playing, close first so we return to browser. */
+                     * If playing, close first so we return to browser.
+                     * Shim: there is no local browser to return to —
+                     * ending playback ends the session (finding 6b). */
                     log_msg("File browser requested (O key)");
-                    if (ps.playing) player_close(&ps);
+                    if (ps.playing) {
+                        if (shim_session_end(&ps, s_shim, s_pos_file, 0)) {
+                            player_close(&ps);
+                            break;
+                        }
+                        player_close(&ps);
+                    }
                     gain_reset(&ps);
                     ps.show_controls = 0;
                     if (!ps.browser_active) {
@@ -1053,7 +1325,21 @@ int main(int argc, char *argv[]) {
                      * internal-panel A/B is an eye test, not a
                      * relaunch. Only meaningful on the tone-mapped
                      * paths, so gated on HDR like T and G. */
-                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f
+                            && (ps.gpu_uniforms.hdr_pass > 0.5f
+                                || ps.out_pq_nits > 0.0f)) {
+                        /* out_gamma is never read in passthrough (the
+                         * shader returns before encode) nor in PQ mode
+                         * (encode_output takes the PQ branch first) —
+                         * cycling it silently claimed changes that
+                         * could not appear (review 2026-08-20
+                         * finding 17). Say so instead. */
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Output transfer: no effect (%s)",
+                                 ps.gpu_uniforms.hdr_pass > 0.5f
+                                     ? "passthrough" : "PQ container");
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                    } else if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
                         float next;
                         const char *name;
                         if (ps.out_gamma_pref == 1.0f)      { next = 2.2f; name = "gamma 2.2"; }
@@ -1067,6 +1353,41 @@ int main(int argc, char *argv[]) {
                                  "Output transfer: %s", name);
                         ps.aud_osd_until = get_time_sec() + 2.0;
                         log_msg("Output transfer changed to %s", name);
+                    }
+                    break;
+
+                case SDLK_M:
+                    /* Toggle the OUTPUT gamut: encode for a BT.709
+                     * display or for a BT.2020 one. Unlike E/T/G this
+                     * is NOT gated on HDR — ordinary BT.709 SDR on a
+                     * wide-gamut display is exactly the case it exists
+                     * for, and that is SDR content by definition.
+                     * Live toggle because a primaries change can only
+                     * be judged by eye, on the same frame, A/B. */
+                    if (ps.playing) {
+                        ps.out_gamut_pref = !ps.out_gamut_pref;
+                        /* Same derivation as gpu_setup_uniforms: the
+                         * HDR10 container is BT.2020 by definition, so
+                         * PQ output clamps the uniform on regardless of
+                         * the preference. Recomputing from the bare
+                         * preference here dropped that clamp — two M
+                         * presses desaturated tone-mapped HDR until the
+                         * next file open (review 2026-08-20 finding 5). */
+                        int m_gamut_2020 = ps.out_gamut_pref
+                                        || ps.out_pq_nits > 0.0f;
+                        ps.gpu_uniforms.out_gamut =
+                            m_gamut_2020 ? 1.0f : 0.0f;
+                        ps.frame_render_dirty = 1;
+                        const char *name =
+                            (m_gamut_2020 && !ps.out_gamut_pref)
+                            ? "BT.2020 (forced by PQ container)"
+                            : ps.out_gamut_pref
+                              ? "BT.2020 (wide-gamut display)"
+                              : "BT.709 (default)";
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Output gamut: %s", name);
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        log_msg("Output gamut changed to %s", name);
                     }
                     break;
 
@@ -1133,8 +1454,25 @@ int main(int argc, char *argv[]) {
 
                         } else if (ps.audio_mode != AUDIO_MODE_PCM && !ps.bitstream_active) {
                             audio_close(&ps);
-                            if (!bitstream_start(&ps))
-                                audio_open(&ps);  /* fallback to PCM */
+                            if (!bitstream_start(&ps) &&
+                                audio_open(&ps) < 0) {
+                                /* Checked like audio.c's track-switch twin:
+                                 * an unchecked failure leaves a codec with
+                                 * no device — audio_pq fills and the demux
+                                 * throttle freezes all playback (the
+                                 * finding-2 class, third site). */
+                                log_msg("Audio: PCM fallback open failed on "
+                                        "mode switch — audio off");
+                                avcodec_free_context(&ps.audio_codec_ctx);
+                                audio_disable_public(&ps,
+                                        "Audio: device error, audio off");
+                                /* Out of the case before the mode OSD
+                                 * below replaces the disable notice
+                                 * with an "Audio Mode" claim; no
+                                 * resync seek for a dead sink (the
+                                 * audio.c twin returns here too). */
+                                break;
+                            }
                             player_seek(&ps, 0.0);
                         }
                     } else if (ps.audio_mode == AUDIO_MODE_PCM) {
@@ -1197,13 +1535,13 @@ int main(int argc, char *argv[]) {
 
                             log_msg("Playlist nav: opening [%d/%d] %s",
                                     next + 1, ps.playlist_count,
-                                    ps.playlist_files[next]);
+                                    log_path(ps.playlist_files[next]));
 
                             if (player_open(&ps, ps.playlist_files[next]) == 0)
                                 gain_reset(&ps);
                             else
                                 log_msg("ERROR: Failed to open: %s",
-                                        ps.playlist_files[next]);
+                                        log_path(ps.playlist_files[next]));
                             ps.playlist_index = next;
                         }
                     }
@@ -1363,7 +1701,7 @@ int main(int argc, char *argv[]) {
                         if (browser_enter(&ps)) {
                             ps.show_controls = 0;
                             log_msg("Browser: opening %s",
-                                    log_anon_active() ? "[redacted]" : ps.browser_selected_file);
+                                    log_path(ps.browser_selected_file));
                             if (player_open(&ps, ps.browser_selected_file) != 0) {
                                 log_msg("ERROR: Failed to open file");
                             } else {
@@ -1422,6 +1760,17 @@ int main(int argc, char *argv[]) {
                         ps.transport_active = 0;
                         ps.seekbar_hide_time = get_time_sec() + 3.0;
                     } else if (ps.playing) {
+                        /* Shim: B is the Deck's primary stop control —
+                         * end the session instead of becoming a local
+                         * file browser the daemon waits on forever
+                         * (finding 6a). This also stops the shim URL
+                         * being strrchr-truncated into browser_path
+                         * and persisted (finding 11's second copy). */
+                        if (shim_session_end(&ps, s_shim, s_pos_file, 0)) {
+                            player_close(&ps);
+                            ps.transport_active = 0;
+                            break;
+                        }
                         /* Update browser to current file's directory */
                         if (ps.filepath[0]) {
                             char dir[1024];
@@ -1696,23 +2045,39 @@ int main(int argc, char *argv[]) {
                 "PCM (decode)", "AUTO", "PASSTHROUGH"
             };
 
+            int switch_audio_ok = 1;
             if (ps.audio_switch_was_truehd) {
                 log_msg("Audio: TrueHD on PCM return — auto-switching to decodable track");
+                /* Unchecked open tolerated here only because audio_cycle's
+                 * own reopen path is checked and disables on failure. */
                 audio_open(&ps);
                 if (ps.audio_stream)
                     SDL_PauseAudioStreamDevice(ps.audio_stream);
                 audio_cycle(&ps);
+            } else if (audio_open(&ps) < 0) {
+                /* Checked like every sibling site (the finding-2 freeze
+                 * class, fifth site): passthrough live, dock bumped, P
+                 * pressed to fall back — device gone, and an unchecked
+                 * open left a codec with no sink. audio_pq fills, the
+                 * demux throttle gates forever, total playback freeze,
+                 * while the mode OSD below claimed success. */
+                log_msg("Audio: PCM open failed on mode-switch "
+                        "completion — audio off");
+                avcodec_free_context(&ps.audio_codec_ctx);
+                audio_disable_public(&ps, "Audio: device error, audio off");
+                switch_audio_ok = 0;
             } else {
-                audio_open(&ps);
                 if (ps.audio_stream && !ps.paused)
                     SDL_ResumeAudioStreamDevice(ps.audio_stream);
                 player_seek(&ps, 0.0);
             }
 
             ps.audio_switch_phase = 0;
-            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                     "Audio Mode: %s", mode_names_cpl[ps.audio_mode]);
-            ps.aud_osd_until = get_time_sec() + 2.0;
+            if (switch_audio_ok) {
+                snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                         "Audio Mode: %s", mode_names_cpl[ps.audio_mode]);
+                ps.aud_osd_until = get_time_sec() + 2.0;
+            }
             log_msg("Audio mode switch complete: %s", mode_names_cpl[ps.audio_mode]);
         }
 
@@ -1814,6 +2179,14 @@ int main(int argc, char *argv[]) {
                 av_frame_unref(ps.video_frame);
                 av_frame_move_ref(ps.video_frame, ps.decoded_frame);
                 ps.video_clock = ps.decoded_pts;
+                /* The pre-staged transfer set / pool slot follows its
+                 * frame. The slot's plane refs moved with move_ref, so
+                 * the slot stays alive exactly as long as video_frame
+                 * holds this frame. */
+                ps.video_frame_xfer = ps.decoded_frame_xfer;
+                ps.decoded_frame_xfer = -1;
+                ps.video_frame_slot = ps.decoded_frame_slot;
+                ps.decoded_frame_slot = -1;
                 ps.decode_frame_ready = 0;
                 SDL_SignalCondition(ps.decode_cond);
                 SDL_UnlockMutex(ps.decode_mutex);
@@ -1953,16 +2326,36 @@ int main(int argc, char *argv[]) {
                          * judder). For content at/above slot rate
                          * pts_delay ≈ slot and behavior is unchanged
                          * (structural drops, backlog burns). */
+                        /* Video-only backstop: a late stuck in
+                         * (pts_delay/2, 0.25) re-drops forever — no
+                         * audio watchdog exists without a stream, and
+                         * the 0.25 re-anchor above never fires. Cap
+                         * the run and re-anchor tempo (the same op as
+                         * the discontinuity re-anchor); this frame
+                         * then displays. Audio-present streams keep
+                         * their own 200ms stall watchdog path. */
+                        if (late > pts_delay * 0.5
+                                && ps.audio_stream_idx < 0
+                                && ps.sched_drop_run >= 8) {
+                            ps.sched_off = now - ps.video_clock;
+                            late = 0.0;
+                            ps.sched_drop_run = 0;
+                            log_msg("DIAG: drop-chain backstop — "
+                                    "re-anchored after 8 consecutive "
+                                    "drops");
+                        }
                         if (late > pts_delay * 0.5) {
                             new_frame = 0;
                             frame_dropped = 1;
                             ps.sched_chain = 1;
                             ps.sched_chain_start = now;
+                            ps.sched_drop_run++;
                             ps.diag_frames_dropped++;
                             log_msg("DIAG: frame dropped at %.3fs "
                                     "(sched late %.1fms)",
                                     ps.video_clock, late * 1000.0);
                         } else {
+                            ps.sched_drop_run = 0;
                             ps.sched_chain = 0;
                         }
                     }
@@ -2064,6 +2457,29 @@ int main(int argc, char *argv[]) {
                         char retry_path[sizeof(ps.filepath)];
                         snprintf(retry_path, sizeof(retry_path), "%s",
                                  ps.filepath);
+                        /* Keep the position across the close/reopen —
+                         * the retry used to restart at 0:00, losing a
+                         * shim resume entirely (finding 12). Flush the
+                         * shim position too, in case the reopen fails. */
+                        double retry_pos = ps.video_clock;
+                        /* The decode-error streak can escalate before
+                         * the demux thread services the startup
+                         * DSVP_START_SEC seek — video_clock then still
+                         * reads ~0 and the resume would silently drop.
+                         * Nothing has played yet in that state, so the
+                         * env resume point is the truth. */
+                        if (s_shim && retry_pos <= 1.0) {
+                            const char *ss = getenv("DSVP_START_SEC");
+                            double sv = ss ? atof(ss) : 0.0;
+                            if (sv > 1.0) retry_pos = sv;
+                        }
+                        if (s_shim && s_pos_file) {
+                            /* Flush the resume point, not a possibly
+                             * unserviced-seek zero; the file is about
+                             * to be closed either way. */
+                            ps.video_clock = retry_pos;
+                            shim_write_pos(s_pos_file, &ps, 0);
+                        }
                         log_msg("VAAPI: profile unsupported — reopening "
                                 "in software decode");
                         player_close(&ps);
@@ -2071,6 +2487,11 @@ int main(int argc, char *argv[]) {
                         ps.force_swdec = 1;
                         int ok = (player_open(&ps, retry_path) == 0);
                         ps.force_swdec = 0;
+                        if (ok && retry_pos > 1.0) {
+                            log_msg("VAAPI retry: resuming at %.1fs",
+                                    retry_pos);
+                            player_seek(&ps, retry_pos);
+                        }
                         if (ok) {
                             snprintf(ps.aud_osd, sizeof(ps.aud_osd),
                                      "Software decode (profile unsupported "
@@ -2080,7 +2501,20 @@ int main(int argc, char *argv[]) {
                         }
                         /* retry failed — fall through to the browser */
                     }
-                    log_msg("I/O error detected — closing playback, returning to browser");
+                    log_msg("I/O error detected — closing playback");
+                    if (s_shim) {
+                        /* A dead stream ends the shim session; the
+                         * daemon reports the stop at last position.
+                         * Only write one while a file is actually open:
+                         * on the retry-failed fall-through the player
+                         * is already closed and this wrote POS 0 over
+                         * the flush above. */
+                        if (s_pos_file && ps.fmt_ctx)
+                            shim_write_pos(s_pos_file, &ps, 0);
+                        player_close(&ps);
+                        ps.quit = 1;
+                        continue;
+                    }
                     player_close(&ps);
                     ps.browser_active = 1;
                     ps.quit = 0;
@@ -2124,7 +2558,7 @@ int main(int argc, char *argv[]) {
 
                         log_msg("Auto-play next: [%d/%d] %s",
                                 next + 1, ps.playlist_count,
-                                ps.playlist_files[next]);
+                                log_path(ps.playlist_files[next]));
 
                         if (player_open(&ps, ps.playlist_files[next]) == 0) {
                             gain_reset(&ps);
@@ -2136,6 +2570,16 @@ int main(int argc, char *argv[]) {
                         ps.playlist_index = next;
                     }
 
+                    if (!auto_played && s_shim) {
+                        /* Natural EOF in a shim session: mark ended so
+                         * the daemon reports the item finished, then
+                         * exit — there is no browser to return to. */
+                        log_msg("Playback finished — shim session, exiting");
+                        if (s_pos_file) shim_write_pos(s_pos_file, &ps, 1);
+                        player_close(&ps);
+                        ps.quit = 1;
+                        continue;
+                    }
                     if (!auto_played) {
                         log_msg("Playback finished, returning to browser");
                         /* Sync browser to current file's directory */
@@ -2278,14 +2722,35 @@ int main(int argc, char *argv[]) {
              * audio degrades to PCM, never to silence. */
             if (ps.bitstream_failed) {
                 ps.bitstream_failed = 0;
-                log_msg("Bitstream: backend failed — falling back to PCM decode");
-                bitstream_stop(&ps);
-                audio_open(&ps);
-                if (ps.audio_stream && !ps.paused)
-                    SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                snprintf(ps.aud_osd, sizeof(ps.aud_osd),
-                         "Passthrough lost — PCM decode");
-                ps.aud_osd_until = get_time_sec() + 3.0;
+                /* Stale-flag guard (review 2026-08-20 finding 3): the
+                 * flag can outlive the stream that raised it (raised
+                 * just before a pause, or before a mode/file change) —
+                 * acting on it with no bitstream running reopened a
+                 * stream over a live one: leaked SDL stream, two
+                 * callbacks decoding one codec ctx. Only fall back
+                 * when passthrough is actually the current sink; a
+                 * stale flag just clears. */
+                if (ps.bitstream_active) {
+                    log_msg("Bitstream: backend failed — falling back to PCM decode");
+                    bitstream_stop(&ps);
+                    if (audio_open(&ps) < 0) {
+                        /* Same shape as audio.c's twin: free the codec
+                         * and stop here — falling through overwrote the
+                         * disable notice with a "PCM decode" OSD while
+                         * audio was actually off. */
+                        log_msg("Audio: PCM fallback open failed — "
+                                "audio off (finding 2 class)");
+                        avcodec_free_context(&ps.audio_codec_ctx);
+                        audio_disable_public(&ps,
+                                "Audio: device error, audio off");
+                    } else {
+                        if (ps.audio_stream && !ps.paused)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Passthrough lost — PCM decode");
+                        ps.aud_osd_until = get_time_sec() + 3.0;
+                    }
+                }
             }
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
@@ -2418,23 +2883,40 @@ int main(int argc, char *argv[]) {
         }
 
         /* ── PRESENT-RATE DIAG (opt-in: DSVP_DIAG=1) ──
-         * Nearly every loop iteration submits one frame (display, reblit,
-         * or draw_idle), so iteration rate is present rate. This is what
-         * proved the KWin VRR-floor blanking below, and it is the first
-         * thing worth having again if presentation ever misbehaves — so
-         * it stays in the tree, off by default rather than deleted.
-         * "ret2browser" is the return-to-browser latch, not an active
-         * browser: it stays 1 through playback by design. */
+         * Reports BOTH loop iteration rate and TRUE submit rate
+         * (ps.presents, counted at the three actual submit sites).
+         * The old iteration-only figure lied in exactly the states
+         * that matter: acquire failures and drop chains iterate
+         * without presenting (2026-08-14 FS investigation). A healthy
+         * gap of ~0 means "every iteration reached the glass"; iters
+         * high with presents low is the freeze signature. This is
+         * what proved the KWin VRR-floor blanking below — it stays in
+         * the tree, off by default rather than deleted. "ret2browser"
+         * is the return-to-browser latch, not an active browser: it
+         * stays 1 through playback by design. */
         if (s_diag) {
             double pr_now = get_time_sec();
             pr_n++;
             if (pr_t0 <= 0.0) pr_t0 = pr_now;
             if (pr_now - pr_t0 >= 1.0) {
-                log_msg("PRESENT DIAG: %.0f presents/s (playing=%d paused=%d ret2browser=%d fs=%d)",
-                        pr_n / (pr_now - pr_t0), ps.playing, ps.paused,
+                log_msg("PRESENT DIAG: %.0f iters/s, %.0f presents/s (playing=%d paused=%d ret2browser=%d fs=%d)",
+                        pr_n / (pr_now - pr_t0),
+                        (ps.presents - pr_presents_last) / (pr_now - pr_t0),
+                        ps.playing, ps.paused,
                         ps.browser_active, ps.fullscreen);
                 pr_n = 0;
+                pr_presents_last = ps.presents;
                 pr_t0 = pr_now;
+            }
+        }
+
+        /* Shim position hand-off, ~1/s while playing. */
+        if (s_pos_file && ps.playing) {
+            static double s_pos_t0 = 0.0;
+            double pnow = get_time_sec();
+            if (pnow - s_pos_t0 >= 1.0) {
+                s_pos_t0 = pnow;
+                shim_write_pos(s_pos_file, &ps, 0);
             }
         }
 
@@ -2464,6 +2946,9 @@ int main(int argc, char *argv[]) {
         SDL_WaitThread(ps.audio_switch_thread, NULL);
         ps.audio_switch_thread = NULL;
     }
+    /* Covers the exit paths that didn't flush (SIGTERM, window close):
+     * the daemon's stop report uses whatever position landed last. */
+    if (s_pos_file && ps.playing) shim_write_pos(s_pos_file, &ps, 0);
     if (ps.playing) player_close(&ps);
     if (ps.gamepad) SDL_CloseGamepad(ps.gamepad);
     browser_free_entries(&ps);

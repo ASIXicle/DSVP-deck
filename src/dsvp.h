@@ -49,7 +49,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.3.7-beta"
+#define DSVP_VERSION        "0.3.8-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -104,16 +104,19 @@ typedef enum {
     AUDIO_MODE_PASSTHROUGH = 2    /* force passthrough, fallback on failure    */
 } AudioMode;
 
+/* Filled by bitstream_probe via the PipeWire registry (union of
+ * iec958.codecs across Audio/Sink nodes). Answers PRE-DECISION
+ * questions (TrueHD track selection, restart-on-track-switch); the
+ * open-time negotiation in bitstream_pw is the final authority.
+ * (alsa_device/hbr_capable/max_channels deleted 2026-08-20 with the
+ * /proc ELD scan — Knot audit finding 2.) */
 typedef struct BitstreamCaps {
     int  support_ac3;      /* sink decodes AC-3 (Dolby Digital)         */
     int  support_eac3;     /* sink decodes E-AC-3 (DD+ / Atmos)        */
     int  support_truehd;   /* sink decodes TrueHD (lossless / Atmos)   */
     int  support_dts;      /* sink decodes DTS core                    */
     int  support_dtshd;    /* sink decodes DTS-HD MA (lossless)        */
-    int  hbr_capable;      /* HDMI supports High Bit Rate (TrueHD req) */
-    int  max_channels;     /* max channel count reported by sink       */
     int  probed;           /* 1 = caps have been queried this session   */
-    char alsa_device[32];  /* ALSA hw device for passthrough (e.g. "hw:0,8") */
 } BitstreamCaps;
 
 /* ── Packet Queue ───────────────────────────────────────────────────
@@ -164,7 +167,15 @@ typedef struct GPUUniforms {
     /* ── 144B boundary ── */
     float is_hlg;           /* 1.0 = HLG transfer (ARIB STD-B67)   4 bytes */
     float hdr_pass;         /* 1.0 = HDR passthrough (PQ out)      4 bytes */
-    float _pad1[2];         /* align to 16B for float4 arrays      8 bytes */
+    float out_gamut;        /* 0.0=BT.709 output, 1.0=BT.2020      4 bytes
+                               (took half of _pad1 — every offset
+                               below is unchanged) */
+    float out_pq;           /* >0 = encode output as PQ/ST.2084 with  4 bytes
+                               this value as reference white in nits
+                               (SDR carried in an HDR10 container).
+                               0 = normal SDR encode. Consumed the
+                               last _pad1 float; the 16B boundary
+                               below is unchanged. */
     /* ── 160B boundary ── */
     float dovi_num_pieces[4]; /* [I, Ct, Cp, 0] piece counts      16 bytes */
     float dovi_pivots[9][4];  /* [pivot][comp] normalized pivots 144 bytes */
@@ -197,6 +208,42 @@ typedef struct GPUUniforms {
 /* Pacing v2 mode machine states (docs/DESIGN-PACING.md) */
 #define PACE_SCHEDULED 0
 #define PACE_LOCKED    1
+
+/* ── get_buffer2 zero-copy decode pool (TODO-PACING open item 1) ──
+ * Decoder frames are allocated directly inside persistently-mapped
+ * SDL transfer buffers, so decode writes once into GPU-visible
+ * memory and the staging memcpy disappears. A slot is owned by the
+ * decoder from get_buffer2 until FFmpeg drops the last plane ref
+ * (frame reordering / frame-threading hold slots for a while), then
+ * COOLS for a few presents so the GPU's copy pass is provably past
+ * before the decoder can write it again. These buffers are mapped
+ * once at creation and NEVER cycled — cycling would swap the backing
+ * out from under both the mapping and FFmpeg's frame pointers.
+ * 8-bit yuv420p software decode only; every other path keeps the
+ * prestage/upload fallbacks. */
+#define DSVP_XFER_POOL_SLOTS 20
+#define DSVP_XFER_POOL_COOL  3   /* swapchain SUBMITS before a freed slot
+                                    recycles. All three submit sites count
+                                    (video_display, reblit, idle draw) and
+                                    that stays safe: each counted unit is a
+                                    queue-ordered submit BEHIND the slot's
+                                    copy pass, and the acquire throttle
+                                    (2-3 swapchain images) bounds how far
+                                    the GPU can lag those submits — so 3
+                                    of them guarantee the copy retired,
+                                    regardless of which loop submitted
+                                    (review 2026-08-20 finding 19). */
+
+enum { XFER_SLOT_FREE = 0, XFER_SLOT_BUSY, XFER_SLOT_COOLING };
+
+typedef struct XferSlot {
+    void                       *ps;        /* PlayerState, for the free cb */
+    SDL_GPUTransferBuffer      *xy, *xu, *xv;
+    uint8_t                    *my, *mu, *mv;  /* persistent mappings */
+    SDL_AtomicInt               plane_refs;    /* live AVBufferRefs (3/frame) */
+    int                         state;
+    int                         cool_stamp;    /* ps->presents at release */
+} XferSlot;
 
 typedef struct PlayerState {
     /* ── Format / streams ── */
@@ -232,8 +279,33 @@ typedef struct PlayerState {
     uint32_t            vk_queue_family;  /* queue family index                  */
     VkCommandPool       vk_cmd_pool;      /* for DMA-BUF copy commands           */
     VkCommandBuffer     vk_cmd_buf;       /* reused each frame                   */
+    VkFence             vk_copy_fence;    /* signals OUR copy submit (gains #3)  */
+    int                 vk_copy_pending;  /* fence submitted, not yet waited     */
     VADisplay           va_display;       /* VAAPI display for surface export    */
     int                 vk_tex_image_offset; /* offset: SDL_GPUTexture → VkImage */
+
+    /* ── Zero-copy import cache (Knot gains #2, Tier A) ──
+     * VAAPI serves decode surfaces from a fixed DPB pool, so the same
+     * VASurfaceIDs cycle for the life of the file. Until 2026-08-20
+     * every frame re-ran vkCreateImage×2 + DMA-BUF vkAllocateMemory×2
+     * + dup×2 and destroyed it all again (~48 kernel-side imports/s at
+     * 24fps). Cache {VkImage, VkDeviceMemory} per surface, keyed on
+     * the exported layout — vaExportSurfaceHandle still runs every
+     * frame and stays the authority: any key mismatch rebuilds the
+     * entry. DSVP_ZC_NOCACHE=1 restores per-frame import (A/B). */
+    struct ZCImportEntry {
+        uint32_t        surface;          /* VASurfaceID                */
+        uint64_t        mod_y, mod_uv;    /* DRM format modifiers       */
+        uint32_t        off_y, pitch_y;
+        uint32_t        off_uv, pitch_uv;
+        size_t          size_y, size_uv;  /* DMA-BUF object sizes       */
+        VkImage         img_y, img_uv;
+        VkDeviceMemory  mem_y, mem_uv;
+        int             valid;
+    }                   zc_imports[32];
+    int                 zc_cache_hits;    /* diagnostics — logged at cleanup */
+    int                 zc_cache_misses;
+    int                 zc_cache_rebuilds;/* key mismatch on a live entry    */
 
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;
@@ -313,9 +385,44 @@ typedef struct PlayerState {
     SDL_GPUTexture             *gpu_tex_v;           /* V plane          */
     SDL_GPUTexture             *gpu_tex_uv;          /* UV interleaved (R16G16, zero-copy) */
     SDL_GPUTexture         *gpu_tex_noise;           /* 64×64 blue noise dither (app lifetime) */
-    SDL_GPUTransferBuffer      *gpu_xfer_y;          /* CPU→GPU staging  */
-    SDL_GPUTransferBuffer      *gpu_xfer_u;
-    SDL_GPUTransferBuffer      *gpu_xfer_v;
+    SDL_GPUTexture         *gpu_tex_lut_lin;         /* 1024×1 R16 x^1.2 (shader squares) linearise LUT */
+    SDL_GPUTexture         *gpu_tex_lut_pq;          /* 1024×1 R16 PQ-encode LUT, sqrt-domain,
+                                                        nits baked in (REVIEW-PERF §3) */
+    int                     pq_lut_active;           /* LUT pipelines compiled + textures live */
+    /* CPU→GPU staging. Sets 0/1 are a ping-pong owned by the DECODE
+     * thread (it pre-fills the set the main thread is not reading —
+     * the 12.4MB/frame Y+U+V memcpy used to run on the vsync-gated
+     * main thread). Set 2 is owned by the MAIN thread for every path
+     * the decode thread cannot serve (VAAPI readback deinterleave,
+     * swscale conversion, fallbacks). No set is ever touched by both
+     * threads — that ownership split is the whole synchronization
+     * story, on top of the existing decode_mutex frame handoff. */
+    SDL_GPUTransferBuffer      *gpu_xfer_y[3];
+    SDL_GPUTransferBuffer      *gpu_xfer_u[3];
+    SDL_GPUTransferBuffer      *gpu_xfer_v[3];
+    int                         xfer_fill;          /* decode-thread: next set to fill (0/1) */
+    int                         decoded_frame_xfer; /* set staged for decoded_frame, -1 none */
+    int                         video_frame_xfer;   /* set staged for video_frame, -1 none */
+    /* get_buffer2 pool (see XferSlot above). pool_n == 0 = pool off
+     * for this file; every consumer falls back to the sets above. */
+    XferSlot                    xfer_pool[DSVP_XFER_POOL_SLOTS];
+    int                         xfer_pool_n;
+    int                         xfer_pool_pitch_y;  /* bytes/row (== pixels, 8-bit) */
+    int                         xfer_pool_pitch_uv;
+    int                         xfer_pool_h;        /* padded plane heights */
+    int                         xfer_pool_ch;
+    SDL_Mutex                  *xfer_pool_mutex;
+    int                         xfer_pool_misses;   /* default-alloc fallbacks */
+    int                         no_pool;            /* DSVP_NO_POOL */
+    int                         decoded_frame_slot; /* pool slot of decoded_frame, -1 */
+    int                         video_frame_slot;   /* pool slot of video_frame, -1 */
+    int                         swapchain_hdr10;    /* current composition is
+                                                       HDR10_ST2084 (recreate-skip) */
+    int                         sub_cue_gen;        /* bumped on any text-cue
+                                                       change; overlay skips the
+                                                       stack re-join when unchanged */
+    int                         xfer_pool_served;   /* frames the decoder wrote
+                                                       straight into pool slots */
     GPUUniforms                 gpu_uniforms;         /* current color params */
 
     /* ── HDR dynamic peak detection (Layer 1: CPU scan) ── */
@@ -337,8 +444,21 @@ typedef struct PlayerState {
                                                          kscreen-doctor (e.g. "DP-1") */
     int                         hdr_sys_prior_hdr;    /* output HDR state before we
                                                          touched it (restore target) */
+    int                         hdr_sys_prior_wcg;    /* same for wide-colour-gamut:
+                                                         1 on, 0 off, -1 unknown or
+                                                         unreported. We write this
+                                                         property, so we must read it —
+                                                         -1 means never touch it */
     int                         hdr_sys_enabled_by_us;/* we flipped output HDR on —
                                                          restore on revert/shutdown */
+    float                       out_pq_nits;          /* >0 = carry SDR in an HDR10/PQ
+                                                         container at this reference
+                                                         white (BT.2408 says 203).
+                                                         DSVP_OUT_PQ[=nits]. */
+    int                         out_gamut_pref;       /* 0 = encode for a BT.709/sRGB
+                                                         display (default), 1 = encode for
+                                                         a BT.2020 display. M key. See the
+                                                         out_gamut shader uniform. */
     float                       out_gamma_pref;       /* output transfer, preserved across
                                                          opens (E key / DSVP_OUTPUT_GAMMA).
                                                          0 = unset (parse env on first
@@ -354,6 +474,10 @@ typedef struct PlayerState {
     SDL_GPUGraphicsPipeline    *gpu_pipeline_blit;    /* frame tex → swapchain copy */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_frame;   /* YUV → RGBA16 intermediate */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_dilated_frame; /* dilated → intermediate */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_direct;       /* exact-1:1 single-fetch */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_direct_frame; /* direct → intermediate  */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_scale2x;       /* exact-2x constant weights */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_scale2x_frame; /* scale2x → intermediate   */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv_dilated; /* downscale-only sampler
                                                              variant (DSVP_DILATE) */
 
@@ -373,6 +497,8 @@ typedef struct PlayerState {
     int                         frame_render_dirty;/* uniforms/geometry moved —
                                                       re-render before blit   */
     int                         no_intermediate;   /* env opt-out / fallback  */
+    int                         no_prestage;       /* DSVP_NO_PRESTAGE: decode-thread
+                                                      staging off (falsification switch) */
     int                         drift_resync_ticks;/* consecutive 1:1 ticks with
                                                       video >0.5s behind audio —
                                                       triggers the warm reseek */
@@ -395,6 +521,14 @@ typedef struct PlayerState {
                                                       by window-event hints for a
                                                       fast re-measure           */
     int                         pace_ring_pos;     /* next write index          */
+    double                      pace_content_ema;  /* EMA of content pts deltas —
+                                                      the contracts compare cadence
+                                                      against THIS, not the last
+                                                      delta (1ms-quantized container
+                                                      timebases alternate ~16/17ms
+                                                      at 59.94 and a single sample
+                                                      can never hold a 0.25ms
+                                                      tolerance for 30 presents) */
     double                      pace_median;       /* median of ring; 0 = still
                                                       measuring (blocks LOCKED
                                                       entry, suspends cadence
@@ -403,6 +537,14 @@ typedef struct PlayerState {
                                                       (display OR reblit; drop
                                                       ticks are not presents)   */
     int                         pace_mode;         /* PACE_SCHEDULED / PACE_LOCKED */
+    int                         active_variant;    /* sampler variant bound last
+                                                      render: -1 none yet, 0 fixed,
+                                                      1 dilated, 2 direct,
+                                                      3 scale2x — feeds the debug
+                                                      panel, which must never
+                                                      claim a kernel that is not
+                                                      running (the Lanczos-2 line
+                                                      lied on 3 of 4 variants). */
     int                         pace_enter_streak; /* presented frames meeting
                                                       LOCKED entry cadence match */
     int                         pace_exit_streak;  /* presented frames failing
@@ -490,6 +632,14 @@ typedef struct PlayerState {
     int                 playing;          /* 1 = file is loaded/playing */
     int                 paused;
     int                 quit;             /* 1 = application exiting    */
+    int                 closing;          /* 1 = player_close in progress —
+                                             stops this file's threads.
+                                             NEVER doubles as quit: the
+                                             shim sets quit before close
+                                             and it must survive (Knot
+                                             audit finding 1; the same
+                                             double-duty shape as
+                                             hdr_sys_enabled_by_us).   */
     double              volume;           /* 0.0 — 1.0                  */
     int                 fullscreen;
     int                 eof;              /* demuxer hit end of file    */
@@ -587,6 +737,12 @@ typedef struct PlayerState {
     int                 diag_frames_displayed; /* total frames shown       */
     int                 diag_frames_decoded;   /* total frames decoded     */
     int                 diag_frames_dropped;   /* frames decoded but not shown */
+    long                presents;         /* actual swapchain submits — the
+                                           * truth PRESENT DIAG reports;
+                                           * iteration count lies during
+                                           * acquire failures/drop chains */
+    int                 sched_drop_run;   /* consecutive SCHEDULED drops
+                                           * (video-only backstop) */
     int                 diag_multi_decodes;    /* ticks with >1 decode     */
     int                 diag_timer_snaps;      /* frame_timer snap-forwards*/
     double              diag_max_av_drift;     /* worst A/V drift (signed) */
@@ -690,6 +846,8 @@ void  player_update_display_rect(PlayerState *ps);
 int   gpu_create_pipelines(PlayerState *ps);
 void  gpu_destroy_pipelines(PlayerState *ps);
 void  hdr_output_apply(PlayerState *ps);
+void  hdr_sys_preenable(PlayerState *ps);
+int   hdr_sys_display_is_wide_gamut(PlayerState *ps);
 void  hdr_output_shutdown(PlayerState *ps);
 
 /* ── Overlay GPU (player.c) ──────────────────────────────────────── */
@@ -704,6 +862,9 @@ void  gpu_overlay_destroy(PlayerState *ps);
 /* ── Audio API (audio.c) ──────────────────────────────────────────── */
 
 int   audio_open(PlayerState *ps);
+void  audio_disable_public(PlayerState *ps, const char *osd_msg);
+void  hdr_sys_reconcile_stamp(void);
+void  hdr_sys_verify_hold(PlayerState *ps);
 void  audio_close(PlayerState *ps);
 void  SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
                               int additional_amount, int total_amount);
@@ -723,6 +884,9 @@ int   audio_switch_bg_func(void *arg);   /* async-switch signaler thread */
 /* ── PipeWire passthrough backend (bitstream_pw.c) ────────────────
  * The only bitstream transport: iec958 encoded stream, server owns
  * the device and channel status (docs/TODO-BITSTREAM.md). */
+int    bitstream_pw_probe_caps(BitstreamCaps *caps); /* sink codec union
+                                                        via registry; 1 =
+                                                        server reachable */
 int    bitstream_pw_open(PlayerState *ps, int av_codec_id, int rate,
                          int channels);          /* 1 = negotiated        */
 int    bitstream_pw_write(PlayerState *ps, const uint8_t *data, int len);
@@ -774,6 +938,11 @@ void  log_init(void);
 void  log_close(void);
 void  log_msg(const char *fmt, ...);
 int   log_anon_active(void);  /* returns 1 if DSVP_LOG_ANON is set */
+const char *log_path(const char *path);  /* path arg for log lines —
+                                            "[redacted]" under
+                                            DSVP_LOG_ANON. Use for
+                                            EVERY path a log_msg
+                                            prints. */
 
 /* ── Utility ──────────────────────────────────────────────────────── */
 

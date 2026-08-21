@@ -3,7 +3,16 @@
 
 CC      = gcc
 SRCDIR  = src
-BUILDDIR = build
+
+# Dev and portable builds get SEPARATE output trees. They must never share
+# one: packaging runs `make PORTABLE=1`, which links without rpath, so a
+# shared tree left build/dsvp as a binary that could not run from the tree
+# ("libavformat.so.63: cannot open shared object file") after every single
+# ./package.sh — until a full dev rebuild. Separate trees also stop the two
+# variants invalidating each other's objects on every switch.
+DEVDIR   = build
+PORTDIR  = build-portable
+BUILDDIR = $(DEVDIR)
 
 # ── Local dep discovery (SteamOS strips dev metadata on updates) ──
 # SDL3 and FFmpeg are built from source into these prefixes on the Deck
@@ -36,6 +45,7 @@ BASE_CFLAGS  = -Wall -Wextra -O2 \
 # the rpaths so build/dsvp runs bare from the tree.
 PORTABLE ?= 0
 ifeq ($(PORTABLE),1)
+BUILDDIR      = $(PORTDIR)
 RPATH_LDFLAGS =
 SC_RPATH      =
 else
@@ -73,10 +83,14 @@ BASE_LDFLAGS += -lpipewire-0.3
 # which tree produced it — a wrong-branch binary once cost a day of debugging a
 # fix that was never in the binary being tested. "unknown" outside a git tree.
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-# +dirty must catch staged AND untracked changes: `git diff --quiet` compares
+# +dirty must catch worktree AND staged changes: `git diff --quiet` compares
 # worktree-vs-index only, so `git add` + build stamped clean with uncommitted
 # code — the exact ambiguity the stamp exists to kill (review P2-22).
-GIT_DIRTY  := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo +dirty)
+# But NOT untracked files: they cannot be compiled in, and --porcelain
+# counted them — test-result folders in the repo dir stamped a truthful
+# binary +dirty and voided a valid field run (2026-08-21).
+# diff-index vs HEAD covers worktree + index in one check.
+GIT_DIRTY  := $(shell git diff-index --quiet HEAD -- 2>/dev/null || echo +dirty)
 BASE_CFLAGS += -DDSVP_GIT_COMMIT=\"$(GIT_COMMIT)$(GIT_DIRTY)\"
 
 
@@ -114,6 +128,9 @@ FORCE:
 $(GITSTAMP): FORCE | $(BUILDDIR)
 	@echo '$(GIT_COMMIT)$(GIT_DIRTY)' | cmp -s - $@ 2>/dev/null || echo '$(GIT_COMMIT)$(GIT_DIRTY)' > $@
 $(BUILDDIR)/main.o: $(GITSTAMP)
+# player.o shows the stamp in the debug panel (2026-08-21) — same
+# stale-stamp hazard as main.o, same cure.
+$(BUILDDIR)/player.o: $(GITSTAMP)
 
 # `make debug` after `make` (or the reverse) silently reused objects built
 # with the other variant's flags — nothing invalidated them, so a release
@@ -151,5 +168,8 @@ hdr-probe: $(HDRPROBE)
 $(HDRPROBE): tools/dsvp-hdr-probe.c | $(BUILDDIR)
 	$(CC) -Wall -Wextra -O2 -o $@ $<
 
+# Removes BOTH trees regardless of PORTABLE, so `make clean` means what it
+# says. package.sh deliberately does NOT call this — it clears only its own
+# tree, so packaging never destroys the dev build.
 clean:
-	rm -rf $(BUILDDIR)
+	rm -rf $(DEVDIR) $(PORTDIR)
